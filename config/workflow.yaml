@@ -1,0 +1,57 @@
+workflows:
+  predictive_maintenance:
+    description: "Predictive Maintenance Pipeline for Pump Monitoring"
+    version: "1.0"
+    steps:
+      - id: data_ingestion
+        type: ingestion
+        config:
+          schema_path: "config/data_schema.json"
+          input_location: "D:/Data + Models/Data/CWRU/12k Drive End - Original/1 HP"
+          output_location: "data/{run_id}/1 HP (12k).npz"
+          state_location: "state/{run_id}/data_ingestion_complete.flag" #what has already been processed
+          segment_length: 1024
+          segments_per_file: 115
+          sample_rate: 12000
+          log_path: "logs/{run_id}/data_ingestion.log" #human-readable record of what happened during the pipeline
+        output:
+          - segmented_data
+        required: true
+
+      - id: feature_extraction
+        type: feature_engineering
+        depends_on: [ "data_ingestion" ]
+        config:
+          input_location: "data/{run_id}/1 HP (12k).npz"
+          output_location: "data/{run_id}/CWRU_12k_features.csv"
+          state_location: "state/{run_id}/feature_extraction_complete.flag" #what has already been processed
+          feature_types:
+            - time_domain
+            - frequency_domain
+            - wavelet_energy
+            - wavelet_entropy
+          sample_rate: 12000
+          extractor_version: "1.0"
+          log_path: "logs/{run_id}/feature_extraction.log"
+        outputs:
+          - extracted_features
+        required: true
+
+      - id: feature_storage
+        type: storage
+        depends_on: [ "feature_extraction" ]
+        config:
+          storage_type: "mongodb"
+          uri: "mongodb://localhost:27017"
+          database: "feature_store"
+          collection: "cwru_features"
+          dataset_id: "pump_vibration_features"
+          version: "v1.0"
+          input_csv_path: "data/{run_id}/CWRU_12k_features.csv"
+          metadata:
+            source: "CWRU Dataset"
+            description: "Extracted vibration features for fault classification"
+          log_path: "logs/{run_id}/feature_storage.log"
+        outputs:
+          - stored_features
+        required: true
