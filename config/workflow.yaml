@@ -37,6 +37,26 @@ workflows:
           - extracted_features
         required: true
 
+#is the following neccasary?
+      - id: dataset_builder
+        type: preprocessing
+        depends_on: [ "feature_extraction" ]
+        config:
+          input_location: "data/{run_id}/CWRU_12k_features.csv"
+          output_location: "data/{run_id}/CWRU_12k_processed.parquet"
+          state_location: "state/{run_id}/dataset_builder_complete.flag"
+          feature_metadata_path: "metadata/{run_id}/feature_metadata.json"
+          one_hot_encoding: true          # or false if you prefer label encoding
+          drop_na: false                  # drop missing rows or not
+          scaling_method: "minmax"        # MinMaxScaler (default)
+          save_encoders: true
+          save_scalers: true
+          log_path: "logs/{run_id}/dataset_builder.log"
+        outputs:
+          - processed_features
+        required: true
+
+
       - id: feature_storage
         type: storage
         depends_on: [ "feature_extraction" ]
@@ -47,7 +67,7 @@ workflows:
           collection: "cwru_features"
           dataset_id: "pump_vibration_features"
           version: "v1.0"
-          input_csv_path: "data/{run_id}/CWRU_12k_features.csv"
+          df_path: "data/{run_id}/CWRU_12k_features.csv"
           metadata:
             source: "CWRU Dataset"
             description: "Extracted vibration features for fault classification"
@@ -55,3 +75,5 @@ workflows:
         outputs:
           - stored_features
         required: true
+
+

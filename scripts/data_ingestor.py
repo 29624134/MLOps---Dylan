@@ -7,17 +7,30 @@ import logging
 class DataIngestor:
     """Reads CWRU .mat vibration data and segments it into .npz format."""
 
-    def __init__(self, input_folder, output_file, state_location=None,
+    def __init__(self, config=None, input_folder=None, output_file=None, state_location=None,
                  segment_length=1024, segments_per_file=115, sample_rate=12000,
                  log_path=None):
-        self.input_folder = input_folder
-        self.output_file = output_file
-        self.state_location = state_location
-        self.segment_length = segment_length
-        self.segments_per_file = segments_per_file
-        self.sample_rate = sample_rate
-        self.log_path = log_path
+        """
+        Accepts either direct arguments (manual run) or a config dict (for orchestrator).
+        """
+        if isinstance(config, dict):
+            self.input_folder = config.get("input_location")
+            self.output_file = config.get("output_location")
+            self.state_location = config.get("state_location")
+            self.segment_length = config.get("segment_length", 1024)
+            self.segments_per_file = config.get("segments_per_file", 115)
+            self.sample_rate = config.get("sample_rate", 12000)
+            self.log_path = config.get("log_path")
+        else:
+            self.input_folder = input_folder
+            self.output_file = output_file
+            self.state_location = state_location
+            self.segment_length = segment_length
+            self.segments_per_file = segments_per_file
+            self.sample_rate = sample_rate
+            self.log_path = log_path
 
+        # Setup logger
         self.logger = logging.getLogger(__name__)
         self.logger.setLevel(logging.INFO)
         if self.log_path:
@@ -59,7 +72,6 @@ class DataIngestor:
 
             # Load MATLAB file
             mat_data = loadmat(file_path)
-            # Determine the key dynamically for DE signal
             key_candidates = [k for k in mat_data.keys() if k.startswith("X") and "_DE_time" in k]
             if not key_candidates:
                 self.logger.warning(f"No valid key found in {file_path}, skipping")
@@ -83,12 +95,10 @@ class DataIngestor:
         segmented_data = segmented_data[:segment_index, :]
         labels = np.array(labels[:segment_index])
 
-        # Ensure output folder exists
         os.makedirs(os.path.dirname(self.output_file), exist_ok=True)
         np.savez(self.output_file, data=segmented_data, labels=labels)
         self.logger.info(f"Saved {segment_index} segments to {self.output_file}")
 
-        # Mark state flag if provided
         if self.state_location:
             os.makedirs(os.path.dirname(self.state_location), exist_ok=True)
             with open(self.state_location, "w") as f:
@@ -96,3 +106,14 @@ class DataIngestor:
             self.logger.info(f"Data ingestion state saved at {self.state_location}")
 
         return self.output_file
+
+    # --------------------------------------------------------------------------
+    # NEW: Orchestrator integration
+    # --------------------------------------------------------------------------
+    def run(self):
+        """
+        Wrapper for orchestrator compatibility.
+        Returns a dictionary with output paths.
+        """
+        output_path = self.ingest()
+        return {"segmented_data": output_path}

@@ -1,0 +1,49 @@
+{
+  "metadata": {
+    "version": "1.0",
+    "description": "Schema for CWRU Bearing Fault Data",
+    "created_at": "2025-11-04T00:00:00Z",
+    "updated_at": "2025-11-04T00:00:00Z",
+    "source": "config/data_schema.json",
+    "author": "Dylan Opperman",
+    "license": "Su"
+},
+  "schema": {
+    "data": {
+        "dtype": "float64",
+        "shape": [1024],
+        "nullable": false,
+        "description": "Vibration signal segment"
+    },
+    "labels": {
+        "dtype": "object",
+        "nullable": false,
+        "allowed_values": [
+            "Normal",
+            "Ball_007",
+            "Ball_014",
+            "Ball_021",
+            "IR_007",
+            "IR_014",
+            "IR_021",
+            "OR_007",
+            "OR_014",
+            "OR_021"
+        ],
+        "description": "Fault type label for each segment"
+    },
+    "original_index": {
+        "dtype": "int64",
+        "nullable": false,
+        "min_value": 0,
+        "description": "Index of the segment in the original data"
+    },
+    "source_file": {
+        "dtype": "object",
+        "nullable": true,
+        "description": "Original MAT file name"
+    }
+}
+
+}
+
