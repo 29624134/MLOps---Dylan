@@ -11,6 +11,9 @@ from scripts.feature_extractor import FeatureExtractor
 from utils.MongoDB import FeatureStore
 from utils.config import load_config
 from scripts.dataset_builder import DatasetBuilder
+from models.fault_classification.bagging import BaggingTrainer
+from scripts.data_validator import DataValidator
+import pandas as pd
 
 # -----------------------------
 # LOGGING SETUP
@@ -27,12 +30,11 @@ logger = logging.getLogger(__name__)
 class WorkflowStateManager:
     """Manages the progress and state of each workflow run"""
 
-    def __init__(self, state_dir="state"):
-        self.state_dir = state_dir
-        os.makedirs(state_dir, exist_ok=True)
+    def __init__(self, base_dir="workflow_data", run_id=None):
+        self.base_dir = base_dir
+        self.run_id = run_id
 
     def create_run_state(self, run_id: str, workflow_def: dict) -> Dict[str, Any]:
-        """Initialize the run file"""
         state = {
             "run_id": run_id,
             "status": "RUNNING",
@@ -48,16 +50,17 @@ class WorkflowStateManager:
                 for step in workflow_def["steps"]
             },
         }
-
         self.save_state(run_id, state)
         return state
 
-    def get_state_path(self, run_id: str) -> str:
-        return os.path.join(self.state_dir, f"{run_id}.json")
+    def get_state_path(self, run_id=None):
+        run = run_id or self.run_id
+        return os.path.join(self.base_dir, run, "state", f"{run}.json")
 
     def save_state(self, run_id: str, state: Dict[str, Any]):
-        """Write to file"""
-        with open(self.get_state_path(run_id), "w") as f:
+        state_path = self.get_state_path(run_id)
+        os.makedirs(os.path.dirname(state_path), exist_ok=True)
+        with open(state_path, "w") as f:
             json.dump(state, f, indent=2)
 
     def load_state(self, run_id: str) -> Dict[str, Any]:
@@ -151,15 +154,36 @@ class WorkflowExecutor:
             if step_type == "ingestion":
                 ingestor = DataIngestor(config)
                 outputs = ingestor.run()
+
             elif step_type == "feature_engineering":
                 extractor = FeatureExtractor(config)
                 outputs = extractor.run()
+
+            elif step_type == "validation":
+                validator = DataValidator(schema_path=config.get("schema_path"),log_path=config.get("log_path"))
+                #multiple csv files therefor need to iterate over them.
+                input_location = config.get("input_location")
+                results_list = []
+
+                for file in os.listdir(input_location):
+                    if file.endswith(".csv"):
+                        df = pd.read_csv(os.path.join(input_location, file))
+                        df, result = validator.validate_dataframe(df)
+                        results_list.append({file: result})
+                validator.save_results(results_list, config.get("output_location"))
+                outputs = {"validation_results": config.get("output_location")}
+
             elif step_type == "preprocessing":
                 extractor = DatasetBuilder(config)
                 outputs = extractor.run()
+
             elif step_type == "storage":
                 storage = FeatureStore(config)
                 outputs = storage.run()
+
+            elif step_type == "training":
+                trainer = BaggingTrainer(config)
+                outputs = trainer.run()
             else:
                 raise ValueError(f"Unknown step type: {step_type}")
 

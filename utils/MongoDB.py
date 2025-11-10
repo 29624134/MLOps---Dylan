@@ -7,27 +7,25 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
 class FeatureStore:
-    """MongoDB Feature Store for versioned feature storage."""
+    """MongoDB Feature Store for versioned feature storage, storing each feature type in its own collection."""
 
     def __init__(self, config: dict):
         self.mongo_uri = config.get("mongo_uri")
-        self.db_name = config.get("db_name", "mydb")
-        self.collection_name = config.get("collection_name", "feature_store")
-        self.dataset_id = config.get("dataset_id", "default_dataset")
-        self.version = config.get("version", "1.0")
+        self.db_name = config.get("db_name")
+        self.base_collection_name = config.get("collection_name")
+        self.dataset_id = config.get("dataset_id")
+        self.version = config.get("version")
         self.df_path = config.get("df_path")  # can now be a folder
         self.metadata = config.get("metadata", {})
 
         self.client = MongoClient(self.mongo_uri)
         self.db = self.client[self.db_name]
-        self.collection = self.db[self.collection_name]
-        self.meta_collection = self.db["_metadata"]
+        self.meta_collection = self.db["metadata"]
 
-        logger.info(f"Connected to MongoDB Feature Store → {self.db_name}.{self.collection_name}")
+        logger.info(f"Connected to MongoDB Feature Store → {self.db_name}")
 
     def run(self):
         """Orchestrator-compatible run method."""
-
         if not self.df_path:
             raise ValueError("No df_path provided for feature storage.")
 
@@ -54,6 +52,13 @@ class FeatureStore:
 
     def save_features(self, dataset_id: str, version: str, df: pd.DataFrame, metadata=None, feature_type=None):
         """Save features (with version, feature_type, and metadata) to MongoDB."""
+        if feature_type:
+            collection_name = f"{self.base_collection_name}{feature_type}"  # each feature type in its own collection
+        else:
+            collection_name = self.base_collection_name
+
+        collection = self.db[collection_name]
+
         records = df.to_dict("records")
         for record in records:
             record["_dataset_id"] = dataset_id
@@ -61,7 +66,7 @@ class FeatureStore:
             if feature_type:
                 record["_feature_type"] = feature_type
 
-        result = self.collection.insert_many(records)
+        result = collection.insert_many(records)
         logger.info(f"Stored {len(result.inserted_ids)} records for {dataset_id} (v{version}) - type: {feature_type}")
 
         meta = {
@@ -78,20 +83,21 @@ class FeatureStore:
 
     def get_features(self, dataset_id: str, version: str = "latest", feature_type: str = None) -> pd.DataFrame:
         """Retrieve features by dataset_id, version, and optionally feature_type."""
+        if not feature_type:
+            raise ValueError("Must provide feature_type to select the correct collection in this setup.")
+
+        collection_name = f"{self.base_collection_name}{feature_type}"
+        collection = self.db[collection_name]
+
         if version == "latest":
             query = {"dataset_id": dataset_id}
-            if feature_type:
-                query["feature_type"] = feature_type
-            meta = self.meta_collection.find_one(query, sort=[("created_at", -1)])
+            meta = self.meta_collection.find_one({**query, "feature_type": feature_type}, sort=[("created_at", -1)])
             if not meta:
-                raise ValueError(f"No metadata found for dataset '{dataset_id}'")
+                raise ValueError(f"No metadata found for dataset '{dataset_id}' and feature_type '{feature_type}'")
             version = meta["version"]
 
         query = {"_dataset_id": dataset_id, "_version": version}
-        if feature_type:
-            query["_feature_type"] = feature_type
-
-        records = list(self.collection.find(query))
+        records = list(collection.find(query))
         if not records:
             raise ValueError(f"No records found for dataset '{dataset_id}' (v{version}) - type: {feature_type}")
 
