@@ -23,11 +23,10 @@ workflows:
         depends_on: [ "data_ingestion" ]
         config:
           input_location: "data/{run_id}/1 HP (12k).npz"
-          output_location: "data/{run_id}/CWRU_12k_features.csv"
+          output_location: "data/{run_id}/features"
           state_location: "state/{run_id}/feature_extraction_complete.flag" #what has already been processed
           feature_types:
             - time_domain
-            - frequency_domain
             - wavelet_energy
             - wavelet_entropy
           sample_rate: 12000
@@ -36,9 +35,6 @@ workflows:
         outputs:
           - extracted_features
         required: true
-
-
-
 
       - id: feature_storage
         type: storage
@@ -50,7 +46,7 @@ workflows:
           collection: "cwru_features"
           dataset_id: "pump_vibration_features"
           version: "v1.0"
-          df_path: "data/{run_id}/CWRU_12k_features.csv"
+          df_path: "data/{run_id}/features"
           metadata:
             source: "CWRU Dataset"
             description: "Extracted vibration features for fault classification"

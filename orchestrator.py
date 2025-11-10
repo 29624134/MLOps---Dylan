@@ -7,8 +7,8 @@ import logging
 from datetime import datetime
 from typing import Dict, Any
 from scripts.data_ingestor import DataIngestor
-from scripts.feature_extractor_TDF import FeatureExtractor
-from utils.database import FeatureStore
+from scripts.feature_extractor import FeatureExtractor
+from utils.MongoDB import FeatureStore
 from utils.config import load_config
 from scripts.dataset_builder import DatasetBuilder
 
