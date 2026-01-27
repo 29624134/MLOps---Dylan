@@ -1,5 +1,0 @@
-workflow_trigger.py - Initiator
-run_servers.py - Starts 2 fast API severs, one for orchestrator to listen and one for it to run?
-upload_to_mongo.py - Uplaods and notifies user about new data.
-inference_API.py - communicates with orchetrator and components.]
-
