@@ -68,19 +68,47 @@ workflows:
           - stored_features
         required: true
 
-      - id: model_training
+      - id: bagging_training
         type: training
         depends_on: ["feature_storage"]
         config:
+          trainer_type: "bagging"
           input_location: "workflow_data/{run_id}/data/features/wavelet_energy.csv"
           output_location: "workflow_data/{run_id}/trained_models/bagging.pkl"
-          state_location: "workflow_data/{run_id}/state/model_training_complete.flag"
-          test_size: 420
-          random state: 325
-          log_path: "workflow_data/{run_id}/logs/model_training.log"
+          test_size: 0.3
+          random_state: 325
+          log_path: "workflow_data/{run_id}/logs/bagging_training.log"
         outputs:
           - trained_model
+        required: true
 
+      - id: boosting_training
+        type: training
+        depends_on: ["feature_storage"]
+        config:
+          trainer_type: "boosting"
+          input_location: "workflow_data/{run_id}/data/1 HP (12k).npz"
+          output_location: "workflow_data/{run_id}/trained_models/boosting.pkl"
+          test_size: 0.3
+          random_state: 325
+          n_estimators: 50
+          max_depth: 2
+          subsample: 0.5
+          log_path: "workflow_data/{run_id}/logs/boosting_training.log"
+        outputs:
+          - trained_model
+        required: true
+
+      - id: select_best_model
+        type: model_selection
+        depends_on: ["bagging_training", "boosting_training"]
+        config:
+          metric: "test_accuracy"
+          log_path: "workflow_data/{run_id}/logs/select_best_model.log"
+          state_location: "workflow_data/{run_id}/state/select_best_model_complete.flag"
+        outputs:
+          - best_model
+        required: true
 
 
 Databuilder:
