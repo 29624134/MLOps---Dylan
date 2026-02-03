@@ -110,9 +110,8 @@ class WorkflowExecutor:
         self.state_manager = WorkflowStateManager()
         self.contract_manager = DataContractManager()
 
-    def start_workflow(self):
+    def start_workflow(self, run_id: str):
         """Initialize and run workflow"""
-        run_id = f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         logger.info(f"Starting workflow with run_id: {run_id}")
 
         state = self.state_manager.create_run_state(run_id, self.workflow_def)

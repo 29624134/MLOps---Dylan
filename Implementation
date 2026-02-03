@@ -1,0 +1,26 @@
+
+
+
+
+
+
+
+
+
+
+
+
+✅ Digital Twin → Initiator (Data Ingestion)
+✅ Feature Engineering Pipeline
+✅ Feature Store (MongoDB)
+✅ Workflow Orchestrator (Basic)
+✅ Model Training (Basic)
+
+❌ Workflow Registry
+❌ Model Registry
+❌ Serving Pipeline (FE, PM, M)
+❌ Serving History
+❌ Dashboard/Audit Services
+❌ CI/CD Integration
+❌ Drift Detection
+❌ FastAPI REST API
