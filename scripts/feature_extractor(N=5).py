@@ -16,8 +16,7 @@ def _compute_skewness(x: np.ndarray) -> float:
 
 
 def _compute_kurtosis(x: np.ndarray) -> float:
-    N = len(x)
-    mu = np.mean(x)
+    N, mu = len(x), np.mean(x)
     s4 = np.std(x, ddof=1) ** 4
     return (np.sum((x - mu) ** 4) / N) / s4 - 3 if s4 != 0 else 0.0
 
@@ -61,6 +60,7 @@ class FeatureExtractorPHM:
         self.is_test           = bool(config.get("is_test", False))
         self.burst_period      = float(config.get("burst_period", 10.0))
         self.failure_threshold = float(config.get("failure_threshold", 20.0))
+        self.n_consecutive     = int(config.get("n_consecutive", 1))
         log_path               = config.get("log_path")
 
         # Logger setup
@@ -84,29 +84,37 @@ class FeatureExtractorPHM:
 
     def _find_failure_time_s(self, df: pd.DataFrame) -> float:
         """
-        Scan bursts chronologically. Return time_s of the FIRST burst where
-        peak acceleration (max of |h_max|, |v_max|) crosses the threshold.
-        Falls back to last burst if threshold is never exceeded.
-        Matches find_failure_time_s() in feature_extraction.py exactly.
+        Scan bursts chronologically. Return the time_s of the FIRST burst in
+        the first run of n_consecutive bursts that ALL exceed the threshold.
+
+        A single spike above 20g is not failure — it could be a transient.
+        Requiring consecutive exceedances filters those out and correctly
+        identifies the point at which the bearing has permanently degraded.
+
+        Falls back to the last burst if the threshold is never sustained.
         """
         df   = df.sort_values("time_s").reset_index(drop=True)
         peak = df[["h_max", "v_max"]].abs().max(axis=1)
-        exceeded = df.loc[peak >= self.failure_threshold, "time_s"]
+        above = (peak >= self.failure_threshold).values
 
-        if len(exceeded) == 0:
-            fallback = float(df["time_s"].max())
-            self.logger.warning(
-                f"[{self.bearing_name}] {self.failure_threshold} g threshold never crossed "
-                f"- using last burst ({fallback:.0f} s) as failure point."
-            )
-            return fallback
+        # Sliding window: find first position where all n_consecutive are True
+        n = self.n_consecutive
+        for i in range(len(above) - n + 1):
+            if above[i:i + n].all():
+                failure_s = float(df.loc[i, "time_s"])
+                self.logger.info(
+                    f"[{self.bearing_name}] Failure detected at {failure_s:.0f} s "
+                    f"(burst {int(failure_s / self.burst_period)}) - "
+                    f"sustained above {self.failure_threshold} g for {n} consecutive bursts"
+                )
+                return failure_s
 
-        failure_s = float(exceeded.iloc[0])
-        self.logger.info(
-            f"[{self.bearing_name}] Failure detected at {failure_s:.0f} s "
-            f"(burst {int(failure_s / self.burst_period)})"
+        fallback = float(df["time_s"].max())
+        self.logger.warning(
+            f"[{self.bearing_name}] {self.failure_threshold} g threshold never sustained "
+            f"for {n} consecutive bursts - using last burst ({fallback:.0f} s) as failure point."
         )
-        return failure_s
+        return fallback
 
     # ------------------------------------------------------------------
     # Main extraction

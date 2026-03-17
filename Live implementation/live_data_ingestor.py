@@ -144,14 +144,6 @@ class DataIngestorPHM:
         if not self.output_location:
             raise ValueError("DataIngestorPHM requires 'output_location'.")
 
-        # Cache check — skip if parquet already exists
-        parquet_path = os.path.join(self.output_location, "vibration_consolidated.parquet")
-        if os.path.exists(parquet_path):
-            self.logger.info(
-                f"Consolidated parquet already exists at {parquet_path} - skipping ingestion."
-            )
-            return {"vibration_parquet": parquet_path, "cached": True}
-
         self._extract_7z_if_needed()
         vib_files, temp_files = self._discover_files()
         outputs = {}

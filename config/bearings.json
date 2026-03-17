@@ -1,0 +1,107 @@
+{
+  "base_path": "D:/Data + Models/Data/IEEE Data",
+  "bearings": [
+    {
+      "name": "Bearing1_1",
+      "role": "train",
+      "condition": 1,
+      "status": "extracted"
+    },
+    {
+      "name": "Bearing1_2",
+      "role": "train",
+      "condition": 1,
+      "status": "extracted"
+    },
+    {
+      "name": "Bearing2_1",
+      "role": "train",
+      "condition": 2,
+      "status": "extracted"
+    },
+    {
+      "name": "Bearing2_2",
+      "role": "train",
+      "condition": 2,
+      "status": "extracted"
+    },
+    {
+      "name": "Bearing3_1",
+      "role": "train",
+      "condition": 3,
+      "status": "extracted"
+    },
+    {
+      "name": "Bearing3_2",
+      "role": "train",
+      "condition": 3,
+      "status": "extracted"
+    },
+    {
+      "name": "Bearing1_3",
+      "role": "val_test",
+      "condition": 1,
+      "status": "extracted"
+    },
+    {
+      "name": "Bearing1_4",
+      "role": "test",
+      "condition": 1,
+      "status": "extracted"
+    },
+    {
+      "name": "Bearing1_5",
+      "role": "test",
+      "condition": 1,
+      "status": "extracted"
+    },
+    {
+      "name": "Bearing1_6",
+      "role": "test",
+      "condition": 1,
+      "status": "extracted"
+    },
+    {
+      "name": "Bearing1_7",
+      "role": "test",
+      "condition": 1,
+      "status": "extracted"
+    },
+    {
+      "name": "Bearing2_3",
+      "role": "test",
+      "condition": 2,
+      "status": "extracted"
+    },
+    {
+      "name": "Bearing2_4",
+      "role": "test",
+      "condition": 2,
+      "status": "extracted"
+    },
+    {
+      "name": "Bearing2_5",
+      "role": "val_test",
+      "condition": 2,
+      "status": "extracted"
+    },
+    {
+      "name": "Bearing2_6",
+      "role": "test",
+      "condition": 2,
+      "status": "extracted"
+    },
+    {
+      "name": "Bearing2_7",
+      "role": "test",
+      "condition": 2,
+      "status": "extracted"
+    },
+    {
+      "name": "Bearing3_3",
+      "role": "test",
+      "condition": 3,
+      "status": "extracted"
+    }
+  ]
+}
