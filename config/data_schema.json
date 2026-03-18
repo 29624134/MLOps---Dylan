@@ -1,49 +1,241 @@
 {
   "metadata": {
     "version": "1.0",
-    "description": "Schema for CWRU Bearing Fault Data",
-    "created_at": "2025-11-04T00:00:00Z",
-    "updated_at": "2025-11-04T00:00:00Z",
+    "description": "Schema for PHM 2012 Bearing RUL Data",
+    "created_at": "2025-01-01T00:00:00Z",
+    "updated_at": "2025-01-01T00:00:00Z",
     "source": "config/data_schema.json",
     "author": "Dylan Opperman",
     "license": "SU"
-},
-  "schema": {
-    "data": {
-        "dtype": "float64",
-        "shape": [1024],
-        "nullable": false,
-        "description": "Vibration signal segment"
-    },
-    "labels": {
-        "dtype": "object",
-        "nullable": false,
-        "allowed_values": [
-            "Normal",
-            "Ball_007",
-            "Ball_014",
-            "Ball_021",
-            "IR_007",
-            "IR_014",
-            "IR_021",
-            "OR_007",
-            "OR_014",
-            "OR_021"
-        ],
-        "description": "Fault type label for each segment"
-    },
-    "original_index": {
+  },
+
+  "raw_consolidated": {
+    "description": "Schema for vibration_consolidated.parquet produced by DataIngestorPHM",
+    "features": {
+      "Hour": {
         "dtype": "int64",
         "nullable": false,
-        "min_value": 0,
-        "description": "Index of the segment in the original data"
-    },
-    "source_file": {
+        "min": 0,
+        "max": 23,
+        "description": "Hour component of the sample timestamp"
+      },
+      "Minute": {
+        "dtype": "int64",
+        "nullable": false,
+        "min": 0,
+        "max": 59,
+        "description": "Minute component of the sample timestamp"
+      },
+      "Second": {
+        "dtype": "int64",
+        "nullable": false,
+        "min": 0,
+        "max": 59,
+        "description": "Second component of the sample timestamp"
+      },
+      "Microsecond": {
+        "dtype": "int64",
+        "nullable": false,
+        "min": 0,
+        "description": "Microsecond component of the sample timestamp"
+      },
+      "Horizontal_Accel": {
+        "dtype": "float64",
+        "nullable": false,
+        "min": -50.0,
+        "max": 50.0,
+        "description": "Horizontal axis acceleration in g. Physical range for PHM 2012 bearings."
+      },
+      "Vertical_Accel": {
+        "dtype": "float64",
+        "nullable": false,
+        "min": -50.0,
+        "max": 50.0,
+        "description": "Vertical axis acceleration in g. Physical range for PHM 2012 bearings."
+      },
+      "file_id": {
         "dtype": "object",
-        "nullable": true,
-        "description": "Original MAT file name"
+        "nullable": false,
+        "description": "Stem of the source acc_*.csv file (e.g. acc_00001)"
+      },
+      "Time_Seconds": {
+        "dtype": "float64",
+        "nullable": false,
+        "min": 0.0,
+        "description": "Absolute time in seconds from start of recording"
+      }
     }
-}
+  },
 
-}
+  "features": {
+    "description": "Schema for phm2012_vibration_features_*.csv produced by FeatureExtractorPHM",
+    "features": {
 
+      "file_id": {
+        "dtype": "object",
+        "nullable": false,
+        "description": "Source burst file identifier"
+      },
+      "burst_idx": {
+        "dtype": "int64",
+        "nullable": false,
+        "min": 0,
+        "description": "Chronological burst index (0-based)"
+      },
+      "time_s": {
+        "dtype": "float64",
+        "nullable": false,
+        "min": 0.0,
+        "description": "Burst start time in seconds from recording start"
+      },
+
+      "h_max": {
+        "dtype": "float64",
+        "nullable": false,
+        "description": "Horizontal axis — max acceleration in burst (g)"
+      },
+      "h_min": {
+        "dtype": "float64",
+        "nullable": false,
+        "description": "Horizontal axis — min acceleration in burst (g)"
+      },
+      "h_mean": {
+        "dtype": "float64",
+        "nullable": false,
+        "description": "Horizontal axis — mean acceleration in burst (g)"
+      },
+      "h_sd": {
+        "dtype": "float64",
+        "nullable": false,
+        "min": 0.0,
+        "description": "Horizontal axis — standard deviation of acceleration (g)"
+      },
+      "h_rms": {
+        "dtype": "float64",
+        "nullable": false,
+        "min": 0.0,
+        "description": "Horizontal axis — root mean square acceleration (g)"
+      },
+      "h_skewness": {
+        "dtype": "float64",
+        "nullable": false,
+        "description": "Horizontal axis — skewness of acceleration signal"
+      },
+      "h_kurtosis": {
+        "dtype": "float64",
+        "nullable": false,
+        "description": "Horizontal axis — excess kurtosis of acceleration signal"
+      },
+      "h_crest_factor": {
+        "dtype": "float64",
+        "nullable": false,
+        "min": 0.0,
+        "description": "Horizontal axis — crest factor (max / rms)"
+      },
+      "h_form_factor": {
+        "dtype": "float64",
+        "nullable": false,
+        "description": "Horizontal axis — form factor (rms / mean)"
+      },
+
+      "v_max": {
+        "dtype": "float64",
+        "nullable": false,
+        "description": "Vertical axis — max acceleration in burst (g)"
+      },
+      "v_min": {
+        "dtype": "float64",
+        "nullable": false,
+        "description": "Vertical axis — min acceleration in burst (g)"
+      },
+      "v_mean": {
+        "dtype": "float64",
+        "nullable": false,
+        "description": "Vertical axis — mean acceleration in burst (g)"
+      },
+      "v_sd": {
+        "dtype": "float64",
+        "nullable": false,
+        "min": 0.0,
+        "description": "Vertical axis — standard deviation of acceleration (g)"
+      },
+      "v_rms": {
+        "dtype": "float64",
+        "nullable": false,
+        "min": 0.0,
+        "description": "Vertical axis — root mean square acceleration (g)"
+      },
+      "v_skewness": {
+        "dtype": "float64",
+        "nullable": false,
+        "description": "Vertical axis — skewness of acceleration signal"
+      },
+      "v_kurtosis": {
+        "dtype": "float64",
+        "nullable": false,
+        "description": "Vertical axis — excess kurtosis of acceleration signal"
+      },
+      "v_crest_factor": {
+        "dtype": "float64",
+        "nullable": false,
+        "min": 0.0,
+        "description": "Vertical axis — crest factor (max / rms)"
+      },
+      "v_form_factor": {
+        "dtype": "float64",
+        "nullable": false,
+        "description": "Vertical axis — form factor (rms / mean)"
+      },
+
+      "h_wp_energy_0": { "dtype": "float64", "nullable": false, "min": 0.0, "description": "Horizontal axis — wavelet packet energy band 0" },
+      "h_wp_energy_1": { "dtype": "float64", "nullable": false, "min": 0.0, "description": "Horizontal axis — wavelet packet energy band 1" },
+      "h_wp_energy_2": { "dtype": "float64", "nullable": false, "min": 0.0, "description": "Horizontal axis — wavelet packet energy band 2" },
+      "h_wp_energy_3": { "dtype": "float64", "nullable": false, "min": 0.0, "description": "Horizontal axis — wavelet packet energy band 3" },
+      "h_wp_energy_4": { "dtype": "float64", "nullable": false, "min": 0.0, "description": "Horizontal axis — wavelet packet energy band 4" },
+      "h_wp_energy_5": { "dtype": "float64", "nullable": false, "min": 0.0, "description": "Horizontal axis — wavelet packet energy band 5" },
+      "h_wp_energy_6": { "dtype": "float64", "nullable": false, "min": 0.0, "description": "Horizontal axis — wavelet packet energy band 6" },
+      "h_wp_energy_7": { "dtype": "float64", "nullable": false, "min": 0.0, "description": "Horizontal axis — wavelet packet energy band 7" },
+
+      "v_wp_energy_0": { "dtype": "float64", "nullable": false, "min": 0.0, "description": "Vertical axis — wavelet packet energy band 0" },
+      "v_wp_energy_1": { "dtype": "float64", "nullable": false, "min": 0.0, "description": "Vertical axis — wavelet packet energy band 1" },
+      "v_wp_energy_2": { "dtype": "float64", "nullable": false, "min": 0.0, "description": "Vertical axis — wavelet packet energy band 2" },
+      "v_wp_energy_3": { "dtype": "float64", "nullable": false, "min": 0.0, "description": "Vertical axis — wavelet packet energy band 3" },
+      "v_wp_energy_4": { "dtype": "float64", "nullable": false, "min": 0.0, "description": "Vertical axis — wavelet packet energy band 4" },
+      "v_wp_energy_5": { "dtype": "float64", "nullable": false, "min": 0.0, "description": "Vertical axis — wavelet packet energy band 5" },
+      "v_wp_energy_6": { "dtype": "float64", "nullable": false, "min": 0.0, "description": "Vertical axis — wavelet packet energy band 6" },
+      "v_wp_energy_7": { "dtype": "float64", "nullable": false, "min": 0.0, "description": "Vertical axis — wavelet packet energy band 7" },
+
+      "h_wp_entropy_0": { "dtype": "float64", "nullable": false, "description": "Horizontal axis — wavelet packet Shannon entropy band 0" },
+      "h_wp_entropy_1": { "dtype": "float64", "nullable": false, "description": "Horizontal axis — wavelet packet Shannon entropy band 1" },
+      "h_wp_entropy_2": { "dtype": "float64", "nullable": false, "description": "Horizontal axis — wavelet packet Shannon entropy band 2" },
+      "h_wp_entropy_3": { "dtype": "float64", "nullable": false, "description": "Horizontal axis — wavelet packet Shannon entropy band 3" },
+      "h_wp_entropy_4": { "dtype": "float64", "nullable": false, "description": "Horizontal axis — wavelet packet Shannon entropy band 4" },
+      "h_wp_entropy_5": { "dtype": "float64", "nullable": false, "description": "Horizontal axis — wavelet packet Shannon entropy band 5" },
+      "h_wp_entropy_6": { "dtype": "float64", "nullable": false, "description": "Horizontal axis — wavelet packet Shannon entropy band 6" },
+      "h_wp_entropy_7": { "dtype": "float64", "nullable": false, "description": "Horizontal axis — wavelet packet Shannon entropy band 7" },
+
+      "v_wp_entropy_0": { "dtype": "float64", "nullable": false, "description": "Vertical axis — wavelet packet Shannon entropy band 0" },
+      "v_wp_entropy_1": { "dtype": "float64", "nullable": false, "description": "Vertical axis — wavelet packet Shannon entropy band 1" },
+      "v_wp_entropy_2": { "dtype": "float64", "nullable": false, "description": "Vertical axis — wavelet packet Shannon entropy band 2" },
+      "v_wp_entropy_3": { "dtype": "float64", "nullable": false, "description": "Vertical axis — wavelet packet Shannon entropy band 3" },
+      "v_wp_entropy_4": { "dtype": "float64", "nullable": false, "description": "Vertical axis — wavelet packet Shannon entropy band 4" },
+      "v_wp_entropy_5": { "dtype": "float64", "nullable": false, "description": "Vertical axis — wavelet packet Shannon entropy band 5" },
+      "v_wp_entropy_6": { "dtype": "float64", "nullable": false, "description": "Vertical axis — wavelet packet Shannon entropy band 6" },
+      "v_wp_entropy_7": { "dtype": "float64", "nullable": false, "description": "Vertical axis — wavelet packet Shannon entropy band 7" },
+
+      "RUL_s": {
+        "dtype": "float64",
+        "nullable": false,
+        "min": 0.0,
+        "description": "Remaining useful life in seconds. 0 at failure (training) or last burst (test)."
+      },
+      "RUL_norm": {
+        "dtype": "float64",
+        "nullable": false,
+        "min": 0.0,
+        "max": 1.0,
+        "description": "RUL normalised to [0, 1] relative to total recording length"
+      }
+    }
+  }
+}
