@@ -31,6 +31,7 @@ class BearingRegistry:
         train     — run to failure, used for training
         val_test  — test bearing also used as validation during training
         test      — test bearing only
+        live      — bearing whose data is streamed for live inference
 
     status values:
         available  — data exists on disk, ready to ingest
@@ -85,6 +86,10 @@ class BearingRegistry:
     def test_bearings(self) -> List[Dict]:
         return [b for b in self.bearings if b["role"] in ("test", "val_test")]
 
+    def live_bearings(self) -> List[Dict]:
+        """Bearings designated for live inference streaming."""
+        return [b for b in self.bearings if b["role"] == "live"]
+
     def is_test(self, bearing: Dict) -> bool:
         return bearing["role"] != "train"
 
@@ -100,7 +105,6 @@ class BearingRegistry:
             status = bearing.get("status", "unknown")
             role   = bearing["role"]
             name   = bearing["name"]
-            # Check if source folder actually exists on disk
             exists = "exists" if os.path.isdir(self.source_path(bearing)) else "NO FOLDER"
             logger.info(f"  {name:<14} role={role:<9} status={status:<10} disk={exists}")
         logger.info(f"  Summary: {dict(counts)}")
@@ -124,23 +128,15 @@ class BearingRegistry:
         """
         Auto-detect which bearings actually have data on disk and update
         status from 'missing' -> 'available' if the source folder now exists.
-        Useful to call at workflow start so you don't have to edit the file manually.
         """
-        updated = []
-        for bearing in self.bearings:
-            current_status = bearing.get("status", "missing")
-            folder_exists  = os.path.isdir(self.source_path(bearing))
-
-            # Only auto-promote missing -> available, never downgrade processed bearings
-            if current_status == "missing" and folder_exists:
-                bearing["status"] = "available"
-                updated.append(bearing["name"])
-
-        if updated:
+        changed = False
+        for b in self.bearings:
+            if b.get("status") == "missing" and os.path.isdir(self.source_path(b)):
+                b["status"] = "available"
+                changed = True
+                logger.info(f"  Auto-detected: {b['name']} -> available")
+        if changed:
             self._save()
-            logger.info(f"  sync_from_disk: promoted {len(updated)} bearings to 'available': {updated}")
-        else:
-            logger.info("  sync_from_disk: no status changes needed")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -148,8 +144,6 @@ class BearingRegistry:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class WorkflowStateManager:
-    """Manages the progress and state of each workflow run."""
-
     def __init__(self, base_dir="workflow_data"):
         self.base_dir = base_dir
 
@@ -259,7 +253,7 @@ class WorkflowExecutor:
         bearing_config_path = self.workflow_def.get("bearing_config", "config/bearings.json")
         self.registry = BearingRegistry(bearing_config_path)
 
-    # ── Step template config (shared values for all bearings) ────────────────
+    # ── Step template helpers ─────────────────────────────────────────────────
 
     def _ingestion_template(self) -> Dict:
         return next(s for s in self.workflow_def["steps"] if s["id"] == "ingestion")["config"]
@@ -275,6 +269,9 @@ class WorkflowExecutor:
 
     def _model_selection_step(self) -> Dict:
         return next(s for s in self.workflow_def["steps"] if s["id"] == "model_selection")
+
+    def _live_serving_step(self) -> Dict:
+        return next(s for s in self.workflow_def["steps"] if s["id"] == "live_serving")
 
     # ── Entry point ──────────────────────────────────────────────────────────
 
@@ -294,24 +291,24 @@ class WorkflowExecutor:
                 f"{[b['name'] for b in missing]}"
             )
 
-        # Classify each bearing independently by checking disk — three states:
-        #   needs_ingestion  : no parquet AND no features.csv
-        #   needs_extraction : parquet exists but no features.csv
-        #   done             : features.csv exists
         def _parquet(b):
             return os.path.join(self.registry.source_path(b), "vibration_consolidated.parquet")
         def _features(b):
             return os.path.join(self.registry.source_path(b), "features.csv")
 
-        needs_ingestion  = [b for b in all_bearings
+        # Live bearings are excluded from ingestion/extraction/training —
+        # they are only used for live inference after the model is deployed.
+        non_live = [b for b in all_bearings if b["role"] != "live"]
+
+        needs_ingestion  = [b for b in non_live
                             if b.get("status") != "missing"
                             and not os.path.exists(_parquet(b))
                             and not os.path.exists(_features(b))]
-        needs_extraction = [b for b in all_bearings
+        needs_extraction = [b for b in non_live
                             if b.get("status") != "missing"
                             and os.path.exists(_parquet(b))
                             and not os.path.exists(_features(b))]
-        done             = [b for b in all_bearings
+        done             = [b for b in non_live
                             if os.path.exists(_features(b))]
 
         if not needs_ingestion and not needs_extraction and not done:
@@ -324,14 +321,14 @@ class WorkflowExecutor:
             f"{len(done)} already have features.csv"
         )
 
-        # Build step IDs only for work that actually needs doing
+        # Build step IDs for work that needs doing
         ingest_ids   = [f"ingest_{b['name'].lower()}"  for b in needs_ingestion]
         extract_ids  = [f"extract_{b['name'].lower()}" for b in needs_ingestion + needs_extraction]
-        all_step_ids = ingest_ids + extract_ids + ["validation", "training", "model_selection"]
+        all_step_ids = ingest_ids + extract_ids + ["validation", "training", "model_selection", "live_serving"]
 
         state = self.state_manager.create_run_state(run_id, all_step_ids)
 
-        # ── 1. Ingestion — only bearings with no parquet yet ──────────────────
+        # ── 1. Ingestion ──────────────────────────────────────────────────────
         if needs_ingestion:
             logger.info(f"[{run_id}] Phase 1: Ingestion ({len(needs_ingestion)} bearings)")
             for bearing in needs_ingestion:
@@ -339,9 +336,8 @@ class WorkflowExecutor:
         else:
             logger.info(f"[{run_id}] Phase 1: Ingestion — skipped (all bearings have parquet or features.csv)")
 
-        # ── 2. Feature extraction — bearings with parquet but no features.csv ─
-        # Includes: newly ingested this run + bearings that already had parquet
-        just_ingested    = [b for b in needs_ingestion if b.get("status") == "ingested"]
+        # ── 2. Feature extraction ─────────────────────────────────────────────
+        just_ingested     = [b for b in needs_ingestion if b.get("status") == "ingested"]
         needs_extract_now = just_ingested + needs_extraction
         if needs_extract_now:
             logger.info(f"[{run_id}] Phase 2: Feature extraction ({len(needs_extract_now)} bearings)")
@@ -362,6 +358,10 @@ class WorkflowExecutor:
         logger.info(f"[{run_id}] Phase 5: Model selection")
         self._run_model_selection(run_id)
 
+        # ── 6. Live serving ───────────────────────────────────────────────────
+        logger.info(f"[{run_id}] Phase 6: Live serving")
+        self._run_live_serving(run_id)
+
         logger.info(f"[{run_id}] Workflow complete!")
 
     # ── Per-phase helpers ─────────────────────────────────────────────────────
@@ -374,8 +374,6 @@ class WorkflowExecutor:
         log_base      = template["log_base"]
         source_folder = self.registry.source_path(bearing)
 
-        # Issue 1: write consolidated parquet next to the source data so it
-        # persists across runs and only needs to be produced once.
         config = {
             "input_location":  source_folder,
             "output_location": source_folder,
@@ -387,7 +385,6 @@ class WorkflowExecutor:
         self._execute(run_id, step_id, "ingestion", config,
                       lambda cfg: DataIngestorPHM(cfg).run())
 
-        # Update bearing status based on outcome
         state = self.state_manager.load_state(run_id)
         if state["steps"][step_id]["status"] == "COMPLETE":
             self.registry.set_status(bearing["name"], "ingested")
@@ -402,15 +399,13 @@ class WorkflowExecutor:
         log_base      = template["log_base"]
         source_folder = self.registry.source_path(bearing)
 
-        # Issue 1: read parquet from source folder; write features CSV
-        # next to it so extracted features persist across runs.
         config = {
-            "input_location":  os.path.join(source_folder, "vibration_consolidated.parquet"),
-            "output_location": os.path.join(source_folder, "features.csv"),
-            "state_location":  os.path.join(state_base, f"{step_id}.flag"),
-            "log_path":        os.path.join(log_base, f"{step_id}.log"),
-            "bearing_name":    bearing["name"],
-            "is_test":         self.registry.is_test(bearing),
+            "input_location":    os.path.join(source_folder, "vibration_consolidated.parquet"),
+            "output_location":   os.path.join(source_folder, "features.csv"),
+            "state_location":    os.path.join(state_base, f"{step_id}.flag"),
+            "log_path":          os.path.join(log_base, f"{step_id}.log"),
+            "bearing_name":      bearing["name"],
+            "is_test":           self.registry.is_test(bearing),
             "burst_period":      template.get("burst_period", 10.0),
             "failure_threshold": template.get("failure_threshold", 20.0),
             "n_consecutive":     template.get("n_consecutive", 5),
@@ -419,7 +414,6 @@ class WorkflowExecutor:
         self._execute(run_id, step_id, "feature_engineering", config,
                       lambda cfg: FeatureExtractorPHM(cfg).run())
 
-        # Update bearing status based on outcome
         state = self.state_manager.load_state(run_id)
         if state["steps"][step_id]["status"] == "COMPLETE":
             self.registry.set_status(bearing["name"], "extracted")
@@ -433,8 +427,6 @@ class WorkflowExecutor:
         step_id = "validation"
 
         def _validate(cfg):
-            # Issue 1: features.csv lives next to source data for each bearing,
-            # so we read paths directly from the registry rather than a folder.
             validator    = DataValidatorPHM(schema_path=cfg.get("schema_path"),
                                             log_path=cfg.get("log_path"))
             results_list = []
@@ -462,8 +454,6 @@ class WorkflowExecutor:
         config  = self.contract_manager.resolve_config(step["config"], run_id)
         step_id = "training"
 
-        # Build file lists by checking features.csv exists on disk —
-        # do NOT rely on registry status which can be stale between runs.
         def _features_csv(bearing: Dict) -> str:
             return os.path.join(self.registry.source_path(bearing), "features.csv")
 
@@ -507,6 +497,136 @@ class WorkflowExecutor:
                       lambda cfg: {"best_model_id":
                                    self.select_best_model(run_id, cfg.get("metric", "mae_s"))["model_id"]})
 
+    def _run_live_serving(self, run_id: str):
+        """Stream live bearing data through the deployed model and save predictions."""
+        live_bearings = self.registry.live_bearings()
+        if not live_bearings:
+            logger.info(f"[{run_id}] Phase 6: Live serving — skipped (no bearings with role='live')")
+            return
+
+        step    = self._live_serving_step()
+        config  = self.contract_manager.resolve_config(step["config"], run_id)
+        step_id = "live_serving"
+
+        def _serve(cfg):
+            from Live_implementation.live_feature_buffer import LiveFeatureBuffer
+            from Live_implementation.live_predictor      import LivePredictor
+            from utils.model_registry                    import ModelRegistry
+
+            registry    = ModelRegistry(run_id=run_id)
+            model_entry = registry.get_deployed_model("RUL_s")
+            if not model_entry:
+                raise RuntimeError(
+                    "No deployed model found. Ensure training + model_selection completed successfully."
+                )
+
+            predictor    = LivePredictor.from_path(model_entry["model_path"])
+            window_size  = int(cfg.get("window_size", 40))
+            burst_period = float(cfg.get("burst_period", 10.0))
+            realtime     = bool(cfg.get("realtime", False))
+
+            all_predictions = []
+
+            for bearing in live_bearings:
+                source_folder = self.registry.source_path(bearing)
+                logger.info(
+                    f"[{run_id}] Live serving: {bearing['name']} "
+                    f"({'realtime' if realtime else 'fast replay'})"
+                )
+
+                buffer   = LiveFeatureBuffer(window_size=window_size)
+                ingestor = DataIngestorPHM(config={
+                    "input_location":  source_folder,
+                    "output_location": source_folder,
+                })
+
+                predictions   = []
+                live_features = []
+                for burst in ingestor.stream_bursts(
+                    source_folder,
+                    burst_period=burst_period,
+                    realtime=realtime,
+                ):
+                    vec = buffer.push_burst(burst["h_signal"], burst["v_signal"])
+
+                    # Always save raw base features from burst 0 regardless
+                    # of warmup state — full history needed for retraining.
+                    raw = buffer._deque[-1]
+                    feature_row = {
+                        "burst_idx": burst["burst_idx"],
+                        "time_s":    burst["time_s"],
+                        **{k: v for k, v in raw.items() if k != "RUL_norm"},
+                        "RUL_s":    None,
+                        "RUL_norm": None,
+                    }
+                    live_features.append(feature_row)
+
+                    if vec is None:
+                        continue
+
+                    rul_s = predictor.predict(vec)
+
+                    # Prediction record
+                    entry = {
+                        "bearing":   bearing["name"],
+                        "burst_idx": burst["burst_idx"],
+                        "time_s":    burst["time_s"],
+                        "rul_s":     rul_s,
+                        "rul_min":   rul_s / 60.0,
+                        "h_max":     burst["h_max"],
+                        "v_max":     burst["v_max"],
+                    }
+                    predictions.append(entry)
+
+                    logger.info(
+                        f"  [{bearing['name']}] Burst {burst['burst_idx']:>5} "
+                        f"| t={burst['time_s']:>8.0f} s "
+                        f"| RUL = {rul_s:>8.0f} s  ({rul_s/60:.1f} min)"
+                    )
+
+                out_base = cfg.get("output_base", f"workflow_data/{run_id}/live")
+                os.makedirs(out_base, exist_ok=True)
+
+                # Save predictions
+                if predictions:
+                    out_path = os.path.join(out_base, f"{bearing['name']}_predictions.csv")
+                    pd.DataFrame(predictions).to_csv(out_path, index=False)
+                    logger.info(
+                        f"  [{bearing['name']}] {len(predictions)} predictions saved → {out_path}"
+                    )
+                    all_predictions.extend(predictions)
+
+                # Save raw base features and label RUL now that all bursts are seen.
+                # failure_time_s = last recorded time_s (end of recording).
+                # RUL_s = failure_time_s - time_s for every row.
+                if live_features:
+                    features_path = os.path.join(out_base, f"{bearing['name']}_live_features.csv")
+                    features_df   = pd.DataFrame(live_features)
+
+                    failure_time_s = features_df["time_s"].max()
+                    features_df["RUL_s"]    = (failure_time_s - features_df["time_s"]).clip(lower=0.0)
+                    features_df["RUL_norm"] = (
+                        features_df["RUL_s"] / failure_time_s if failure_time_s > 0 else 0.0
+                    )
+                    features_df.drop(columns=["bearing"], inplace=True)
+
+                    features_df.to_csv(features_path, index=False)
+                    logger.info(
+                        f"  [{bearing['name']}] {len(features_df)} feature rows saved → {features_path}"
+                    )
+                    logger.info(
+                        f"  [{bearing['name']}] RUL labelled: "
+                        f"failure_time={failure_time_s:.0f} s | "
+                        f"RUL range: {features_df['RUL_s'].max():.0f} s -> 0 s"
+                    )
+
+            return {
+                "n_predictions":  len(all_predictions),
+                "bearings_served": [b["name"] for b in live_bearings],
+            }
+
+        self._execute(run_id, step_id, "live_serving", config, _serve)
+
     # ── Generic step executor ─────────────────────────────────────────────────
 
     def _execute(self, run_id: str, step_id: str, step_type: str,
@@ -519,8 +639,8 @@ class WorkflowExecutor:
         self.state_manager.update_step_status(run_id, step_id, "RUNNING")
 
         try:
-            start   = time.time()
-            outputs = fn(config)
+            start    = time.time()
+            outputs  = fn(config)
             duration = time.time() - start
 
             self.state_manager.mark_step_outputs(run_id, step_id, outputs or {})

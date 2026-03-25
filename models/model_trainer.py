@@ -132,9 +132,12 @@ class RULTrainerPHM:
         y_train_scaled = y_train / self.rul_scale
 
         scaler = StandardScaler()
-        X_train = scaler.fit_transform(X_train)
-        X_val = scaler.transform(X_val)
+        drop = [c for c in DROP_COLS if c in train_combined.columns]
+        feature_cols = [c for c in train_combined.columns if c not in drop]
+        X_train = scaler.fit_transform(pd.DataFrame(X_train, columns=feature_cols))
+        X_val = scaler.transform(pd.DataFrame(X_val, columns=feature_cols))
 
+        self.logger.info(f"Training features ({len(feature_cols)}): {feature_cols}")
         self.logger.info(f"Train: {X_train.shape} | Val: {X_val.shape}")
         self.logger.info(f"RUL_s train range (scaled): {y_train_scaled.min():.4f} -> {y_train_scaled.max():.4f}")
         self.logger.info(f"RUL_s val range: {y_val.min():.0f} s -> {y_val.max():.0f} s")
@@ -166,7 +169,7 @@ class RULTrainerPHM:
                 continue
 
             X_test, y_test = self._get_xy(df_test)
-            X_test         = scaler.transform(X_test)
+            X_test = scaler.transform(pd.DataFrame(X_test, columns=scaler.feature_names_in_))
             preds          = model.predict(X_test)   # (n_windows, horizon), raw seconds
 
             pred_rul_s = float(np.clip(preds[-1, 0], 0, None))

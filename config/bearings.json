@@ -39,7 +39,7 @@
     },
     {
       "name": "Bearing1_3",
-      "role": "val_test",
+      "role": "train",
       "condition": 1,
       "status": "extracted"
     },
@@ -51,7 +51,7 @@
     },
     {
       "name": "Bearing1_5",
-      "role": "test",
+      "role": "live",
       "condition": 1,
       "status": "extracted"
     },
