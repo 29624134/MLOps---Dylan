@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException, BackgroundTasks, WebSocket
 from pydantic import BaseModel, Field
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any
 from datetime import datetime
 from utils.model_registry import ModelRegistry
 import uuid
@@ -29,15 +29,20 @@ class WorkflowStatusResponse(BaseModel):
     steps: Dict[str, Dict]
 
 class RULPredictionRequest(BaseModel):
-    features: Dict[str, float]          # feature_name → value (one burst's worth)
+    features: Dict[str, float]
     model_version: Optional[str] = "latest"
 
 class RULPredictionResponse(BaseModel):
-    predicted_rul_s: float              # seconds remaining
-    predicted_rul_min: float            # minutes remaining (convenience)
-    horizon: int                        # steps predicted ahead
+    predicted_rul_s: float
+    predicted_rul_min: float
+    horizon: int
     model_version: str
     timestamp: str
+
+class LiveServingRequest(BaseModel):
+    bearing_name: str                    # must match a bearing with role='live' in bearings.json
+    realtime: bool = False               # True = sleep burst_period between bursts
+    max_bursts: Optional[int] = None     # stop early (useful for testing)
 
 
 # ====================================================================
@@ -66,7 +71,7 @@ async def get_workflow_artifacts(run_id: str):
 
 
 # ====================================================================
-# RUL PREDICTION ENDPOINT
+# RUL PREDICTION ENDPOINT  (single feature vector, synchronous)
 # ====================================================================
 
 @app.post("/predict/rul", response_model=RULPredictionResponse)
@@ -81,36 +86,134 @@ async def predict_rul(request: RULPredictionRequest):
         raise HTTPException(status_code=404, detail="No deployed RUL model found")
 
     checkpoint = torch.load(model_entry["model_path"], map_location="cpu")
-
-    # Restore scaler
     scaler = joblib.load(io.BytesIO(checkpoint["scaler_bytes"]))
 
-    # Rebuild model
     from models.rul_net_model import RULNetModel
-    hp = checkpoint.get("hyperparameters", {})
+    hp        = checkpoint.get("hyperparameters", {})
     rul_model = RULNetModel(**hp)
-    state = checkpoint["model_state_dict"]
+    state     = checkpoint["model_state_dict"]
     input_dim = next(iter(state.values())).shape[1]
-    rul_model.model = rul_model.create_model(input_dim=input_dim)
+    rul_model.model = rul_model._build_net(input_dim)
     rul_model.model.load_state_dict(state)
     rul_model.model.eval()
     rul_model.is_trained = True
 
-    # Scale and predict
-    features = np.array([list(request.features.values())], dtype=np.float32)
+    features        = np.array([list(request.features.values())], dtype=np.float32)
     features_scaled = scaler.transform(features)
-    preds = rul_model.predict(features_scaled)  # (1, horizon)
 
-    predicted_rul_s = float(np.clip(preds[0, 0], 0, None))
-    horizon = preds.shape[1]
+    # Use direct forward pass (single row — sliding window loop needs horizon rows)
+    with torch.no_grad():
+        x_in = torch.tensor(features_scaled, dtype=torch.float32)
+        preds = rul_model.model(x_in).detach().cpu().numpy().reshape(-1)
+
+    rul_scale     = hp.get("rul_scale", 30000.0)
+    predicted_rul = float(np.clip(preds[0] * rul_scale, 0.0, None))
+    horizon       = len(preds)
 
     return RULPredictionResponse(
-        predicted_rul_s   = predicted_rul_s,
-        predicted_rul_min = predicted_rul_s / 60.0,
+        predicted_rul_s   = predicted_rul,
+        predicted_rul_min = predicted_rul / 60.0,
         horizon           = horizon,
         model_version     = model_entry["model_id"],
         timestamp         = datetime.now().isoformat(),
     )
+
+
+# ====================================================================
+# LIVE SERVING ENDPOINT  (streams a bearing, runs in background)
+# ====================================================================
+
+@app.post("/serve/live", response_model=Dict[str, str])
+async def start_live_serving(request: LiveServingRequest, background_tasks: BackgroundTasks):
+    """
+    Start live inference for a bearing that has role='live' in bearings.json.
+    Returns immediately with a run_id. Poll /workflow/{run_id}/status for progress.
+    Predictions are written to workflow_data/{run_id}/live/{bearing}_predictions.csv
+    """
+    run_id = f"live_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+    background_tasks.add_task(_run_live_serving_bg, run_id, request)
+    return {"run_id": run_id, "status": "started", "bearing": request.bearing_name}
+
+
+async def _run_live_serving_bg(run_id: str, request: LiveServingRequest):
+    """Background task: stream a live bearing through the deployed model."""
+    import os
+    import pandas as pd
+    from orchestrator import BearingRegistry, WorkflowStateManager
+    from Live_implementation.live_feature_buffer import LiveFeatureBuffer
+    from Live_implementation.live_predictor      import LivePredictor
+    from scripts import DataIngestorPHM
+
+    state_manager = WorkflowStateManager()
+    state_manager.create_run_state(run_id, ["live_serving"])
+    state_manager.update_step_status(run_id, "live_serving", "RUNNING")
+
+    try:
+        # Resolve the bearing
+        bearing_registry = BearingRegistry("config/bearings.json")
+        matching = [b for b in bearing_registry.live_bearings()
+                    if b["name"] == request.bearing_name]
+        if not matching:
+            raise ValueError(
+                f"Bearing '{request.bearing_name}' not found or does not have role='live'. "
+                f"Check config/bearings.json."
+            )
+        bearing       = matching[0]
+        source_folder = bearing_registry.source_path(bearing)
+
+        # Load deployed model
+        model_registry = ModelRegistry(run_id="__deployed__")
+        model_entry    = model_registry.get_deployed_model("RUL_s")
+        if not model_entry:
+            raise RuntimeError(
+                "No deployed model found. Trigger a training workflow first."
+            )
+
+        predictor = LivePredictor.from_path(model_entry["model_path"])
+        buffer    = LiveFeatureBuffer(window_size=40)
+        ingestor  = DataIngestorPHM(config={
+            "input_location":  source_folder,
+            "output_location": source_folder,
+        })
+
+        predictions = []
+        for burst in ingestor.stream_bursts(
+            source_folder,
+            burst_period=10.0,
+            realtime=request.realtime,
+        ):
+            if request.max_bursts and burst["burst_idx"] >= request.max_bursts:
+                break
+
+            vec = buffer.push_burst(burst["h_signal"], burst["v_signal"])
+            if vec is None:
+                continue
+
+            rul_s = predictor.predict(vec)
+            predictions.append({
+                "bearing":   request.bearing_name,
+                "burst_idx": burst["burst_idx"],
+                "time_s":    burst["time_s"],
+                "rul_s":     rul_s,
+                "rul_min":   rul_s / 60.0,
+                "h_max":     burst["h_max"],
+                "v_max":     burst["v_max"],
+            })
+
+        # Save predictions
+        out_path = f"workflow_data/{run_id}/live/{request.bearing_name}_predictions.csv"
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        pd.DataFrame(predictions).to_csv(out_path, index=False)
+
+        state_manager.mark_step_outputs(run_id, "live_serving", {
+            "predictions_path": out_path,
+            "n_predictions":    len(predictions),
+        })
+        state_manager.update_step_status(run_id, "live_serving", "COMPLETE")
+
+    except Exception as e:
+        state_manager.update_step_status(run_id, "live_serving", "FAILED", str(e))
+        raise
 
 
 # ====================================================================

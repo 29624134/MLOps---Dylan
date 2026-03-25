@@ -34,7 +34,7 @@ workflows:
           log_base: "workflow_data/{run_id}/logs"
           burst_period: 10.0
           failure_threshold: 20.0
-          n_consecutive: 5        # bursts that must ALL exceed threshold before declaring failure
+          n_consecutive: 5
 
       # ---------------------------------------------------------------
       # VALIDATION
@@ -82,3 +82,24 @@ workflows:
           metric: "mae_s"
           state_location: "workflow_data/{run_id}/state/model_selection.flag"
           log_path: "workflow_data/{run_id}/logs/model_selection.log"
+
+      # ---------------------------------------------------------------
+      # LIVE SERVING
+      # Streams acc_*.csv from each bearing with role='live' in
+      # bearings.json through the deployed model, one burst at a time.
+      # Predictions are saved to workflow_data/{run_id}/live/
+      #
+      # realtime: false  = fast replay (for testing, no sleep between bursts)
+      # realtime: true   = sleep burst_period seconds between bursts
+      #                    (matches real sensor rate)
+      # ---------------------------------------------------------------
+      - id: live_serving
+        type: live_serving
+        depends_on: ["model_selection"]
+        config:
+          window_size: 40
+          burst_period: 10.0
+          realtime: false
+          output_base: "workflow_data/{run_id}/live"
+          state_location: "workflow_data/{run_id}/state/live_serving.flag"
+          log_path: "workflow_data/{run_id}/logs/live_serving.log"
