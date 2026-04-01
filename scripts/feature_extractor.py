@@ -54,6 +54,10 @@ class FeatureExtractorPHM:
               Failure detection uses .abs() on h_max and v_max before
               comparing against the threshold.
     Issue 3 - All log strings use ASCII '->' instead of Unicode arrow.
+    Issue 4 - Failure detection now requires n_consecutive bursts above
+              threshold before declaring failure, guarding against false
+              triggers from external vibration or sensor noise.
+              n_consecutive is configurable via workflow.yaml (default: 2).
     """
 
     def __init__(self, config: dict):
@@ -61,6 +65,7 @@ class FeatureExtractorPHM:
         self.is_test           = bool(config.get("is_test", False))
         self.burst_period      = float(config.get("burst_period", 10.0))
         self.failure_threshold = float(config.get("failure_threshold", 20.0))
+        self.n_consecutive     = int(config.get("n_consecutive", 1))      # <-- NEW
         log_path               = config.get("log_path")
 
         # Logger setup
@@ -84,29 +89,37 @@ class FeatureExtractorPHM:
 
     def _find_failure_time_s(self, df: pd.DataFrame) -> float:
         """
-        Scan bursts chronologically. Return time_s of the FIRST burst where
-        peak acceleration (max of |h_max|, |v_max|) crosses the threshold.
-        Falls back to last burst if threshold is never exceeded.
-        Matches find_failure_time_s() in feature_extraction.py exactly.
+        Scan bursts chronologically. Return time_s of the FIRST burst in the
+        first run of n_consecutive bursts that ALL exceed the failure threshold
+        (peak of |h_max|, |v_max|).
+
+        Requiring consecutive bursts guards against false failure triggers
+        caused by external vibration, mechanical shock, or sensor noise.
+
+        Falls back to the last burst if the threshold is never sustained.
         """
         df   = df.sort_values("time_s").reset_index(drop=True)
-        peak = df[["h_max", "v_max"]].abs().max(axis=1)
-        exceeded = df.loc[peak >= self.failure_threshold, "time_s"]
+        peak = df[["h_max", "v_max"]].abs().max(axis=1).values
+        above = peak >= self.failure_threshold
 
-        if len(exceeded) == 0:
-            fallback = float(df["time_s"].max())
-            self.logger.warning(
-                f"[{self.bearing_name}] {self.failure_threshold} g threshold never crossed "
-                f"- using last burst ({fallback:.0f} s) as failure point."
-            )
-            return fallback
+        for i in range(len(above) - self.n_consecutive + 1):
+            if above[i : i + self.n_consecutive].all():
+                failure_s = float(df.loc[i, "time_s"])
+                self.logger.info(
+                    f"[{self.bearing_name}] Failure detected at {failure_s:.0f} s "
+                    f"(burst {int(failure_s / self.burst_period)}) — "
+                    f"sustained >{self.failure_threshold} g for "
+                    f"{self.n_consecutive} consecutive bursts."
+                )
+                return failure_s
 
-        failure_s = float(exceeded.iloc[0])
-        self.logger.info(
-            f"[{self.bearing_name}] Failure detected at {failure_s:.0f} s "
-            f"(burst {int(failure_s / self.burst_period)})"
+        fallback = float(df["time_s"].max())
+        self.logger.warning(
+            f"[{self.bearing_name}] {self.failure_threshold} g threshold never sustained "
+            f"for {self.n_consecutive} consecutive bursts "
+            f"- using last burst ({fallback:.0f} s) as failure point."
         )
-        return failure_s
+        return fallback
 
     # ------------------------------------------------------------------
     # Main extraction
@@ -133,6 +146,7 @@ class FeatureExtractorPHM:
         self.logger.info(
             f"[{self.bearing_name}] Extracting features from {len(file_order)} bursts..."
         )
+
 
         # Per-burst feature extraction
         rows = []

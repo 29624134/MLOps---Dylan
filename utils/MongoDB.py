@@ -51,34 +51,45 @@ class FeatureStore:
         return {"dataset_id": self.dataset_id, "version": self.version}
 
     def save_features(self, dataset_id: str, version: str, df: pd.DataFrame, metadata=None, feature_type=None):
-        """Save features (with version, feature_type, and metadata) to MongoDB."""
-        if feature_type:
-            collection_name = f"{self.base_collection_name}{feature_type}"  # each feature type in its own collection
-        else:
-            collection_name = self.base_collection_name
-
-        collection = self.db[collection_name]
-
-        records = df.to_dict("records")
-        for record in records:
-            record["_dataset_id"] = dataset_id
-            record["_version"] = version
-            if feature_type:
-                record["_feature_type"] = feature_type
-
-        result = collection.insert_many(records)
-        logger.info(f"Stored {len(result.inserted_ids)} records for {dataset_id} (v{version}) - type: {feature_type}")
-
-        meta = {
+        # Skip if this bearing + version already exists
+        existing = self.meta_collection.find_one({
             "dataset_id": dataset_id,
             "version": version,
-            "feature_type": feature_type,
-            "row_count": len(df),
-            "columns": list(df.columns),
-            "created_at": pd.Timestamp.now().isoformat(),
-            **(metadata or {})
-        }
-        self.meta_collection.insert_one(meta)
+        })
+        if existing:
+            logger.info(f"  [{dataset_id}] Already in MongoDB for run {version} — skipping.")
+            return
+
+        collection_name = (
+            f"{self.base_collection_name}_{feature_type}"
+            if feature_type
+            else self.base_collection_name
+        )
+        collection = self.db[collection_name]
+
+        records = df.to_dict(orient="records")
+        for r in records:
+            r["dataset_id"] = dataset_id
+            r["version"] = version
+            r["metadata"] = metadata or {}
+
+        if records:
+            collection.insert_many(records)
+            logger.info(f"Inserted {len(records)} records into '{collection_name}'")
+
+        # Write metadata entry
+        self.meta_collection.update_one(
+            {"dataset_id": dataset_id, "version": version, "feature_type": feature_type},
+            {"$set": {
+                "dataset_id": dataset_id,
+                "version": version,
+                "feature_type": feature_type,
+                "n_records": len(records),
+                "columns": list(df.columns),
+                "metadata": metadata or {},
+            }},
+            upsert=True
+        )
         logger.info(f"Metadata saved for {dataset_id} (v{version}) - type: {feature_type}")
 
     def get_features(self, dataset_id: str, version: str = "latest", feature_type: str = None) -> pd.DataFrame:
