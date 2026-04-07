@@ -241,15 +241,56 @@ class WorkflowExecutor:
     no changes to workflow.yaml or this file are needed.
     """
 
-    def __init__(self, yaml_path: str = "config/workflow.yaml"):
-        with open(yaml_path, "r") as f:
-            workflows = yaml.safe_load(f)["workflows"]
+    def __init__(
+            self,
+            workflow_name: str = "rul_prediction",
+            yaml_path: str = "config/workflow.yaml",
+    ):
+        """
+        Initialise the executor, resolving the workflow definition from the
+        WorkflowRegistry if an active version exists, otherwise falling back
+        to the local YAML file (useful during development / bootstrapping).
 
-        self.workflow_def      = workflows["rul_prediction"]
-        self.state_manager     = WorkflowStateManager()
-        self.contract_manager  = DataContractManager()
+        Parameters
+        ----------
+        workflow_name : str
+            Logical workflow name to look up in the registry
+            (e.g. ``"rul_prediction"``).
+        yaml_path : str
+            Path to the local workflow YAML — used only when no active
+            workflow is found in the registry.
+        """
+        from utils.workflow_registry import WorkflowRegistry
 
-        # Load bearing registry
+        self.state_manager = WorkflowStateManager()
+        self.contract_manager = DataContractManager()
+
+        # ── 1. Try the Workflow Registry first ───────────────────────────────
+        wf_registry = WorkflowRegistry()
+        active_workflow = wf_registry.get_active_workflow(workflow_name)
+
+        if active_workflow:
+            self.workflow_def = active_workflow["definition"]
+            self._workflow_id = active_workflow["workflow_id"]
+            self._workflow_version = active_workflow["version"]
+            logger.info(
+                f"WorkflowExecutor: resolved '{workflow_name}' "
+                f"v{self._workflow_version} (id={self._workflow_id}) "
+                f"from WorkflowRegistry."
+            )
+        else:
+            # ── 2. Fall back to local YAML ────────────────────────────────────
+            logger.warning(
+                f"WorkflowExecutor: no active workflow found in registry for "
+                f"'{workflow_name}'. Falling back to '{yaml_path}'."
+            )
+            with open(yaml_path, "r") as f:
+                workflows = yaml.safe_load(f)["workflows"]
+            self.workflow_def = workflows[workflow_name]
+            self._workflow_id = None
+            self._workflow_version = "local"
+
+        # ── 3. Load bearing registry (same as before) ─────────────────────────
         bearing_config_path = self.workflow_def.get("bearing_config", "config/bearings.json")
         self.registry = BearingRegistry(bearing_config_path)
 
@@ -513,7 +554,7 @@ class WorkflowExecutor:
             from Live_implementation.live_predictor      import LivePredictor
             from utils.model_registry                    import ModelRegistry
 
-            registry    = ModelRegistry(run_id=run_id)
+            registry    = ModelRegistry()
             model_entry = registry.get_deployed_model("RUL_s")
             if not model_entry:
                 raise RuntimeError(
@@ -608,7 +649,7 @@ class WorkflowExecutor:
                     features_df["RUL_norm"] = (
                         features_df["RUL_s"] / failure_time_s if failure_time_s > 0 else 0.0
                     )
-                    features_df.drop(columns=["bearing"], inplace=True)
+                    features_df.drop(columns=["bearing"], inplace=True, errors="ignore")
 
                     features_df.to_csv(features_path, index=False)
                     logger.info(
@@ -663,10 +704,11 @@ class WorkflowExecutor:
         from utils.model_registry import ModelRegistry
         time.sleep(2)
 
-        registry = ModelRegistry(run_id=run_id)
-        models   = registry.list_models(status="pending") + registry.list_models(status="approved")
-        models_this_run = [m for m in models
-                           if m.get("metadata", {}).get("run_id") == run_id]
+        registry = ModelRegistry()
+        models_this_run = (
+            registry.list_models(status="pending",  run_id=run_id) +
+            registry.list_models(status="approved", run_id=run_id)
+        )
 
         if not models_this_run:
             raise ValueError(f"No models registered for run_id='{run_id}'")

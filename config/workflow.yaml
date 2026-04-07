@@ -40,25 +40,7 @@ workflows:
           log_base: "workflow_data/{run_id}/logs"
           burst_period: 10.0
           failure_threshold: 20.0
-          n_consecutive: 5
-
-          # -----------------------------------------------------------
-          # Signal pre-processing  (scripts/signal_preprocessor.py)
-          # Set enabled: false to run with raw signals (baseline).
-          # Set enabled: true  to apply the three pre-processing steps.
-          # -----------------------------------------------------------
-          preprocessor:
-            enabled: true              # master switch — false = raw signals
-
-            outlier_rejection: true    # IQR-based clipping before filtering
-            iqr_multiplier: 1.5        # fence = Q1/Q3 ± k * IQR  (Tukey default)
-
-            noise_filter: true         # zero-phase Butterworth low-pass filter
-            filter_order: 4            # filter order (higher = steeper roll-off)
-            cutoff_hz: 5000            # low-pass cutoff frequency in Hz
-            sample_rate_hz: 25600      # PHM 2012 accelerometer sample rate
-
-            normalise: true            # per-burst Min-Max scaling to [-1, 1]
+          n_consecutive: 1
 
       # ---------------------------------------------------------------
       # VALIDATION

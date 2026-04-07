@@ -53,7 +53,7 @@
       "name": "Bearing1_5",
       "role": "live",
       "condition": 1,
-      "status": "extracted"
+      "status": "available"
     },
     {
       "name": "Bearing1_6",

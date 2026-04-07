@@ -102,27 +102,25 @@ class LivePredictor:
     @classmethod
     def from_registry(
         cls,
-        run_id: str = "__deployed__",
         target_feature: str = "RUL_s",
         rul_scale: float = 30000.0,
     ) -> "LivePredictor":
         """
-        Load the currently deployed model from the ModelRegistry.
+        Load the currently deployed model from the global ModelRegistry.
 
         Parameters
         ----------
-        run_id         : registry run_id (use "__deployed__" for production)
         target_feature : feature the model predicts (default "RUL_s")
         rul_scale      : must match the rul_scale used during training
         """
         from utils.model_registry import ModelRegistry
 
-        registry = ModelRegistry(run_id=run_id)
+        registry = ModelRegistry()
         entry = registry.get_deployed_model(target_feature)
         if entry is None:
             raise RuntimeError(
                 f"No deployed model found for target_feature='{target_feature}' "
-                f"in registry run_id='{run_id}'"
+                f"in the global ModelRegistry."
             )
 
         logger.info(
