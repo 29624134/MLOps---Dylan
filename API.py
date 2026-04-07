@@ -3,6 +3,7 @@ from pydantic import BaseModel, Field
 from typing import Optional, Dict, Any
 from datetime import datetime
 from utils.model_registry import ModelRegistry
+from utils.workflow_registry import WorkflowRegistry
 import uuid
 import torch
 import joblib
@@ -44,9 +45,18 @@ class LiveServingRequest(BaseModel):
     realtime: bool = False               # True = sleep burst_period between bursts
     max_bursts: Optional[int] = None     # stop early (useful for testing)
 
+class RegisterWorkflowRequest(BaseModel):
+    workflow_name: str
+    version:       str
+    definition:    Dict[str, Any]
+    trigger:       Optional[Dict[str, Any]] = None
+    git_hash:      Optional[str]            = None
+    environment:   Optional[Dict[str, str]] = None
+    metadata:      Optional[Dict[str, Any]] = None
+
 
 # ====================================================================
-# WORKFLOW ENDPOINTS
+# WORKFLOW TRIGGER ENDPOINTS
 # ====================================================================
 
 @app.post("/workflow/trigger", response_model=Dict[str, str])
@@ -80,7 +90,7 @@ async def predict_rul(request: RULPredictionRequest):
     Predict remaining useful life for a single burst's feature vector.
     Returns the step-0 prediction from the multi-step horizon.
     """
-    registry = ModelRegistry(run_id="__deployed__")
+    registry = ModelRegistry()
     model_entry = registry.get_deployed_model(target_feature="RUL_s")
     if not model_entry:
         raise HTTPException(status_code=404, detail="No deployed RUL model found")
@@ -88,6 +98,7 @@ async def predict_rul(request: RULPredictionRequest):
     checkpoint = torch.load(model_entry["model_path"], map_location="cpu")
     scaler = joblib.load(io.BytesIO(checkpoint["scaler_bytes"]))
 
+    print(scaler.feature_names_in_.tolist())
     from models.rul_net_model import RULNetModel
     hp        = checkpoint.get("hyperparameters", {})
     rul_model = RULNetModel(**hp)
@@ -142,7 +153,7 @@ async def _run_live_serving_bg(run_id: str, request: LiveServingRequest):
     from orchestrator import BearingRegistry, WorkflowStateManager
     from Live_implementation.live_feature_buffer import LiveFeatureBuffer
     from Live_implementation.live_predictor      import LivePredictor
-    from scripts import DataIngestorPHM
+    from scripts.data_ingestor import DataIngestorPHM
 
     state_manager = WorkflowStateManager()
     state_manager.create_run_state(run_id, ["live_serving"])
@@ -162,7 +173,7 @@ async def _run_live_serving_bg(run_id: str, request: LiveServingRequest):
         source_folder = bearing_registry.source_path(bearing)
 
         # Load deployed model
-        model_registry = ModelRegistry(run_id="__deployed__")
+        model_registry = ModelRegistry()
         model_entry    = model_registry.get_deployed_model("RUL_s")
         if not model_entry:
             raise RuntimeError(
@@ -221,31 +232,130 @@ async def _run_live_serving_bg(run_id: str, request: LiveServingRequest):
 # ====================================================================
 
 @app.get("/models", operation_id="list_all_models")
-async def list_models(run_id: str, status: Optional[str] = None):
-    registry = ModelRegistry(run_id=run_id)
-    return registry.list_models(status=status)
+async def list_models(status: Optional[str] = None, run_id: Optional[str] = None, target_feature: Optional[str] = None):
+    registry = ModelRegistry()
+    return registry.list_models(status=status, run_id=run_id, target_feature=target_feature)
 
 @app.post("/models/{model_id}/approve", operation_id="approve_model_by_id")
-async def approve_model(run_id: str, model_id: str, approved_by: str):
-    registry = ModelRegistry(run_id=run_id)
+async def approve_model(model_id: str, approved_by: str):
+    registry = ModelRegistry()
     if not registry.approve_model(model_id, approved_by):
         raise HTTPException(status_code=400, detail="Failed to approve model")
     return {"status": "approved", "model_id": model_id}
 
 @app.post("/models/{model_id}/deploy")
-async def deploy_model(model_id: str, run_id: str):
-    registry = ModelRegistry(run_id=run_id)
+async def deploy_model(model_id: str):
+    registry = ModelRegistry()
     if not registry.deploy_model(model_id):
         raise HTTPException(status_code=400, detail="Failed to deploy model")
     return {"status": "deployed", "model_id": model_id}
 
 @app.get("/models/{target_feature}/deployed")
-async def get_deployed_model(target_feature: str, run_id: str):
-    registry = ModelRegistry(run_id=run_id)
+async def get_deployed_model(target_feature: str):
+    registry = ModelRegistry()
     model = registry.get_deployed_model(target_feature)
     if not model:
         raise HTTPException(status_code=404, detail="No deployed model found")
     return model
+
+
+# ====================================================================
+# WORKFLOW REGISTRY ENDPOINTS
+# ====================================================================
+
+@app.post("/workflows", operation_id="register_workflow")
+async def register_workflow(request: RegisterWorkflowRequest):
+    """Register a new workflow version. Called by CI after pushing a new definition."""
+    registry = WorkflowRegistry()
+    workflow_id = registry.register_workflow(
+        workflow_name = request.workflow_name,
+        version       = request.version,
+        definition    = request.definition,
+        trigger       = request.trigger,
+        git_hash      = request.git_hash,
+        environment   = request.environment,
+        metadata      = request.metadata,
+    )
+    return {"status": "registered", "workflow_id": workflow_id}
+
+@app.get("/workflows", operation_id="list_workflows")
+async def list_workflows(
+    workflow_name: Optional[str] = None,
+    status:        Optional[str] = None,
+):
+    """List all workflow records, with optional filters by name and/or status."""
+    registry = WorkflowRegistry()
+    return registry.list_workflows(workflow_name=workflow_name, status=status)
+
+@app.post("/workflows/{workflow_id}/approve", operation_id="approve_workflow")
+async def approve_workflow(workflow_id: str, approved_by: str):
+    """Transition a workflow from pending → approved. Called by CI on green build."""
+    registry = WorkflowRegistry()
+    if not registry.approve_workflow(workflow_id, approved_by):
+        raise HTTPException(status_code=400, detail="Failed to approve workflow")
+    return {"status": "approved", "workflow_id": workflow_id}
+
+@app.post("/workflows/{workflow_id}/reject", operation_id="reject_workflow")
+async def reject_workflow(workflow_id: str, rejected_by: str, reason: str = ""):
+    """Transition a workflow from pending → rejected. Called by CI on failed build."""
+    registry = WorkflowRegistry()
+    if not registry.reject_workflow(workflow_id, rejected_by, reason):
+        raise HTTPException(status_code=400, detail="Failed to reject workflow")
+    return {"status": "rejected", "workflow_id": workflow_id}
+
+@app.post("/workflows/{workflow_id}/activate", operation_id="activate_workflow")
+async def activate_workflow(workflow_id: str):
+    """
+    Transition an approved workflow → active.
+    Automatically deprecates any currently active version for the same workflow name.
+    """
+    registry = WorkflowRegistry()
+    if not registry.activate_workflow(workflow_id):
+        raise HTTPException(status_code=400, detail="Failed to activate workflow")
+    return {"status": "active", "workflow_id": workflow_id}
+
+@app.post("/workflows/{workflow_id}/deprecate", operation_id="deprecate_workflow")
+async def deprecate_workflow(workflow_id: str):
+    """Manually transition an active workflow → deprecated."""
+    registry = WorkflowRegistry()
+    if not registry.deprecate_workflow(workflow_id):
+        raise HTTPException(status_code=400, detail="Failed to deprecate workflow")
+    return {"status": "deprecated", "workflow_id": workflow_id}
+
+@app.post("/workflows/{workflow_id}/archive", operation_id="archive_workflow")
+async def archive_workflow(workflow_id: str):
+    """Retire a workflow record. Kept for lineage/audit; no longer served."""
+    registry = WorkflowRegistry()
+    if not registry.archive_workflow(workflow_id):
+        raise HTTPException(status_code=400, detail="Failed to archive workflow")
+    return {"status": "archived", "workflow_id": workflow_id}
+
+@app.get("/workflows/{workflow_name}/active", operation_id="get_active_workflow")
+async def get_active_workflow(workflow_name: str):
+    """
+    Return the currently active workflow definition for a given workflow name.
+    This is the primary endpoint consumed by the Scheduler (step 3 in the architecture).
+    """
+    registry = WorkflowRegistry()
+    workflow = registry.get_active_workflow(workflow_name)
+    if not workflow:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No active workflow found for '{workflow_name}'"
+        )
+    return workflow
+
+@app.get("/workflows/{workflow_name}/approved/latest", operation_id="get_latest_approved_workflow")
+async def get_latest_approved_workflow(workflow_name: str):
+    """Return the most recently approved (not yet active) workflow version."""
+    registry = WorkflowRegistry()
+    workflow = registry.get_latest_approved(workflow_name)
+    if not workflow:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No approved workflow found for '{workflow_name}'"
+        )
+    return workflow
 
 
 # ====================================================================
@@ -254,7 +364,7 @@ async def get_deployed_model(target_feature: str, run_id: str):
 
 async def execute_workflow_async(run_id: str, request: WorkflowTriggerRequest):
     from orchestrator import WorkflowExecutor
-    executor = WorkflowExecutor("config/workflow.yaml")
+    executor = WorkflowExecutor(workflow_name=request.workflow_name)
     executor.start_workflow(run_id)
 
 

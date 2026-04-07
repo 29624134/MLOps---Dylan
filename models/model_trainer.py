@@ -210,9 +210,18 @@ class RULTrainerPHM:
         }
 
     def save_model(self, model: RULNetModel, scaler: StandardScaler) -> str:
-        """Save model checkpoint (includes scaler). Returns saved path."""
-        os.makedirs(self.output_location, exist_ok=True)
-        model_path = os.path.join(self.output_location, "rul_model.pt")
+        """
+        Save model checkpoint (includes scaler) to the global model store.
+        Returns saved path.
+
+        Models are saved to model_registry/models/ with a timestamp-based
+        filename so each training run produces a uniquely named file,
+        independent of run_id scoping.
+        """
+        model_dir = os.path.join("model_registry", "models")
+        os.makedirs(model_dir, exist_ok=True)
+        timestamp  = datetime.now().strftime("%Y%m%d_%H%M%S")
+        model_path = os.path.join(model_dir, f"rul_model_{timestamp}.pt")
         model.scaler = scaler
         model.save(model_path)
         self.logger.info(f"Model saved to {model_path}")
@@ -220,6 +229,7 @@ class RULTrainerPHM:
 
     def save_results(self, metrics: Dict) -> str:
         """Save per-bearing results CSV. Returns saved path."""
+        os.makedirs(self.output_location, exist_ok=True)
         results_csv = os.path.join(self.output_location, "rul_test_results.csv")
         pd.DataFrame(metrics.get("summary_rows", [])).to_csv(results_csv, index=False)
         self.logger.info(f"Results saved to {results_csv}")
@@ -228,7 +238,7 @@ class RULTrainerPHM:
     def register_model(self, run_id: str, model: RULNetModel,
                        model_path: str, metrics: Dict) -> str:
         """Register trained model in ModelRegistry. Returns model_id."""
-        registry = ModelRegistry(run_id=run_id)
+        registry = ModelRegistry()
 
         training_data_info = {
             "num_train_files": len(self.train_files),
