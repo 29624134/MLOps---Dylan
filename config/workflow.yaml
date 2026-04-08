@@ -7,6 +7,16 @@ workflows:
     # source data paths. Add new bearings here only.
     bearing_config: "config/bearings.json"
 
+    # ---------------------------------------------------------------
+    # MONGODB
+    # Feature Store connection settings.
+    # Set enabled: false to skip all MongoDB writes.
+    # ---------------------------------------------------------------
+    mongodb:
+      enabled: true
+      uri: "mongodb://localhost:27017"
+      db_name: "phm_mlops"
+
     steps:
 
       # ---------------------------------------------------------------
@@ -109,3 +119,33 @@ workflows:
           output_base: "workflow_data/{run_id}/live"
           state_location: "workflow_data/{run_id}/state/live_serving.flag"
           log_path: "workflow_data/{run_id}/logs/live_serving.log"
+
+      # ---------------------------------------------------------------
+      # SERVING PIPELINE
+      # Runs the full 4-stage pipeline (Feature Engineering → Inference →
+      # Predictive Maintenance → MLOps Monitoring) for all live bearings.
+      #
+      # Outputs:
+      #   step 7  → Feature Store (versioned features, MongoDB)
+      #   step 9  → Serving History (MongoDB serving_history collection)
+      #   step 10 → Audit Service (via Serving History metadata)
+      #             Dashboard (RUL metrics via monitoring output)
+      #             Export Service (stubbed)
+      #
+      # critical_threshold_s: RUL ≤ this → status = "critical"  (default 1 hr)
+      # warning_threshold_s:  RUL ≤ this → status = "warning"   (default 4 hr)
+      # baseline_path: where the monitoring baseline JSON is persisted.
+      #   Delete this file to force a new baseline on the next run.
+      # ---------------------------------------------------------------
+      - id: serving_pipeline
+        type: serving_pipeline
+        depends_on: ["live_serving"]
+        config:
+          window_size: 40
+          burst_period: 10.0
+          realtime: false
+          critical_threshold_s: 3600
+          warning_threshold_s: 14400
+          baseline_path: "model_registry/monitoring_baseline.json"
+          state_location: "workflow_data/{run_id}/state/serving_pipeline.flag"
+          log_path: "workflow_data/{run_id}/logs/serving_pipeline.log"

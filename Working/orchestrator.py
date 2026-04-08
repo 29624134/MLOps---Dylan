@@ -1,17 +1,3 @@
-"""
-orchestrator_MongoDB.py
-═══════════════════════════════════════════════════════════════════════════════
-Workflow Orchestrator — MongoDB edition.
-
-Identical to orchestrator.py with these additions:
-  1. _mongo_config()        — reads MongoDB connection settings from workflow.yaml
-  2. _run_extraction()      — pushes features to MongoDB Feature Store after extraction
-  3. _run_mongo_backfill()  — pushes already-extracted features.csv files into MongoDB
-  4. start_workflow()       — includes Phase 2b (backfill) and Phase 7 (Serving Pipeline)
-  5. _run_serving_pipeline()— runs the 4-stage Serving Pipeline for all live bearings
-                              and persists results to Serving History (MongoDB)
-"""
-
 import os
 import json
 import yaml
@@ -80,12 +66,15 @@ class BearingRegistry:
         return self.bearings
 
     def available_bearings(self) -> List[Dict]:
+        """Bearings with data on disk that have not yet been processed."""
         return [b for b in self.bearings if b.get("status") == "available"]
 
     def missing_bearings(self) -> List[Dict]:
+        """Bearings registered but whose data has not arrived yet."""
         return [b for b in self.bearings if b.get("status") == "missing"]
 
     def ready_bearings(self) -> List[Dict]:
+        """Bearings fully processed and ready for training (extracted)."""
         return [b for b in self.bearings if b.get("status") == "extracted"]
 
     def train_bearings(self) -> List[Dict]:
@@ -98,6 +87,7 @@ class BearingRegistry:
         return [b for b in self.bearings if b["role"] in ("test", "val_test")]
 
     def live_bearings(self) -> List[Dict]:
+        """Bearings designated for live inference streaming."""
         return [b for b in self.bearings if b["role"] == "live"]
 
     def is_test(self, bearing: Dict) -> bool:
@@ -107,6 +97,7 @@ class BearingRegistry:
         return os.path.join(self.base_path, bearing["name"])
 
     def print_status(self):
+        """Log a readable summary of all bearing statuses."""
         from collections import Counter
         counts = Counter(b.get("status", "unknown") for b in self.bearings)
         logger.info("── Bearing registry status ──────────────────────")
@@ -122,6 +113,7 @@ class BearingRegistry:
     # ── Updates ───────────────────────────────────────────────────────────────
 
     def set_status(self, bearing_name: str, status: str):
+        """Update the status of a single bearing and persist to disk."""
         if status not in self.VALID_STATUSES:
             raise ValueError(f"Invalid status '{status}'. Must be one of {self.VALID_STATUSES}")
         for b in self.bearings:
@@ -133,6 +125,10 @@ class BearingRegistry:
         raise ValueError(f"Bearing '{bearing_name}' not found in registry")
 
     def sync_from_disk(self):
+        """
+        Auto-detect which bearings actually have data on disk and update
+        status from 'missing' -> 'available' if the source folder now exists.
+        """
         changed = False
         for b in self.bearings:
             if b.get("status") == "missing" and os.path.isdir(self.source_path(b)):
@@ -215,6 +211,7 @@ class DataContractManager:
         return template.format(run_id=run_id)
 
     def resolve_config(self, config: Dict, run_id: str) -> Dict:
+        """Recursively resolve all string values in a config dict."""
         resolved = {}
         for key, val in config.items():
             if isinstance(val, str):
@@ -232,28 +229,49 @@ class DataContractManager:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# WORKFLOW EXECUTOR  (MongoDB edition)
+# WORKFLOW EXECUTOR
 # ─────────────────────────────────────────────────────────────────────────────
 
 class WorkflowExecutor:
+    """
+    Reads workflow.yaml and bearings.json, then dynamically expands
+    template steps into per-bearing executions at runtime.
+
+    Adding new bearings requires only editing config/bearings.json —
+    no changes to workflow.yaml or this file are needed.
+    """
 
     def __init__(
-        self,
-        workflow_name: str = "rul_prediction",
-        yaml_path: str = "config/workflow.yaml",
+            self,
+            workflow_name: str = "rul_prediction",
+            yaml_path: str = "config/workflow.yaml",
     ):
+        """
+        Initialise the executor, resolving the workflow definition from the
+        WorkflowRegistry if an active version exists, otherwise falling back
+        to the local YAML file (useful during development / bootstrapping).
+
+        Parameters
+        ----------
+        workflow_name : str
+            Logical workflow name to look up in the registry
+            (e.g. ``"rul_prediction"``).
+        yaml_path : str
+            Path to the local workflow YAML — used only when no active
+            workflow is found in the registry.
+        """
         from utils.workflow_registry import WorkflowRegistry
 
-        self.state_manager    = WorkflowStateManager()
+        self.state_manager = WorkflowStateManager()
         self.contract_manager = DataContractManager()
 
-        # ── 1. Try the Workflow Registry first ────────────────────────────────
-        wf_registry     = WorkflowRegistry()
+        # ── 1. Try the Workflow Registry first ───────────────────────────────
+        wf_registry = WorkflowRegistry()
         active_workflow = wf_registry.get_active_workflow(workflow_name)
 
         if active_workflow:
-            self.workflow_def      = active_workflow["definition"]
-            self._workflow_id      = active_workflow["workflow_id"]
+            self.workflow_def = active_workflow["definition"]
+            self._workflow_id = active_workflow["workflow_id"]
             self._workflow_version = active_workflow["version"]
             logger.info(
                 f"WorkflowExecutor: resolved '{workflow_name}' "
@@ -268,35 +286,13 @@ class WorkflowExecutor:
             )
             with open(yaml_path, "r") as f:
                 workflows = yaml.safe_load(f)["workflows"]
-            self.workflow_def      = workflows[workflow_name]
-            self._workflow_id      = None
+            self.workflow_def = workflows[workflow_name]
+            self._workflow_id = None
             self._workflow_version = "local"
 
-        # ── 3. Bearing registry ───────────────────────────────────────────────
+        # ── 3. Load bearing registry (same as before) ─────────────────────────
         bearing_config_path = self.workflow_def.get("bearing_config", "config/bearings.json")
         self.registry = BearingRegistry(bearing_config_path)
-
-    # ── MongoDB config helper ─────────────────────────────────────────────────
-
-    def _mongo_config(self) -> Dict:
-        """
-        Return MongoDB connection settings from the workflow definition.
-
-        Expected in workflow.yaml under the workflow root:
-            mongodb:
-              enabled: true
-              uri:     "mongodb://localhost:27017"
-              db_name: "phm_mlops"
-
-        Returns a dict with keys: enabled, uri, db_name.
-        If the section is absent, returns {enabled: False}.
-        """
-        mongo = self.workflow_def.get("mongodb", {})
-        return {
-            "enabled": bool(mongo.get("enabled", False)),
-            "uri":     mongo.get("uri",     "mongodb://localhost:27017"),
-            "db_name": mongo.get("db_name", "phm_mlops"),
-        }
 
     # ── Step template helpers ─────────────────────────────────────────────────
 
@@ -318,26 +314,12 @@ class WorkflowExecutor:
     def _live_serving_step(self) -> Dict:
         return next(s for s in self.workflow_def["steps"] if s["id"] == "live_serving")
 
-    def _serving_pipeline_step(self) -> Dict:
-        """Workflow step definition for the Serving Pipeline phase."""
-        return {
-            "id":   "serving_pipeline",
-            "type": "serving_pipeline",
-            "config": {
-                "window_size":          40,
-                "burst_period":         10.0,
-                "realtime":             False,
-                "critical_threshold_s": 3600,
-                "warning_threshold_s":  14400,
-                "baseline_path":        "model_registry/monitoring_baseline.json",
-            },
-        }
-
-    # ── Entry point ───────────────────────────────────────────────────────────
+    # ── Entry point ──────────────────────────────────────────────────────────
 
     def start_workflow(self, run_id: str):
-        logger.info(f"Starting RUL workflow (MongoDB) | run_id={run_id}")
+        logger.info(f"Starting RUL workflow | run_id={run_id}")
 
+        # Auto-detect any newly arrived data before doing anything
         self.registry.sync_from_disk()
         self.registry.print_status()
 
@@ -346,7 +328,7 @@ class WorkflowExecutor:
 
         if missing:
             logger.warning(
-                f"  {len(missing)} bearing(s) registered but data missing: "
+                f"  {len(missing)} bearing(s) are registered but data is missing: "
                 f"{[b['name'] for b in missing]}"
             )
 
@@ -355,6 +337,8 @@ class WorkflowExecutor:
         def _features(b):
             return os.path.join(self.registry.source_path(b), "features.csv")
 
+        # Live bearings are excluded from ingestion/extraction/training —
+        # they are only used for live inference after the model is deployed.
         non_live = [b for b in all_bearings if b["role"] != "live"]
 
         needs_ingestion  = [b for b in non_live
@@ -365,7 +349,8 @@ class WorkflowExecutor:
                             if b.get("status") != "missing"
                             and os.path.exists(_parquet(b))
                             and not os.path.exists(_features(b))]
-        done             = [b for b in non_live if os.path.exists(_features(b))]
+        done             = [b for b in non_live
+                            if os.path.exists(_features(b))]
 
         if not needs_ingestion and not needs_extraction and not done:
             logger.error("No bearings have data on disk. Aborting workflow.")
@@ -377,14 +362,12 @@ class WorkflowExecutor:
             f"{len(done)} already have features.csv"
         )
 
+        # Build step IDs for work that needs doing
         ingest_ids   = [f"ingest_{b['name'].lower()}"  for b in needs_ingestion]
         extract_ids  = [f"extract_{b['name'].lower()}" for b in needs_ingestion + needs_extraction]
-        all_step_ids = (
-            ingest_ids + extract_ids
-            + ["validation", "training", "model_selection", "live_serving", "serving_pipeline"]
-        )
+        all_step_ids = ingest_ids + extract_ids + ["validation", "training", "model_selection", "live_serving"]
 
-        self.state_manager.create_run_state(run_id, all_step_ids)
+        state = self.state_manager.create_run_state(run_id, all_step_ids)
 
         # ── 1. Ingestion ──────────────────────────────────────────────────────
         if needs_ingestion:
@@ -392,7 +375,7 @@ class WorkflowExecutor:
             for bearing in needs_ingestion:
                 self._run_ingestion(run_id, bearing)
         else:
-            logger.info(f"[{run_id}] Phase 1: Ingestion — skipped")
+            logger.info(f"[{run_id}] Phase 1: Ingestion — skipped (all bearings have parquet or features.csv)")
 
         # ── 2. Feature extraction ─────────────────────────────────────────────
         just_ingested     = [b for b in needs_ingestion if b.get("status") == "ingested"]
@@ -402,11 +385,7 @@ class WorkflowExecutor:
             for bearing in needs_extract_now:
                 self._run_extraction(run_id, bearing)
         else:
-            logger.info(f"[{run_id}] Phase 2: Feature extraction — skipped")
-
-        # ── 2b. MongoDB backfill ──────────────────────────────────────────────
-        logger.info(f"[{run_id}] Phase 2b: MongoDB Feature Store backfill")
-        self._run_mongo_backfill(run_id)
+            logger.info(f"[{run_id}] Phase 2: Feature extraction — skipped (all bearings have features.csv)")
 
         # ── 3. Validation ─────────────────────────────────────────────────────
         logger.info(f"[{run_id}] Phase 3: Validation")
@@ -423,10 +402,6 @@ class WorkflowExecutor:
         # ── 6. Live serving ───────────────────────────────────────────────────
         logger.info(f"[{run_id}] Phase 6: Live serving")
         self._run_live_serving(run_id)
-
-        # ── 7. Serving Pipeline ───────────────────────────────────────────────
-        logger.info(f"[{run_id}] Phase 7: Serving Pipeline")
-        self._run_serving_pipeline(run_id)
 
         logger.info(f"[{run_id}] Workflow complete!")
 
@@ -458,7 +433,7 @@ class WorkflowExecutor:
             self.registry.set_status(bearing["name"], "error")
 
     def _run_extraction(self, run_id: str, bearing: Dict):
-        """Extract features for one bearing, then push to MongoDB Feature Store."""
+        """Extract features for one bearing."""
         step_id       = f"extract_{bearing['name'].lower()}"
         template      = self.contract_manager.resolve_config(self._extraction_template(), run_id)
         state_base    = template["state_base"]
@@ -483,65 +458,8 @@ class WorkflowExecutor:
         state = self.state_manager.load_state(run_id)
         if state["steps"][step_id]["status"] == "COMPLETE":
             self.registry.set_status(bearing["name"], "extracted")
-            # ── Push features to MongoDB Feature Store ────────────────────────
-            mongo_cfg = self._mongo_config()
-            if mongo_cfg.get("enabled"):
-                from utils.MongoDB import FeatureStore
-                features_path = os.path.join(source_folder, "features.csv")
-                store = FeatureStore({
-                    "mongo_uri":        mongo_cfg["uri"],
-                    "db_name":          mongo_cfg["db_name"],
-                    "collection_name":  "features",
-                    "dataset_id":       bearing["name"],
-                    "version":          run_id,
-                    "df_path":          features_path,
-                    "metadata": {
-                        "bearing_name": bearing["name"],
-                        "role":         bearing["role"],
-                        "run_id":       run_id,
-                    },
-                })
-                store.run()
-                logger.info(f"  [{bearing['name']}] Features ingested into MongoDB")
         else:
             self.registry.set_status(bearing["name"], "error")
-
-    def _run_mongo_backfill(self, run_id: str):
-        """Push already-extracted features.csv files into MongoDB (one-time backfill)."""
-        mongo_cfg = self._mongo_config()
-        if not mongo_cfg.get("enabled"):
-            logger.info("MongoDB not enabled — skipping backfill.")
-            return
-
-        from utils.MongoDB import FeatureStore
-
-        logger.info(f"[{run_id}] MongoDB backfill: pushing existing features.csv files...")
-        for bearing in self.registry.all_bearings():
-            if bearing["role"] == "live":
-                continue  # live bearing handled separately
-            source_folder = self.registry.source_path(bearing)
-            features_path = os.path.join(source_folder, "features.csv")
-
-            if not os.path.exists(features_path):
-                logger.warning(f"  [{bearing['name']}] No features.csv found — skipping.")
-                continue
-
-            store = FeatureStore({
-                "mongo_uri":        mongo_cfg["uri"],
-                "db_name":          mongo_cfg["db_name"],
-                "collection_name":  "features",
-                "dataset_id":       bearing["name"],
-                "version":          run_id,
-                "df_path":          features_path,
-                "metadata": {
-                    "bearing_name": bearing["name"],
-                    "role":         bearing["role"],
-                    "run_id":       run_id,
-                    "source":       "backfill",
-                },
-            })
-            store.run()
-            logger.info(f"  [{bearing['name']}] ✓ ingested into MongoDB")
 
     def _run_validation(self, run_id: str):
         """Validate all feature CSVs produced across all bearings."""
@@ -689,6 +607,7 @@ class WorkflowExecutor:
 
                     rul_s = predictor.predict(vec)
 
+                    # Prediction record
                     entry = {
                         "bearing":   bearing["name"],
                         "burst_idx": burst["burst_idx"],
@@ -709,6 +628,7 @@ class WorkflowExecutor:
                 out_base = cfg.get("output_base", f"workflow_data/{run_id}/live")
                 os.makedirs(out_base, exist_ok=True)
 
+                # Save predictions
                 if predictions:
                     out_path = os.path.join(out_base, f"{bearing['name']}_predictions.csv")
                     pd.DataFrame(predictions).to_csv(out_path, index=False)
@@ -717,15 +637,20 @@ class WorkflowExecutor:
                     )
                     all_predictions.extend(predictions)
 
+                # Save raw base features and label RUL now that all bursts are seen.
+                # failure_time_s = last recorded time_s (end of recording).
+                # RUL_s = failure_time_s - time_s for every row.
                 if live_features:
-                    features_path  = os.path.join(out_base, f"{bearing['name']}_live_features.csv")
-                    features_df    = pd.DataFrame(live_features)
+                    features_path = os.path.join(out_base, f"{bearing['name']}_live_features.csv")
+                    features_df   = pd.DataFrame(live_features)
+
                     failure_time_s = features_df["time_s"].max()
                     features_df["RUL_s"]    = (failure_time_s - features_df["time_s"]).clip(lower=0.0)
                     features_df["RUL_norm"] = (
                         features_df["RUL_s"] / failure_time_s if failure_time_s > 0 else 0.0
                     )
                     features_df.drop(columns=["bearing"], inplace=True, errors="ignore")
+
                     features_df.to_csv(features_path, index=False)
                     logger.info(
                         f"  [{bearing['name']}] {len(features_df)} feature rows saved → {features_path}"
@@ -737,93 +662,11 @@ class WorkflowExecutor:
                     )
 
             return {
-                "n_predictions":   len(all_predictions),
+                "n_predictions":  len(all_predictions),
                 "bearings_served": [b["name"] for b in live_bearings],
             }
 
         self._execute(run_id, step_id, "live_serving", config, _serve)
-
-    def _run_serving_pipeline(self, run_id: str) -> None:
-        """
-        Phase 7: Run the full 4-stage Serving Pipeline for all live bearings.
-
-        Wires (per diagram):
-            WFOrch ──(step 5/6)──► ServPipeline ──(step 7)──► FeatStore
-                                                 ──(step 9)──► ServHistory
-                                                 ──────────►  ExportSvc (stub)
-                                                 ──────────►  Dashboard (via monitoring)
-        """
-        live_bearings = self.registry.live_bearings()
-        if not live_bearings:
-            logger.info(
-                f"[{run_id}] Phase 7: Serving Pipeline — skipped (no live bearings)"
-            )
-            return
-
-        step   = self._serving_pipeline_step()
-        config = self.contract_manager.resolve_config(step["config"], run_id)
-
-        # ── Build pipeline config, injecting MongoDB settings if available ────
-        mongo_cfg    = self._mongo_config()
-        pipeline_cfg = {
-            "window_size":            int(config.get("window_size", 40)),
-            "burst_period":           float(config.get("burst_period", 10.0)),
-            "realtime":               bool(config.get("realtime", False)),
-            "critical_threshold_s":   int(config.get("critical_threshold_s", 3600)),
-            "warning_threshold_s":    int(config.get("warning_threshold_s", 14400)),
-            "baseline_path":          config.get(
-                "baseline_path", "model_registry/monitoring_baseline.json"
-            ),
-            "enable_serving_history": True,
-            "mongo_uri":              mongo_cfg["uri"],
-            "db_name":                mongo_cfg["db_name"],
-        }
-
-        def _run_pipeline(cfg):
-            from serving_pipeline.serving_pipeline import ServingPipeline
-
-            pipeline    = ServingPipeline(config=pipeline_cfg)
-            all_results = []
-
-            for bearing in live_bearings:
-                source_folder = self.registry.source_path(bearing)
-                logger.info(
-                    f"[{run_id}] Serving Pipeline: {bearing['name']} "
-                    f"({'realtime' if pipeline_cfg['realtime'] else 'fast replay'})"
-                )
-
-                results = pipeline.run_bearing(
-                    run_id        = run_id,
-                    bearing_name  = bearing["name"],
-                    source_folder = source_folder,
-                    burst_period  = pipeline_cfg["burst_period"],
-                    realtime      = pipeline_cfg["realtime"],
-                )
-
-                n_ready  = sum(1 for r in results if r.get("ready"))
-                n_alerts = sum(
-                    1 for r in results
-                    if r.get("ready") and r.get("pm", {}).get("alert", False)
-                )
-                n_errors = sum(1 for r in results if not r.get("ok"))
-
-                logger.info(
-                    f"  [{bearing['name']}] bursts={len(results)}  "
-                    f"ready={n_ready}  alerts={n_alerts}  errors={n_errors}"
-                )
-                all_results.extend(results)
-
-            return {
-                "bearings_served": [b["name"] for b in live_bearings],
-                "total_bursts":    len(all_results),
-                "ready_bursts":    sum(1 for r in all_results if r.get("ready")),
-                "total_alerts":    sum(
-                    1 for r in all_results
-                    if r.get("ready") and r.get("pm", {}).get("alert", False)
-                ),
-            }
-
-        self._execute(run_id, "serving_pipeline", "serving_pipeline", config, _run_pipeline)
 
     # ── Generic step executor ─────────────────────────────────────────────────
 
@@ -888,5 +731,5 @@ class WorkflowExecutor:
 # ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    executor = WorkflowExecutor("config/workflow.yaml")
+    executor = WorkflowExecutor("../config/workflow.yaml")
     executor.start_workflow()

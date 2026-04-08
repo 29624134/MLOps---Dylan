@@ -1,30 +1,16 @@
-"""
-API.py
-═══════════════════════════════════════════════════════════════════════════════
-PHM 2012 RUL Prediction API
-"""
-
-import io
-import os
-import uuid
-from datetime import datetime
-from typing import Any, Dict, List, Optional
-
-import joblib
-import numpy as np
-import pandas as pd
-import torch
-from fastapi import BackgroundTasks, FastAPI, HTTPException, WebSocket
+from fastapi import FastAPI, HTTPException, BackgroundTasks, WebSocket
 from pydantic import BaseModel, Field
-
+from typing import Optional, Dict, Any
+from datetime import datetime
 from utils.model_registry import ModelRegistry
 from utils.workflow_registry import WorkflowRegistry
+import uuid
+import torch
+import joblib
+import numpy as np
+import io
 
 app = FastAPI(title="PHM 2012 RUL Prediction API", version="1.0.0")
-
-# ── Serving Pipeline router ───────────────────────────────────────────────────
-from serving_pipeline.serving_pipeline_routes import router as serving_router
-app.include_router(serving_router)
 
 
 # ====================================================================
@@ -32,32 +18,32 @@ app.include_router(serving_router)
 # ====================================================================
 
 class WorkflowTriggerRequest(BaseModel):
-    workflow_name:    str                    = "rul_prediction"
+    workflow_name: str = "rul_prediction"
     config_overrides: Optional[Dict[str, Any]] = None
-    priority:         str                    = Field(default="normal", pattern="^(low|normal|high)$")
+    priority: str = Field(default="normal", pattern="^(low|normal|high)$")
 
 class WorkflowStatusResponse(BaseModel):
-    run_id:     str
-    status:     str
+    run_id: str
+    status: str
     start_time: str
-    end_time:   Optional[str]       = None
-    steps:      Dict[str, Dict]
+    end_time: Optional[str] = None
+    steps: Dict[str, Dict]
 
 class RULPredictionRequest(BaseModel):
-    features:      Dict[str, float]
+    features: Dict[str, float]
     model_version: Optional[str] = "latest"
 
 class RULPredictionResponse(BaseModel):
-    predicted_rul_s:   float
+    predicted_rul_s: float
     predicted_rul_min: float
-    horizon:           int
-    model_version:     str
-    timestamp:         str
+    horizon: int
+    model_version: str
+    timestamp: str
 
 class LiveServingRequest(BaseModel):
-    bearing_name: str                  # must match a bearing with role='live' in bearings.json
-    realtime:     bool          = False
-    max_bursts:   Optional[int] = None
+    bearing_name: str                    # must match a bearing with role='live' in bearings.json
+    realtime: bool = False               # True = sleep burst_period between bursts
+    max_bursts: Optional[int] = None     # stop early (useful for testing)
 
 class RegisterWorkflowRequest(BaseModel):
     workflow_name: str
@@ -79,7 +65,6 @@ async def trigger_workflow(request: WorkflowTriggerRequest, background_tasks: Ba
     background_tasks.add_task(execute_workflow_async, run_id, request)
     return {"run_id": run_id, "status": "queued"}
 
-
 @app.get("/workflow/{run_id}/status", response_model=WorkflowStatusResponse)
 async def get_workflow_status(run_id: str):
     from orchestrator import WorkflowStateManager
@@ -90,22 +75,9 @@ async def get_workflow_status(run_id: str):
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
 
-
 @app.get("/workflow/{run_id}/artifacts")
 async def get_workflow_artifacts(run_id: str):
     return {"artifacts": []}
-
-
-async def execute_workflow_async(run_id: str, request: WorkflowTriggerRequest):
-    """Background task: run the full orchestrator workflow."""
-    try:
-        from orchestrator_MongoDB import WorkflowExecutor
-        executor = WorkflowExecutor("config/workflow.yaml")
-        executor.start_workflow(run_id=run_id)
-    except Exception as e:
-        from orchestrator import WorkflowStateManager
-        WorkflowStateManager().update_step_status(run_id, "workflow", "FAILED", str(e))
-        raise
 
 
 # ====================================================================
@@ -118,13 +90,13 @@ async def predict_rul(request: RULPredictionRequest):
     Predict remaining useful life for a single burst's feature vector.
     Returns the step-0 prediction from the multi-step horizon.
     """
-    registry    = ModelRegistry()
+    registry = ModelRegistry()
     model_entry = registry.get_deployed_model(target_feature="RUL_s")
     if not model_entry:
         raise HTTPException(status_code=404, detail="No deployed RUL model found")
 
     checkpoint = torch.load(model_entry["model_path"], map_location="cpu")
-    scaler     = joblib.load(io.BytesIO(checkpoint["scaler_bytes"]))
+    scaler = joblib.load(io.BytesIO(checkpoint["scaler_bytes"]))
 
     print(scaler.feature_names_in_.tolist())
     from models.rul_net_model import RULNetModel
@@ -140,8 +112,9 @@ async def predict_rul(request: RULPredictionRequest):
     features        = np.array([list(request.features.values())], dtype=np.float32)
     features_scaled = scaler.transform(features)
 
+    # Use direct forward pass (single row — sliding window loop needs horizon rows)
     with torch.no_grad():
-        x_in  = torch.tensor(features_scaled, dtype=torch.float32)
+        x_in = torch.tensor(features_scaled, dtype=torch.float32)
         preds = rul_model.model(x_in).detach().cpu().numpy().reshape(-1)
 
     rul_scale     = hp.get("rul_scale", 30000.0)
@@ -175,29 +148,25 @@ async def start_live_serving(request: LiveServingRequest, background_tasks: Back
 
 async def _run_live_serving_bg(run_id: str, request: LiveServingRequest):
     """Background task: stream a live bearing through the deployed model."""
-    from orchestrator import WorkflowStateManager
+    import os
+    import pandas as pd
+    from orchestrator import BearingRegistry, WorkflowStateManager
     from Live_implementation.live_feature_buffer import LiveFeatureBuffer
-    from Live_implementation.live_predictor import LivePredictor
+    from Live_implementation.live_predictor      import LivePredictor
     from scripts.data_ingestor import DataIngestorPHM
-    import json
 
     state_manager = WorkflowStateManager()
+    state_manager.create_run_state(run_id, ["live_serving"])
     state_manager.update_step_status(run_id, "live_serving", "RUNNING")
 
     try:
-        # Resolve bearing from registry
-        with open("config/bearings.json") as f:
-            bearings_data = json.load(f)
-
-        from orchestrator import BearingRegistry
+        # Resolve the bearing
         bearing_registry = BearingRegistry("config/bearings.json")
-        matching = [
-            b for b in bearing_registry.all_bearings()
-            if b["name"] == request.bearing_name
-        ]
+        matching = [b for b in bearing_registry.live_bearings()
+                    if b["name"] == request.bearing_name]
         if not matching:
             raise ValueError(
-                f"Bearing '{request.bearing_name}' not found in bearings.json. "
+                f"Bearing '{request.bearing_name}' not found or does not have role='live'. "
                 f"Check config/bearings.json."
             )
         bearing       = matching[0]
@@ -263,14 +232,9 @@ async def _run_live_serving_bg(run_id: str, request: LiveServingRequest):
 # ====================================================================
 
 @app.get("/models", operation_id="list_all_models")
-async def list_models(
-    status:         Optional[str] = None,
-    run_id:         Optional[str] = None,
-    target_feature: Optional[str] = None,
-):
+async def list_models(status: Optional[str] = None, run_id: Optional[str] = None, target_feature: Optional[str] = None):
     registry = ModelRegistry()
     return registry.list_models(status=status, run_id=run_id, target_feature=target_feature)
-
 
 @app.post("/models/{model_id}/approve", operation_id="approve_model_by_id")
 async def approve_model(model_id: str, approved_by: str):
@@ -279,14 +243,12 @@ async def approve_model(model_id: str, approved_by: str):
         raise HTTPException(status_code=400, detail="Failed to approve model")
     return {"status": "approved", "model_id": model_id}
 
-
 @app.post("/models/{model_id}/deploy")
 async def deploy_model(model_id: str):
     registry = ModelRegistry()
     if not registry.deploy_model(model_id):
         raise HTTPException(status_code=400, detail="Failed to deploy model")
     return {"status": "deployed", "model_id": model_id}
-
 
 @app.get("/models/{target_feature}/deployed")
 async def get_deployed_model(target_feature: str):
@@ -304,7 +266,7 @@ async def get_deployed_model(target_feature: str):
 @app.post("/workflows", operation_id="register_workflow")
 async def register_workflow(request: RegisterWorkflowRequest):
     """Register a new workflow version. Called by CI after pushing a new definition."""
-    registry    = WorkflowRegistry()
+    registry = WorkflowRegistry()
     workflow_id = registry.register_workflow(
         workflow_name = request.workflow_name,
         version       = request.version,
@@ -316,7 +278,6 @@ async def register_workflow(request: RegisterWorkflowRequest):
     )
     return {"status": "registered", "workflow_id": workflow_id}
 
-
 @app.get("/workflows", operation_id="list_workflows")
 async def list_workflows(
     workflow_name: Optional[str] = None,
@@ -326,7 +287,6 @@ async def list_workflows(
     registry = WorkflowRegistry()
     return registry.list_workflows(workflow_name=workflow_name, status=status)
 
-
 @app.post("/workflows/{workflow_id}/approve", operation_id="approve_workflow")
 async def approve_workflow(workflow_id: str, approved_by: str):
     """Transition a workflow from pending → approved. Called by CI on green build."""
@@ -335,31 +295,98 @@ async def approve_workflow(workflow_id: str, approved_by: str):
         raise HTTPException(status_code=400, detail="Failed to approve workflow")
     return {"status": "approved", "workflow_id": workflow_id}
 
-
 @app.post("/workflows/{workflow_id}/reject", operation_id="reject_workflow")
 async def reject_workflow(workflow_id: str, rejected_by: str, reason: str = ""):
     """Transition a workflow from pending → rejected. Called by CI on failed build."""
     registry = WorkflowRegistry()
-    if not registry.reject_workflow(workflow_id, rejected_by, reason=reason):
+    if not registry.reject_workflow(workflow_id, rejected_by, reason):
         raise HTTPException(status_code=400, detail="Failed to reject workflow")
     return {"status": "rejected", "workflow_id": workflow_id}
 
+@app.post("/workflows/{workflow_id}/activate", operation_id="activate_workflow")
+async def activate_workflow(workflow_id: str):
+    """
+    Transition an approved workflow → active.
+    Automatically deprecates any currently active version for the same workflow name.
+    """
+    registry = WorkflowRegistry()
+    if not registry.activate_workflow(workflow_id):
+        raise HTTPException(status_code=400, detail="Failed to activate workflow")
+    return {"status": "active", "workflow_id": workflow_id}
+
+@app.post("/workflows/{workflow_id}/deprecate", operation_id="deprecate_workflow")
+async def deprecate_workflow(workflow_id: str):
+    """Manually transition an active workflow → deprecated."""
+    registry = WorkflowRegistry()
+    if not registry.deprecate_workflow(workflow_id):
+        raise HTTPException(status_code=400, detail="Failed to deprecate workflow")
+    return {"status": "deprecated", "workflow_id": workflow_id}
+
+@app.post("/workflows/{workflow_id}/archive", operation_id="archive_workflow")
+async def archive_workflow(workflow_id: str):
+    """Retire a workflow record. Kept for lineage/audit; no longer served."""
+    registry = WorkflowRegistry()
+    if not registry.archive_workflow(workflow_id):
+        raise HTTPException(status_code=400, detail="Failed to archive workflow")
+    return {"status": "archived", "workflow_id": workflow_id}
 
 @app.get("/workflows/{workflow_name}/active", operation_id="get_active_workflow")
 async def get_active_workflow(workflow_name: str):
-    """Return the currently active (approved) workflow for a given name."""
+    """
+    Return the currently active workflow definition for a given workflow name.
+    This is the primary endpoint consumed by the Scheduler (step 3 in the architecture).
+    """
     registry = WorkflowRegistry()
-    wf = registry.get_active_workflow(workflow_name)
-    if not wf:
-        raise HTTPException(status_code=404, detail="No active workflow found")
-    return wf
+    workflow = registry.get_active_workflow(workflow_name)
+    if not workflow:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No active workflow found for '{workflow_name}'"
+        )
+    return workflow
+
+@app.get("/workflows/{workflow_name}/approved/latest", operation_id="get_latest_approved_workflow")
+async def get_latest_approved_workflow(workflow_name: str):
+    """Return the most recently approved (not yet active) workflow version."""
+    registry = WorkflowRegistry()
+    workflow = registry.get_latest_approved(workflow_name)
+    if not workflow:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No approved workflow found for '{workflow_name}'"
+        )
+    return workflow
 
 
-@app.get("/workflows/{workflow_id}", operation_id="get_workflow")
-async def get_workflow(workflow_id: str):
-    """Retrieve a specific workflow record by ID."""
-    registry = WorkflowRegistry()
-    wf = registry.get_workflow(workflow_id)
-    if not wf:
-        raise HTTPException(status_code=404, detail="Workflow not found")
-    return wf
+# ====================================================================
+# HELPERS
+# ====================================================================
+
+async def execute_workflow_async(run_id: str, request: WorkflowTriggerRequest):
+    from orchestrator import WorkflowExecutor
+    executor = WorkflowExecutor(workflow_name=request.workflow_name)
+    executor.start_workflow(run_id)
+
+
+# ====================================================================
+# WEBSOCKET
+# ====================================================================
+
+@app.websocket("/ws/workflow/{run_id}")
+async def workflow_updates(websocket: WebSocket, run_id: str):
+    await websocket.accept()
+    while True:
+        await websocket.send_json({"status": "running", "run_id": run_id})
+
+
+# ====================================================================
+# STARTUP / SHUTDOWN
+# ====================================================================
+
+@app.on_event("startup")
+async def startup_event():
+    pass
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    pass
