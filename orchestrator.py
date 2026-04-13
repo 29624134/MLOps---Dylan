@@ -381,7 +381,7 @@ class WorkflowExecutor:
         extract_ids  = [f"extract_{b['name'].lower()}" for b in needs_ingestion + needs_extraction]
         all_step_ids = (
             ingest_ids + extract_ids
-            + ["validation", "training", "model_selection", "live_serving", "serving_pipeline"]
+            + ["validation", "training", "model_selection", "serving_pipeline"]
         )
 
         self.state_manager.create_run_state(run_id, all_step_ids)
@@ -420,12 +420,8 @@ class WorkflowExecutor:
         logger.info(f"[{run_id}] Phase 5: Model selection")
         self._run_model_selection(run_id)
 
-        # ── 6. Live serving ───────────────────────────────────────────────────
-        logger.info(f"[{run_id}] Phase 6: Live serving")
-        self._run_live_serving(run_id)
-
-        # ── 7. Serving Pipeline ───────────────────────────────────────────────
-        logger.info(f"[{run_id}] Phase 7: Serving Pipeline")
+        # ── 6. Serving Pipeline ───────────────────────────────────────────────
+        logger.info(f"[{run_id}] Phase 6: Serving Pipeline")
         self._run_serving_pipeline(run_id)
 
         logger.info(f"[{run_id}] Workflow complete!")

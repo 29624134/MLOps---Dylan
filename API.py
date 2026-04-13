@@ -97,14 +97,16 @@ async def get_workflow_artifacts(run_id: str):
 
 
 async def execute_workflow_async(run_id: str, request: WorkflowTriggerRequest):
-    """Background task: run the full orchestrator workflow."""
     try:
-        from orchestrator_MongoDB import WorkflowExecutor
-        executor = WorkflowExecutor("config/workflow.yaml")
+        from orchestrator import WorkflowExecutor
+        executor = WorkflowExecutor(request.workflow_name)  # uses "rul_prediction" from request
         executor.start_workflow(run_id=run_id)
     except Exception as e:
         from orchestrator import WorkflowStateManager
-        WorkflowStateManager().update_step_status(run_id, "workflow", "FAILED", str(e))
+        try:
+            WorkflowStateManager().update_step_status(run_id, "workflow", "FAILED", str(e))
+        except FileNotFoundError:
+            pass
         raise
 
 
