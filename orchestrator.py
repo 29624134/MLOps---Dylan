@@ -12,13 +12,15 @@ FIRST RUN  (no deployed model in model registry):
     3. Validate val bearings
     4. Train    on train bearings
     5. Select & deploy best model
-    6. Serving Pipeline — current live bearing
+    6. Serving Pipeline — current live bearing (legacy path only)
 
-SUBSEQUENT RUNS  (deployed model already exists, triggered via /bearing/continue):
-    1. Ingest   current live bearing
-    2. Extract  current live bearing
-    3. Serving Pipeline — current live bearing
-    (Training and model selection are skipped.)
+SUBSEQUENT RUNS  (deployed model already exists):
+    Phases 2b–5 are skipped. Serving is now handled by run_serving.py.
+
+run_training_only() — called by run_preprod.py after fault confirmation:
+    Retrains on confirmed_faults (FS Mirrored) + train-role bearings.
+    Does NOT touch the live Feature Store or Serving Pipeline.
+    Registers new model as PENDING — run_preprod.py handles promotion.
 
 Fault confirmation flow (called from API after tech confirms):
     confirm_fault_and_push_to_store() → re-labels features → pushes to MongoDB
@@ -278,120 +280,58 @@ class WorkflowExecutor:
         except Exception:
             logger.warning("WorkflowExecutor: falling back to local YAML.")
             with open(yaml_path, "r") as f:
-                self.workflow_def = yaml.safe_load(f)["workflows"][workflow_name]
+                all_workflows = yaml.safe_load(f)
+            self.workflow_def = all_workflows["workflows"][workflow_name]
 
-        bearing_config_path = self.workflow_def.get("bearing_config", "config/bearings.json")
-        self.registry = BearingRegistry(bearing_config_path)
+        self.registry = BearingRegistry(
+            self.workflow_def.get("bearing_config", "config/bearings.json")
+        )
 
-    # ── Helpers ───────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────────
+    # PUBLIC: Full workflow (first run / legacy)
+    # ─────────────────────────────────────────────────────────────────────────
 
-    def _mongo_config(self) -> Dict:
-        mongo = self.workflow_def.get("mongodb", {})
-        return {
-            "enabled": bool(mongo.get("enabled", False)),
-            "uri":     mongo.get("uri",     "mongodb://localhost:27017"),
-            "db_name": mongo.get("db_name", "phm_mlops"),
-        }
-
-    def _step(self, step_id: str) -> Dict:
-        return next(s for s in self.workflow_def["steps"] if s["id"] == step_id)
-
-    def _ingestion_template(self) -> Dict:
-        return self._step("ingestion")["config"]
-
-    def _extraction_template(self) -> Dict:
-        return self._step("feature_engineering")["config"]
-
-    def _validation_step(self) -> Dict:
-        return self._step("validation")
-
-    def _training_step(self) -> Dict:
-        return self._step("training")
-
-    def _model_selection_step(self) -> Dict:
-        return self._step("model_selection")
-
-    def _serving_pipeline_step(self) -> Dict:
-        return self._step("serving_pipeline")
-
-    def _deployed_model_exists(self) -> bool:
-        """Check whether any deployed RUL model already exists in the registry."""
-        from utils.model_registry import ModelRegistry
-        entry = ModelRegistry().get_deployed_model("RUL_s")
-        return entry is not None
-
-    def _execute(self, run_id: str, step_id: str, step_type: str,
-                 config: Dict, fn):
-        self.state_manager.update_step_status(run_id, step_id, "RUNNING")
-        logger.info(f"  [{run_id}] Step '{step_id}' ({step_type}) — RUNNING")
-        try:
-            outputs = fn(config)
-            self.state_manager.update_step_status(run_id, step_id, "COMPLETE")
-            if outputs:
-                self.state_manager.mark_step_outputs(run_id, step_id, outputs)
-            logger.info(f"  [{run_id}] Step '{step_id}' — COMPLETE")
-        except Exception as e:
-            self.state_manager.update_step_status(run_id, step_id, "FAILED", str(e))
-            logger.error(f"  [{run_id}] Step '{step_id}' — FAILED: {e}", exc_info=True)
-            raise
-
-    # ── Main workflow entry point ─────────────────────────────────────────────
-
-    def start_workflow(self, workflow_name: str = "rul_prediction",
-                       config_overrides: Dict = None) -> str:
+    def start_workflow(
+        self,
+        workflow_name:    str = "rul_prediction",
+        config_overrides: Dict = None,
+    ) -> str:
         """
-        Bearing-by-bearing workflow.
+        Run the full workflow end-to-end.
 
-        If no deployed model exists (first run):
-            1. Ingest   current live bearing
-            2. Extract  current live bearing
-            2b. MongoDB backfill (train/val)
-            3. Validate val bearings
-            4. Train    on train bearings
-            5. Select & deploy best model
-            6. Serving Pipeline — current live bearing
+        FIRST RUN (no deployed model):
+            ingest → extract → backfill → validate → train → select → serve
 
-        If a deployed model already exists (subsequent runs):
-            1. Ingest   current live bearing
-            2. Extract  current live bearing
-            6. Serving Pipeline — current live bearing
+        SUBSEQUENT RUNS (deployed model exists):
+            ingest → extract only
+            (Serving is handled externally by run_serving.py)
         """
         run_id = f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         self.state_manager.init_state(run_id, workflow_name)
-        self.registry.print_status()
-
-        live_bearing    = self.registry.current_live_bearing()
-        model_deployed  = self._deployed_model_exists()
-
-        if live_bearing:
-            logger.info(
-                f"[{run_id}] Current live bearing: {live_bearing['name']} | "
-                f"Deployed model: {'YES' if model_deployed else 'NO — will train first'}"
-            )
-        else:
-            logger.warning(f"[{run_id}] No live bearing in queue.")
 
         try:
-            # ── 1. Extract live bearing (reads directly from acc_*.csv) ──────
-            if live_bearing:
-                logger.info(f"[{run_id}] Phase 1: Feature extraction — {live_bearing['name']}")
-                self._run_extraction(run_id, live_bearing)
-            else:
-                logger.info(f"[{run_id}] Phase 1: Feature extraction — skipped (no live bearing)")
+            from utils.model_registry import ModelRegistry
+            currently_deployed = ModelRegistry().get_deployed_model("RUL_s")
+            live_bearing       = self.registry.current_live_bearing()
 
-            if not model_deployed:
-                # ── First run: ensure train/val bearings are extracted ────────
-                # Train and val bearings are not processed via the live queue,
-                # so we ingest + extract any that are missing features.csv here.
-                logger.info(f"[{run_id}] Phase 1a: Extract train/val bearings (from acc_*.csv)")
+            # ── 1. Ingest live bearing ────────────────────────────────────────
+            if live_bearing:
+                logger.info(f"[{run_id}] Phase 1: Ingestion — {live_bearing['name']}")
+                self._run_ingestion(run_id, live_bearing)
+
+            # ── 2. Extract live bearing ───────────────────────────────────────
+            if live_bearing:
+                logger.info(f"[{run_id}] Phase 2: Feature extraction — {live_bearing['name']}")
+                self._run_extraction(run_id, live_bearing)
+
+            if not currently_deployed:
+                # First run — train a model from scratch
+                logger.info(f"[{run_id}] No deployed model found — running full pipeline.")
+
+                # Also extract all train/val bearings
                 for b in self.registry.train_bearings() + self.registry.val_bearings():
-                    source_folder = self.registry.source_path(b)
-                    features_path = os.path.join(source_folder, "features.csv")
-                    if os.path.exists(features_path):
-                        logger.info(f"  [{b['name']}] features.csv exists — skipping.")
-                        continue
-                    logger.info(f"  [{b['name']}] Missing features.csv — extracting from raw CSVs.")
-                    self._run_extraction(run_id, b)
+                    if b["name"] != (live_bearing["name"] if live_bearing else ""):
+                        self._run_extraction(run_id, b)
 
                 # 2b. MongoDB backfill
                 logger.info(f"[{run_id}] Phase 2b: MongoDB backfill (train/val)")
@@ -412,18 +352,17 @@ class WorkflowExecutor:
             else:
                 logger.info(
                     f"[{run_id}] Phases 2b–5: Skipped "
-                    f"(deployed model already exists)"
+                    f"(deployed model already exists — serving handled by run_serving.py)"
                 )
 
-            # ── 6. Serving Pipeline ───────────────────────────────────────────
-            if live_bearing:
-                logger.info(f"[{run_id}] Phase 6: Serving Pipeline — {live_bearing['name']}")
-                self._run_serving_pipeline(run_id)
-            else:
-                logger.info(f"[{run_id}] Phase 6: Serving Pipeline — skipped")
-
-            self.state_manager.mark_workflow_complete(run_id)
-            logger.info(f"[{run_id}] Workflow complete!")
+            # ── 6. Serving Pipeline ───────────────────────────────────────────────
+            # Serving is handled by run_serving.py which is started automatically
+            # by the API's ProcessManager after this workflow completes.
+            # The legacy _run_serving_pipeline() is no longer called here.
+            logger.info(
+                f"[{run_id}] Phase 6: Serving Pipeline — "
+                f"handled by run_serving.py (started by ProcessManager after workflow)"
+            )
 
         except Exception as e:
             self.state_manager.mark_workflow_failed(run_id, traceback.format_exc())
@@ -432,7 +371,152 @@ class WorkflowExecutor:
 
         return run_id
 
-    # ── Per-phase helpers ─────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────────
+    # PUBLIC: Pre-Production retraining (called by run_preprod.py)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def run_training_only(
+        self,
+        run_id:    str,
+        mongo_uri: str = "mongodb://localhost:27017",
+        db_name:   str = "phm_mlops",
+    ) -> str:
+        """
+        Pre-Production retraining path — called by run_preprod.py.
+
+        Retrains ONLY using:
+          - All train-role bearings (features.csv on disk)
+          - Confirmed fault data from MongoDB 'confirmed_faults' collection
+            (Feature Store Mirrored), restored to disk if not already present
+
+        The live Feature Store and Serving Pipeline are NOT touched.
+        The Serving Pipeline continues making predictions concurrently.
+
+        Steps
+        ─────
+        1. Restore confirmed fault CSVs from MongoDB if not on disk
+        2. Validate train + val feature files
+        3. Train model
+        4. Register new model as PENDING in ModelRegistry
+           → run_preprod.py calls registry.compare_and_promote() to decide
+             whether to write champion.json and hot-swap in run_serving.py
+
+        Parameters
+        ----------
+        run_id    : str — unique identifier for this training run
+        mongo_uri : str — MongoDB connection string
+        db_name   : str — MongoDB database name
+
+        Returns
+        -------
+        run_id : str
+        """
+        logger.info(f"[{run_id}] Pre-Production retraining started.")
+        logger.info(f"[{run_id}] Data source: FS Mirrored (confirmed_faults) + train bearings.")
+        logger.info(f"[{run_id}] Live Feature Store and Serving Pipeline are UNAFFECTED.")
+
+        self.state_manager.init_state(run_id, "preprod_training")
+
+        try:
+            # 1. Restore confirmed fault CSVs from FS Mirrored (MongoDB)
+            logger.info(f"[{run_id}] Phase 1: Restoring confirmed faults from FS Mirrored...")
+            self._restore_confirmed_faults_from_mongo(run_id, mongo_uri, db_name)
+
+            # 2. Validate feature files
+            logger.info(f"[{run_id}] Phase 2: Validation")
+            self._run_validation(run_id)
+
+            # 3. Train
+            logger.info(f"[{run_id}] Phase 3: Training")
+            self._run_training(run_id)
+
+            self.state_manager.mark_workflow_complete(run_id)
+            logger.info(
+                f"[{run_id}] Pre-Production retraining complete. "
+                f"New model registered as PENDING — run_preprod.py will "
+                f"compare and promote via registry.compare_and_promote()."
+            )
+
+        except Exception as e:
+            self.state_manager.mark_workflow_failed(run_id, traceback.format_exc())
+            logger.error(f"[{run_id}] Pre-Production retraining FAILED: {e}", exc_info=True)
+            raise
+
+        return run_id
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # PUBLIC: Fault confirmation
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def confirm_fault_and_push_to_store(
+        self,
+        bearing_name:   str,
+        run_id:         str,
+        rul_at_failure: float = 0.0,
+    ) -> Dict:
+        """
+        Called from the API after a maintenance worker confirms a fault.
+
+        1. Reads the bearing's features.csv
+        2. Re-labels RUL from the confirmed failure point
+        3. Pushes labelled data to MongoDB 'confirmed_faults' (Feature Store Mirrored)
+        4. Sets bearing status to 'confirmed'
+        """
+        bearing = self.registry.get_bearing(bearing_name)
+        if not bearing:
+            raise ValueError(f"Bearing '{bearing_name}' not in registry.")
+
+        source_folder  = self.registry.source_path(bearing)
+        features_path  = os.path.join(source_folder, "features.csv")
+        if not os.path.exists(features_path):
+            raise FileNotFoundError(
+                f"No features.csv for {bearing_name} at {features_path}"
+            )
+
+        df = pd.read_csv(features_path)
+        failure_s      = float(df["time_s"].max())
+        df["RUL_s"]    = (failure_s - df["time_s"]).clip(lower=0.0)
+        df["RUL_norm"] = df["RUL_s"] / failure_s if failure_s > 0 else 0.0
+        # Do NOT add extra columns — must match features.csv schema exactly
+        # so the trainer's scaler doesn't get a column count mismatch.
+        # The 'confirmed' flag lives only in MongoDB metadata.
+
+        confirmed_path = os.path.join(source_folder, "features_confirmed.csv")
+        df.to_csv(confirmed_path, index=False)
+
+        mongo_cfg = self._mongo_config()
+        if mongo_cfg.get("enabled"):
+            from utils.MongoDB import FeatureStore
+            store = FeatureStore({
+                "mongo_uri":       mongo_cfg["uri"],
+                "db_name":         mongo_cfg["db_name"],
+                "collection_name": "confirmed_faults",
+                "dataset_id":      bearing_name,
+                "version":         run_id,
+                "df_path":         confirmed_path,
+                "metadata": {
+                    "bearing_name":   bearing_name,
+                    "role":           bearing["role"],
+                    "run_id":         run_id,
+                    "confirmed":      True,
+                    "rul_at_failure": rul_at_failure,
+                    "confirmed_at":   datetime.now().isoformat(),
+                },
+            })
+            result = store.run()
+            logger.info(
+                f"[{bearing_name}] Confirmed fault features pushed to "
+                f"MongoDB 'confirmed_faults' (Feature Store Mirrored)."
+            )
+        else:
+            result = {"skipped": "MongoDB not enabled"}
+
+        self.registry.set_status(bearing_name, "confirmed")
+        return result
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # PRIVATE: Per-phase helpers
+    # ─────────────────────────────────────────────────────────────────────────
 
     def _run_ingestion(self, run_id: str, bearing: Dict):
         step_id       = f"ingest_{bearing['name'].lower()}"
@@ -472,7 +556,6 @@ class WorkflowExecutor:
         if bearing.get("status") == "extracted" and os.path.exists(features_path):
             logger.info(f"  [{bearing['name']}] Features already extracted — skipping.")
             self.state_manager.update_step_status(run_id, step_id, "SKIPPED")
-            # Still push to Mongo if not already there
             self._push_features_to_mongo(bearing, features_path, run_id)
             return
 
@@ -559,8 +642,10 @@ class WorkflowExecutor:
         step_id = "validation"
 
         def _validate(cfg):
-            validator    = DataValidatorPHM(schema_path=cfg.get("schema_path"),
-                                            log_path=cfg.get("log_path"))
+            validator    = DataValidatorPHM(
+                schema_path=cfg.get("schema_path"),
+                log_path=cfg.get("log_path"),
+            )
             results_list = []
             for bearing in self.registry.val_bearings():
                 csv_path = os.path.join(self.registry.source_path(bearing), "features.csv")
@@ -579,13 +664,15 @@ class WorkflowExecutor:
     def _confirmed_fault_files(self) -> List[str]:
         """
         Return paths to features_confirmed.csv for every live bearing that has
-        been confirmed by the maintenance tech.  These are included as extra
+        been confirmed by the maintenance tech. These are included as extra
         training data alongside the normal train-role bearings.
         """
         confirmed = []
         for b in self.registry.live_bearings():
             if b.get("status") == "confirmed":
-                path = os.path.join(self.registry.source_path(b), "features_confirmed.csv")
+                path = os.path.join(
+                    self.registry.source_path(b), "features_confirmed.csv"
+                )
                 if os.path.exists(path):
                     confirmed.append(path)
                     logger.info(f"  [confirmed fault] Including {path} in training data")
@@ -608,8 +695,7 @@ class WorkflowExecutor:
             if os.path.exists(os.path.join(self.registry.source_path(b), "features.csv"))
         ]
 
-        # Add confirmed fault data from live bearings that the tech has validated.
-        # This is the mechanism by which the system learns from real-world faults.
+        # Add confirmed fault data from live bearings validated by the tech
         confirmed_files = self._confirmed_fault_files()
         train_files.extend(confirmed_files)
 
@@ -619,8 +705,7 @@ class WorkflowExecutor:
             if os.path.exists(os.path.join(self.registry.source_path(b), "features.csv"))
         ]
 
-        # Test files are used only for evaluation (mae_s metric) — never for training.
-        # Without these, mae_s will be None and model comparison cannot work.
+        # Test files used only for evaluation (mae_s metric) — never for training
         test_files = [
             os.path.join(self.registry.source_path(b), "features.csv")
             for b in self.registry.all_bearings()
@@ -649,27 +734,23 @@ class WorkflowExecutor:
     def _run_model_selection(self, run_id: str):
         """
         Select and deploy the best model trained in this run.
-        If the training step was skipped (no new models for this run_id),
-        this step is also skipped gracefully.
+        If the training step was skipped, this step is also skipped gracefully.
         """
         step    = self._model_selection_step()
         config  = self.contract_manager.resolve_config(step["config"], run_id)
         step_id = "model_selection"
 
         # Check if training was skipped
-        state = self.state_manager.load_state(run_id)
+        state           = self.state_manager.load_state(run_id)
         training_status = state.get("steps", {}).get("training", {}).get("status")
         if training_status == "SKIPPED":
-            logger.info(
-                f"[{run_id}] Model selection skipped — training was skipped."
-            )
+            logger.info(f"[{run_id}] Model selection skipped — training was skipped.")
             self.state_manager.update_step_status(run_id, step_id, "SKIPPED")
             return
 
         from utils.model_registry import ModelRegistry
         models_this_run = ModelRegistry().list_models(run_id=run_id, status="pending")
         if not models_this_run:
-            # No new models — check if any approved/deployed model already exists
             deployed = ModelRegistry().get_deployed_model("RUL_s")
             if deployed:
                 logger.info(
@@ -679,7 +760,6 @@ class WorkflowExecutor:
                 self.state_manager.update_step_status(run_id, step_id, "SKIPPED")
                 return
             else:
-                # Genuinely nothing to work with
                 logger.error(
                     f"[{run_id}] Model selection: no trained models and no deployed model."
                 )
@@ -688,8 +768,7 @@ class WorkflowExecutor:
                     "No trained models found and no deployed model exists."
                 )
                 raise RuntimeError(
-                    "No trained models found for this run and no deployed model exists. "
-                    "Ensure training completed successfully."
+                    "No trained models found for this run and no deployed model exists."
                 )
 
         self._execute(
@@ -706,76 +785,31 @@ class WorkflowExecutor:
         Compare the best new model from this run against the currently deployed
         model on the chosen metric (lower is better for MAE).
 
-        - No deployed model        → auto-approve and deploy (first run).
-        - New model is better      → auto-approve and deploy, archive old.
-        - New model is not better  → leave as pending for manual review.
-        - Metric is None/missing   → treat as infinity so the model is never
-                                     auto-deployed (forces manual review).
+        Uses ModelRegistry.compare_and_promote() which also writes champion.json
+        so run_serving.py can hot-swap between bursts.
         """
         from utils.model_registry import ModelRegistry
         registry = ModelRegistry()
+        result   = registry.compare_and_promote(run_id=run_id, metric=metric)
 
-        # Candidates: pending models from this run
-        models = registry.list_models(run_id=run_id, status="pending")
-        if not models:
+        if not result["model_id"]:
             raise RuntimeError(f"No pending models found for run_id={run_id}")
 
-        best = min(models, key=lambda m: m.get("metrics", {}).get(metric, float("inf")))
-        new_score = best.get("metrics", {}).get(metric)
+        logger.info(
+            f"[{run_id}] Model selection: {result['reason']}"
+        )
 
-        currently_deployed = registry.get_deployed_model("RUL_s")
-
-        if currently_deployed is None:
-            # No deployed model at all — always deploy regardless of metrics.
-            # This covers first run AND cases where registry was wiped/reset.
-            registry.approve_model(best["model_id"], approved_by="orchestrator_auto")
-            registry.deploy_model(best["model_id"])
-            logger.info(
-                f"[{run_id}] No deployed model — auto-approved & deployed: "
-                f"{best['model_id']} ({metric}={new_score})"
-            )
-
-        elif new_score is None:
-            # New model has no metric — can't compare, leave as pending.
-            # This should not block serving since a deployed model already exists.
-            logger.warning(
-                f"[{run_id}] New model '{best['model_id']}' has no {metric} metric — "
-                f"left as PENDING for manual review. Existing deployed model retained."
-            )
-
-        else:
-            old_score = currently_deployed.get("metrics", {}).get(metric)
-
-            if old_score is None or new_score < old_score:
-                # New model is better (or old deployed model had no metric) — deploy it
-                registry.approve_model(best["model_id"], approved_by="orchestrator_auto")
-                registry.deploy_model(best["model_id"])
-                logger.info(
-                    f"[{run_id}] New model is BETTER — auto-deployed: "
-                    f"{best['model_id']} "
-                    f"({metric}: {old_score} → {new_score})"
-                )
-            else:
-                # New model is not better — leave as pending, keep current deployment
-                logger.info(
-                    f"[{run_id}] New model is NOT better — left as PENDING: "
-                    f"{best['model_id']} "
-                    f"({metric}: new={new_score} vs deployed={old_score})"
-                )
-
-        return best
+        # Return a dict with model_id so the orchestrator state can record it
+        return {"model_id": result["model_id"], "promoted": result["promoted"]}
 
     def _run_serving_pipeline(self, run_id: str):
         """
-        Run the 4-stage Serving Pipeline burst-by-burst for the current live bearing.
+        Legacy serving pipeline path — used on the first run and when
+        triggered via the old /workflow/trigger endpoint.
 
-        Each burst is ingested from disk, run through feature engineering → inference
-        → predictive maintenance → monitoring, and written to MongoDB Serving History
-        immediately. The dashboard polls Serving History and updates in real time.
-
-        Stops early if:
-          - PM status reaches 'critical' (RUL below critical threshold)
-          - All acc_*.csv files have been read (bearing exhausted)
+        In the new architecture, serving is handled by run_serving.py which
+        polls live_features independently. This method is kept for backward
+        compatibility only.
         """
         live_bearing = self.registry.current_live_bearing()
         if not live_bearing:
@@ -800,170 +834,182 @@ class WorkflowExecutor:
                     "No deployed model found. Ensure training + model selection completed."
                 )
 
-            mongo_cfg = self._mongo_config()
-            pipeline  = ServingPipeline(config={
+            pipeline = ServingPipeline(config={
+                "mongo_uri":              self._mongo_config().get("uri"),
+                "db_name":                self._mongo_config().get("db_name"),
                 "window_size":            int(config.get("window_size", 40)),
                 "critical_threshold_s":   int(config.get("critical_threshold_s", 3600)),
                 "warning_threshold_s":    int(config.get("warning_threshold_s", 14400)),
                 "baseline_path":          config.get("baseline_path",
-                                                     "model_registry/monitoring_baseline.json"),
-                "mongo_uri":              mongo_cfg.get("uri"),
-                "db_name":                mongo_cfg.get("db_name"),
+                    "model_registry/monitoring_baseline.json"),
                 "enable_serving_history": True,
             })
-            pipeline.reset_bearing()
 
             source_folder = self.registry.source_path(live_bearing)
-            ingestor      = DataIngestorPHM(config={
-                "input_location":  source_folder,
-                "output_location": source_folder,
-            })
-
-            burst_period = float(config.get("burst_period", 10.0))
-            realtime     = bool(config.get("realtime", False))
-            max_bursts   = config.get("max_bursts")
-
-            n_total  = 0
-            n_ready  = 0
-            n_alerts = 0
-            stop_reason = "exhausted"
-
-            for burst in ingestor.stream_bursts(
-                source_folder,
-                burst_period=burst_period,
-                realtime=realtime,
-            ):
-                if max_bursts is not None and burst["burst_idx"] >= max_bursts:
-                    stop_reason = "max_bursts"
-                    break
-
-                # Run this single burst through all 4 pipeline stages.
-                # run_burst() writes the result to MongoDB immediately.
-                result = pipeline.run_burst(
-                    run_id       = run_id,
-                    bearing_name = live_bearing["name"],
-                    burst_idx    = burst["burst_idx"],
-                    h_signal     = burst["h_signal"],
-                    v_signal     = burst["v_signal"],
-                )
-
-                n_total += 1
-                if result.get("ready"):
-                    n_ready  += 1
-                    pm        = result.get("pm") or {}
-                    pm_status = pm.get("status", "unknown")
-                    rul_s     = pm.get("rul_s")
-                    rul_min   = pm.get("rul_min")
-
-                    if pm.get("alert"):
-                        n_alerts += 1
-
-                    logger.info(
-                        f"  [{live_bearing['name']}] Burst {burst['burst_idx']:>5} "
-                        f"| t={burst['time_s']:>8.0f}s "
-                        f"| RUL={rul_s:>8.0f}s ({rul_min:.1f} min) "
-                        f"| status={pm_status}"
-                    )
-
-                    # Stop early if critical — fault has occurred or is imminent
-                    if pm_status == "critical":
-                        stop_reason = "critical_alert"
-                        logger.warning(
-                            f"  [{live_bearing['name']}] CRITICAL threshold reached "
-                            f"at burst {burst['burst_idx']} — stopping live stream."
-                        )
-                        break
-                else:
-                    logger.debug(
-                        f"  [{live_bearing['name']}] Burst {burst['burst_idx']:>5} "
-                        f"— warming up feature buffer"
-                    )
-
-            logger.info(
-                f"  [{live_bearing['name']}] Stream ended | reason={stop_reason} "
-                f"| bursts={n_total} ready={n_ready} alerts={n_alerts}"
+            results = pipeline.run_bearing(
+                run_id        = run_id,
+                bearing_name  = live_bearing["name"],
+                source_folder = source_folder,
+                burst_period  = float(config.get("burst_period", 10.0)),
+                realtime      = bool(config.get("realtime", False)),
+                max_bursts    = config.get("max_bursts"),
             )
 
-            outputs = {
-                "bearing":      live_bearing["name"],
-                "n_bursts":     n_total,
-                "n_ready":      n_ready,
-                "n_alerts":     n_alerts,
-                "stop_reason":  stop_reason,
-            }
             self.state_manager.update_step_status(run_id, step_id, "COMPLETE")
-            self.state_manager.mark_step_outputs(run_id, step_id, outputs)
-            logger.info(f"  [{run_id}] Step '{step_id}' — COMPLETE")
+            self.state_manager.mark_step_outputs(run_id, step_id, {
+                "bearing":       live_bearing["name"],
+                "n_predictions": len(results),
+            })
+            logger.info(
+                f"  [{run_id}] Serving pipeline complete — "
+                f"{len(results)} bursts processed."
+            )
 
         except Exception as e:
             self.state_manager.update_step_status(run_id, step_id, "FAILED", str(e))
-            logger.error(f"  [{run_id}] Step '{step_id}' — FAILED: {e}", exc_info=True)
+            logger.error(f"  [{run_id}] Serving pipeline FAILED: {e}", exc_info=True)
             raise
 
-    # ── Fault confirmation ────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────────
+    # PRIVATE: Restore confirmed faults from MongoDB to disk
+    # ─────────────────────────────────────────────────────────────────────────
 
-    def confirm_fault_and_push_to_store(
+    def _restore_confirmed_faults_from_mongo(
         self,
-        bearing_name: str,
-        run_id: str,
-        rul_at_failure: float,
-    ) -> Dict:
+        run_id:    str,
+        mongo_uri: str,
+        db_name:   str,
+    ) -> None:
         """
-        Called by the API after the maintenance tech confirms a fault.
+        Pull confirmed fault records from MongoDB 'confirmed_faults' collection
+        and write them to disk as features_confirmed.csv so the trainer can
+        include them in the training set.
 
-        1. Reads the bearing's features.csv
-        2. Re-labels RUL from the confirmed failure point
-        3. Pushes to MongoDB Feature Store under 'confirmed_faults' collection
-        4. Sets bearing status to 'confirmed'
+        This is the read path from the Feature Store Mirrored (FS Mirrored).
+        The FS Mirrored is populated by confirm_fault_and_push_to_store() when
+        a maintenance worker confirms a fault on the dashboard.
+
+        If features_confirmed.csv already exists on disk for a bearing, the
+        restore is skipped (idempotent).
         """
-        bearing = self.registry.get_bearing(bearing_name)
-        if not bearing:
-            raise ValueError(f"Bearing '{bearing_name}' not in registry.")
+        try:
+            from pymongo import MongoClient
 
-        source_folder  = self.registry.source_path(bearing)
-        features_path  = os.path.join(source_folder, "features.csv")
-        if not os.path.exists(features_path):
-            raise FileNotFoundError(
-                f"No features.csv for {bearing_name} at {features_path}"
+            client = MongoClient(mongo_uri, serverSelectionTimeoutMS=5000)
+            db     = client[db_name]
+            col    = db["confirmed_faults"]
+
+            bearings_with_faults = col.distinct("dataset_id")
+            if not bearings_with_faults:
+                logger.info(
+                    f"[{run_id}] No confirmed faults in MongoDB — "
+                    f"training on base train set only."
+                )
+                return
+
+            for bearing_name in bearings_with_faults:
+                bearing = self.registry.get_bearing(bearing_name)
+                if not bearing:
+                    logger.warning(
+                        f"[{run_id}] Confirmed fault bearing '{bearing_name}' "
+                        f"not found in registry — skipping."
+                    )
+                    continue
+
+                source_folder  = self.registry.source_path(bearing)
+                confirmed_path = os.path.join(source_folder, "features_confirmed.csv")
+
+                if os.path.exists(confirmed_path):
+                    logger.info(
+                        f"[{run_id}] [{bearing_name}] features_confirmed.csv "
+                        f"already on disk — skipping restore."
+                    )
+                    continue
+
+                # Pull all records for this bearing from MongoDB
+                records = list(col.find({"dataset_id": bearing_name}))
+                if not records:
+                    continue
+
+                # Strip MongoDB internal fields before writing to CSV
+                for r in records:
+                    r.pop("_id",      None)
+                    r.pop("dataset_id", None)
+                    r.pop("version",  None)
+                    r.pop("metadata", None)
+
+                df = pd.DataFrame(records)
+                os.makedirs(source_folder, exist_ok=True)
+                df.to_csv(confirmed_path, index=False)
+                logger.info(
+                    f"[{run_id}] [{bearing_name}] Restored {len(df)} confirmed "
+                    f"fault rows from FS Mirrored → {confirmed_path}"
+                )
+
+        except Exception as e:
+            logger.warning(
+                f"[{run_id}] Could not restore confirmed faults from MongoDB: {e}. "
+                f"Training will proceed with base train set only."
             )
 
-        df = pd.read_csv(features_path)
-        failure_s      = float(df["time_s"].max())
-        df["RUL_s"]    = (failure_s - df["time_s"]).clip(lower=0.0)
-        df["RUL_norm"] = df["RUL_s"] / failure_s if failure_s > 0 else 0.0
-        # Do NOT add extra columns to the CSV — it must have the exact same
-        # schema as features.csv so the trainer's scaler doesn't get a column
-        # count mismatch. The 'confirmed' flag lives only in MongoDB metadata.
+    # ─────────────────────────────────────────────────────────────────────────
+    # PRIVATE: Workflow step templates (read from workflow.yaml)
+    # ─────────────────────────────────────────────────────────────────────────
 
-        confirmed_path = os.path.join(source_folder, "features_confirmed.csv")
-        df.to_csv(confirmed_path, index=False)
+    def _get_step(self, step_type: str) -> Dict:
+        for step in self.workflow_def.get("steps", []):
+            if step["type"] == step_type:
+                return step
+        raise KeyError(f"No step of type '{step_type}' in workflow definition.")
 
-        mongo_cfg = self._mongo_config()
-        if mongo_cfg.get("enabled"):
-            from utils.MongoDB import FeatureStore
-            store = FeatureStore({
-                "mongo_uri":       mongo_cfg["uri"],
-                "db_name":         mongo_cfg["db_name"],
-                "collection_name": "confirmed_faults",
-                "dataset_id":      bearing_name,
-                "version":         run_id,
-                "df_path":         confirmed_path,
-                "metadata": {
-                    "bearing_name":   bearing_name,
-                    "role":           bearing["role"],
-                    "run_id":         run_id,
-                    "confirmed":      True,
-                    "rul_at_failure": rul_at_failure,
-                    "confirmed_at":   datetime.now().isoformat(),
-                },
-            })
-            result = store.run()
-            logger.info(
-                f"[{bearing_name}] Confirmed fault features pushed to "
-                f"MongoDB 'confirmed_faults'."
+    def _ingestion_template(self) -> Dict:
+        return self._get_step("ingestion")["config"]
+
+    def _extraction_template(self) -> Dict:
+        return self._get_step("feature_engineering")["config"]
+
+    def _validation_step(self) -> Dict:
+        return self._get_step("validation")
+
+    def _training_step(self) -> Dict:
+        return self._get_step("training")
+
+    def _model_selection_step(self) -> Dict:
+        return self._get_step("model_selection")
+
+    def _serving_pipeline_step(self) -> Dict:
+        return self._get_step("serving_pipeline")
+
+    def _mongo_config(self) -> Dict:
+        return self.workflow_def.get("mongodb", {"enabled": False})
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # PRIVATE: Generic step executor
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _execute(
+        self,
+        run_id:    str,
+        step_id:   str,
+        step_type: str,
+        config:    Dict,
+        fn,
+    ):
+        """
+        Generic step executor with state tracking.
+        Calls fn(config), catches exceptions, updates WorkflowStateManager.
+        """
+        self.state_manager.update_step_status(run_id, step_id, "RUNNING")
+        logger.info(f"  [{run_id}] Step '{step_id}' ({step_type}) — RUNNING")
+        try:
+            outputs = fn(config)
+            self.state_manager.update_step_status(run_id, step_id, "COMPLETE")
+            if outputs:
+                self.state_manager.mark_step_outputs(run_id, step_id, outputs)
+            logger.info(f"  [{run_id}] Step '{step_id}' — COMPLETE")
+        except Exception as e:
+            self.state_manager.update_step_status(run_id, step_id, "FAILED", str(e))
+            logger.error(
+                f"  [{run_id}] Step '{step_id}' FAILED: {e}", exc_info=True
             )
-        else:
-            result = {"skipped": "MongoDB not enabled"}
-
-        self.registry.set_status(bearing_name, "confirmed")
-        return result
+            raise

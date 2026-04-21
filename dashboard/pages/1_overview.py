@@ -11,7 +11,7 @@ import pandas as pd
 from datetime import datetime
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from api_client import get_workflow_status, get_latest_bearing_records, get_deployed_model
+from dashboard.api_client import get_workflow_status, get_latest_bearing_records, get_deployed_model
 
 st.markdown("# 🏠 System Overview")
 st.markdown("Real-time health snapshot of the PHM MLOps pipeline.")
