@@ -20,8 +20,18 @@ ProcessManager singleton. This means:
       → starts scada_simulator.py + run_serving.py for new bearing
       → if confirmed: also starts run_preprod.py in background
 
+  POST /preprod/trigger   (Dashboard → AutoTrain dashed arrow)
+      → manually triggers Pre-Production retraining from the dashboard
+      → serving pipeline continues uninterrupted
+
   GET /bearing/processes
       → shows current subprocess status
+
+  POST /audit/flush
+      → batch-flush Serving History records to external CSV destination
+
+  GET  /export/paths
+      → return configured Export Service destination paths
 """
 
 import io
@@ -74,9 +84,9 @@ class ProcessManager:
     def __new__(cls):
         if cls._instance is None:
             cls._instance = super().__new__(cls)
-            cls._instance._scada_proc   = None
-            cls._instance._serving_proc = None
-            cls._instance._preprod_proc = None
+            cls._instance._scada_proc      = None
+            cls._instance._serving_proc    = None
+            cls._instance._preprod_proc    = None
             cls._instance._current_bearing = None
         return cls._instance
 
@@ -98,7 +108,6 @@ class ProcessManager:
 
         logger.info(f"[ProcessManager] Starting SCADA + Serving for {bearing_name}")
 
-        # Build command for scada_simulator.py
         scada_cmd = [
             sys.executable, "scada_simulator.py",
             "--bearing", bearing_name,
@@ -106,7 +115,6 @@ class ProcessManager:
         if realtime:
             scada_cmd.append("--realtime")
 
-        # Build command for run_serving.py
         serving_cmd = [
             sys.executable, "run_serving.py",
             "--bearing", bearing_name,
@@ -116,16 +124,10 @@ class ProcessManager:
 
         try:
             self._scada_proc = subprocess.Popen(
-                scada_cmd,
-                env=env,
-                stdout=None,   # prints directly to API terminal
-                stderr=None,
+                scada_cmd, env=env, stdout=None, stderr=None,
             )
             self._serving_proc = subprocess.Popen(
-                serving_cmd,
-                env=env,
-                stdout=None,   # prints directly to API terminal
-                stderr=None,
+                serving_cmd, env=env, stdout=None, stderr=None,
             )
             self._current_bearing = bearing_name
 
@@ -135,9 +137,9 @@ class ProcessManager:
             )
 
             return {
-                "bearing":      bearing_name,
-                "scada_pid":    self._scada_proc.pid,
-                "serving_pid":  self._serving_proc.pid,
+                "bearing":     bearing_name,
+                "scada_pid":   self._scada_proc.pid,
+                "serving_pid": self._serving_proc.pid,
             }
 
         except Exception as e:
@@ -161,9 +163,7 @@ class ProcessManager:
         try:
             self._preprod_proc = subprocess.Popen(
                 [sys.executable, "run_preprod.py", "--run_id", run_id],
-                env=env,
-                stdout=None,   # prints directly to API terminal
-                stderr=None,
+                env=env, stdout=None, stderr=None,
             )
             logger.info(
                 f"[ProcessManager] Pre-Production started "
@@ -181,9 +181,7 @@ class ProcessManager:
             ("Serving", self._serving_proc),
         ]:
             if proc and proc.poll() is None:
-                logger.info(
-                    f"[ProcessManager] Stopping {name} (PID={proc.pid})"
-                )
+                logger.info(f"[ProcessManager] Stopping {name} (PID={proc.pid})")
                 proc.terminate()
                 try:
                     proc.wait(timeout=5)
@@ -226,7 +224,6 @@ class WorkflowTriggerRequest(BaseModel):
     priority:         str                      = Field(
         default="normal", pattern="^(low|normal|high)$"
     )
-    # If True, automatically start SCADA + Serving after workflow completes
     auto_start_serving: bool = Field(
         True,
         description="Auto-start SCADA simulator and Serving pipeline after workflow"
@@ -236,6 +233,7 @@ class WorkflowTriggerRequest(BaseModel):
         description="Run SCADA simulator in realtime mode (10 s between bursts)"
     )
 
+
 class WorkflowStatusResponse(BaseModel):
     run_id:     str
     status:     str
@@ -243,9 +241,11 @@ class WorkflowStatusResponse(BaseModel):
     end_time:   Optional[str] = None
     steps:      Dict[str, Dict]
 
+
 class RULPredictionRequest(BaseModel):
     features:      Dict[str, float]
     model_version: Optional[str] = "latest"
+
 
 class RULPredictionResponse(BaseModel):
     predicted_rul_s:   float
@@ -254,10 +254,12 @@ class RULPredictionResponse(BaseModel):
     model_version:     str
     timestamp:         str
 
+
 class LiveServingRequest(BaseModel):
     bearing_name: str
     realtime:     bool          = False
     max_bursts:   Optional[int] = None
+
 
 class RegisterWorkflowRequest(BaseModel):
     workflow_name: str
@@ -268,19 +270,22 @@ class RegisterWorkflowRequest(BaseModel):
     environment:   Optional[Dict[str, str]] = None
     metadata:      Optional[Dict[str, Any]] = None
 
+
 # ── Bearing lifecycle models ──────────────────────────────────────────────────
 
 class FaultConfirmRequest(BaseModel):
     bearing_name:   str   = Field(..., json_schema_extra={"example": "Bearing1_5"})
     run_id:         str   = Field(..., description="Workflow run_id that produced the features")
-    rul_at_failure: float = Field(0.0,       description="Confirmed RUL at failure (seconds)")
+    rul_at_failure: float = Field(0.0, description="Confirmed RUL at failure (seconds)")
     worker_name:    str   = Field("Unknown", description="Maintenance tech name")
-    note:           str   = Field("",        description="Optional note")
+    note:           str   = Field("", description="Optional note")
+
 
 class FaultDenyRequest(BaseModel):
     bearing_name: str = Field(..., json_schema_extra={"example": "Bearing1_5"})
     worker_name:  str = Field("Unknown")
     note:         str = Field("")
+
 
 class ContinueRequest(BaseModel):
     worker_name:     str  = Field("Unknown")
@@ -290,6 +295,17 @@ class ContinueRequest(BaseModel):
     realtime: bool = Field(
         False, description="Run SCADA simulator in realtime mode for new bearing"
     )
+
+
+# ── New models for pre-prod trigger and audit flush ───────────────────────────
+
+class PreprodTriggerRequest(BaseModel):
+    workflow_name: str = Field("rul_prediction")
+
+
+class AuditFlushRequest(BaseModel):
+    bearing_name: str = Field(..., description="Bearing to flush audit records for")
+    limit:        int = Field(500, ge=1, le=10000)
 
 
 # ====================================================================
@@ -312,9 +328,7 @@ async def trigger_workflow(
     auto_start_serving=False).
     """
     run_id = f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
-    background_tasks.add_task(
-        execute_workflow_async, run_id, request
-    )
+    background_tasks.add_task(execute_workflow_async, run_id, request)
     return {"run_id": run_id, "status": "queued"}
 
 
@@ -354,7 +368,6 @@ async def execute_workflow_async(run_id: str, request: WorkflowTriggerRequest):
             config_overrides = request.config_overrides,
         )
 
-        # ── Auto-start SCADA + Serving after workflow completes ───────────────
         if request.auto_start_serving:
             reg     = BearingRegistry("config/bearings.json")
             bearing = reg.current_live_bearing()
@@ -370,7 +383,7 @@ async def execute_workflow_async(run_id: str, request: WorkflowTriggerRequest):
             else:
                 logger.warning(
                     f"[{run_id}] Workflow complete — no live bearing in queue, "
-                    f"SCADA + Serving not started."
+                    "SCADA + Serving not started."
                 )
 
     except Exception as e:
@@ -383,6 +396,46 @@ async def execute_workflow_async(run_id: str, request: WorkflowTriggerRequest):
             pass
         logger.error(f"[{run_id}] Workflow failed: {e}", exc_info=True)
         raise
+
+
+# ====================================================================
+# PRE-PRODUCTION RETRAINING  (Dashboard → AutoTrain dashed arrow)
+# ====================================================================
+
+@app.post("/preprod/trigger", tags=["Pre-Production"])
+async def trigger_preprod_retraining():
+    """
+    Dashboard → AutoTrain: manually trigger Pre-Production retraining.
+
+    Starts run_preprod.py in the background. The Serving Pipeline continues
+    uninterrupted — model hot-swap happens automatically if the new model
+    outperforms the current champion.
+
+    This implements the dashed arrow:
+        Dashboard -.Retraining Triggered.-> AutoTrain  (V9 diagram)
+    """
+    preprod_run_id = (
+        f"preprod_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        f"_{uuid.uuid4().hex[:6]}"
+    )
+    try:
+        preprod_pid = _process_manager.start_preprod(preprod_run_id)
+        logger.info(
+            f"[preprod/trigger] Manual retraining triggered from Dashboard — "
+            f"run_id={preprod_run_id}  PID={preprod_pid}"
+        )
+        return {
+            "status":         "started",
+            "preprod_run_id": preprod_run_id,
+            "preprod_pid":    preprod_pid,
+            "message": (
+                "Pre-Production retraining started in background. "
+                "Serving Pipeline continues uninterrupted. "
+                f"Poll /workflow/{preprod_run_id}/status for progress."
+            ),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ====================================================================
@@ -590,7 +643,6 @@ def reset_bearing_queue():
     """
     from orchestrator import BearingRegistry
 
-    # Stop running processes before reset
     _process_manager.stop_all()
 
     reg = BearingRegistry("config/bearings.json")
@@ -641,7 +693,6 @@ def confirm_fault(request: FaultConfirmRequest):
             rul_at_failure = request.rul_at_failure,
         )
 
-        # Start retraining immediately — no need to wait for Continue
         preprod_run_id = f"preprod_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
         preprod_pid    = _process_manager.start_preprod(preprod_run_id)
         logger.info(
@@ -651,17 +702,17 @@ def confirm_fault(request: FaultConfirmRequest):
         )
 
         return {
-            "status":          "confirmed",
-            "bearing":         request.bearing_name,
-            "worker":          request.worker_name,
-            "confirmed_at":    datetime.now().isoformat(),
-            "store_result":    result,
-            "preprod_run_id":  preprod_run_id,
-            "preprod_pid":     preprod_pid,
-            "message":         (
+            "status":         "confirmed",
+            "bearing":        request.bearing_name,
+            "worker":         request.worker_name,
+            "confirmed_at":   datetime.now().isoformat(),
+            "store_result":   result,
+            "preprod_run_id": preprod_run_id,
+            "preprod_pid":    preprod_pid,
+            "message": (
                 f"Fault confirmed. Confirmed fault data pushed to FS Mirrored. "
                 f"Retraining started in background (run_id={preprod_run_id}). "
-                f"Serving pipeline continues — model will hot-swap if new model is better."
+                "Serving pipeline continues — model will hot-swap if new model is better."
             ),
         }
     except FileNotFoundError as e:
@@ -714,7 +765,6 @@ def continue_to_next_bearing(
     """
     from orchestrator import BearingRegistry
 
-    # Stop current processes before advancing
     _process_manager.stop_all()
 
     reg    = BearingRegistry("config/bearings.json")
@@ -779,11 +829,9 @@ async def _run_bearing_workflow_bg(
             state_mgr.mark_workflow_failed(run_id, f"Bearing '{bearing_name}' not found.")
             return
 
-        # 1. Extract features for new bearing
         logger.info(f"[{run_id}] Extracting features for {bearing_name}...")
         executor._run_extraction(run_id, bearing)
 
-        # 2. Start SCADA simulator + Serving Pipeline
         logger.info(f"[{run_id}] Starting SCADA + Serving for {bearing_name}...")
         pids = _process_manager.start_bearing(
             bearing_name=bearing_name,
@@ -841,3 +889,51 @@ async def _start_serving_bg(run_id: str, bearing_name: str, realtime: bool):
         logger.info(f"[{run_id}] SCADA + Serving started for {bearing_name}")
     except Exception as e:
         logger.error(f"[{run_id}] Failed to start serving: {e}", exc_info=True)
+
+
+# ====================================================================
+# AUDIT SERVICE — batch flush (AuditSvc → External Data Destination)
+# ====================================================================
+
+@app.post("/audit/flush", tags=["Audit & Export"])
+def flush_audit_records(request: AuditFlushRequest):
+    """
+    AuditSvc → External: batch-flush Serving History records to the
+    external CSV data destination for a specific bearing.
+
+    Useful when the pipeline was running without Export Service enabled,
+    or to re-export historical data from the dashboard.
+    """
+    try:
+        from utils.audit_service import AuditService
+        auditor  = AuditService()
+        exported = auditor.flush_bearing(
+            bearing_name=request.bearing_name,
+            limit=request.limit,
+        )
+        return {
+            "status":       "ok",
+            "bearing":      request.bearing_name,
+            "exported":     exported,
+            "export_paths": auditor.get_export_paths(),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ====================================================================
+# EXPORT SERVICE — path info (ExportSvc → External Data Destination)
+# ====================================================================
+
+@app.get("/export/paths", tags=["Audit & Export"])
+def get_export_paths():
+    """
+    Return the configured external data destination paths for the Export Service.
+    Shown in the Dashboard → Retraining & Export Control page.
+    """
+    try:
+        from export_service.export_service import get_exporter
+        exporter = get_exporter()
+        return exporter.get_export_paths()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
