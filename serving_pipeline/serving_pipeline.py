@@ -18,13 +18,15 @@ Pipeline outputs (per diagram):
 
 Design notes
 ────────────
-- The pipeline is callable from the Workflow Orchestrator and from the FastAPI
-  endpoint independently.
-- It is stateful per-bearing (FE buffer, monitoring baseline are maintained
-  across bursts).  Call reset_bearing() between bearings.
+- Callable from run_serving.py (primary) and the FastAPI endpoint independently.
+- Stateful per-bearing (FE buffer, monitoring baseline maintained across bursts).
+  Call reset_bearing() between bearings.
 - On any stage failure the pipeline logs the error, writes an error record to
-  Serving History, and returns a safe error response — it never raises to the
-  caller.
+  Serving History, and returns a safe error response — it never raises to the caller.
+- Supports precomputed_features kwarg in run_burst(): when run_serving.py passes
+  features already extracted by the SCADA simulator, the FE stage uses them
+  directly and skips re-extraction from raw signals.
+- reload_model() is public — called by run_serving.py on hot-swap detection.
 
 Usage
 ─────
@@ -36,6 +38,7 @@ Usage
         "window_size": 40,
     })
 
+    # Standard usage (raw signals):
     for burst in ingestor.stream_bursts(source_folder):
         result = pipeline.run_burst(
             run_id       = "serve_20260407_abc123",
@@ -44,8 +47,16 @@ Usage
             h_signal     = burst["h_signal"],
             v_signal     = burst["v_signal"],
         )
-        if result["ready"] and result["pm"]["alert"]:
-            print(f"ALERT: {result['pm']['recommended_action']}")
+
+    # SCADA simulator usage (pre-extracted features from FS):
+    result = pipeline.run_burst(
+        run_id              = run_id,
+        bearing_name        = "Bearing1_5",
+        burst_idx           = burst_idx,
+        h_signal            = np.array([0.0]),   # ignored when precomputed
+        v_signal            = np.array([0.0]),   # ignored when precomputed
+        precomputed_features= features_dict,     # from live_features FS
+    )
 """
 
 import logging
@@ -150,22 +161,36 @@ class ServingPipeline:
 
     def run_burst(
         self,
-        run_id:       str,
-        bearing_name: str,
-        burst_idx:    int,
-        h_signal:     np.ndarray,
-        v_signal:     np.ndarray,
+        run_id:               str,
+        bearing_name:         str,
+        burst_idx:            int,
+        h_signal:             np.ndarray,
+        v_signal:             np.ndarray,
+        precomputed_features: Optional[Dict[str, float]] = None,
     ) -> Dict[str, Any]:
         """
         Run one burst through the full 4-stage pipeline.
 
-        Returns a structured dict with outputs from all stages plus
-        the Serving History record_id.
+        Parameters
+        ──────────
+        run_id, bearing_name, burst_idx : identifiers
+        h_signal, v_signal              : raw vibration arrays (used when
+                                          precomputed_features is None)
+        precomputed_features            : dict of 18 feature values already
+                                          extracted by scada_simulator.py.
+                                          When provided, the FE stage uses
+                                          these values directly and builds the
+                                          rolling window from them, skipping
+                                          re-extraction from raw signals.
 
-        The return value is safe to use even on failure — check result["ok"].
+        Returns a structured dict with outputs from all stages plus the
+        Serving History record_id. Always safe to use — check result["ok"].
         """
         try:
-            return self._run_stages(run_id, bearing_name, burst_idx, h_signal, v_signal)
+            return self._run_stages(
+                run_id, bearing_name, burst_idx,
+                h_signal, v_signal, precomputed_features
+            )
         except Exception as exc:
             logger.error(
                 f"[Pipeline] Unhandled error for burst {burst_idx}: {exc}",
@@ -205,10 +230,11 @@ class ServingPipeline:
         max_bursts:    Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         """
-        Stream an entire bearing through the pipeline.
+        Stream an entire bearing through the pipeline using raw CSV files.
 
         Convenience wrapper for the Workflow Orchestrator integration.
         Resets the FE buffer and monitoring baseline between runs.
+        NOTE: run_serving.py is the preferred entry point for production use.
         """
         from scripts.data_ingestor import DataIngestorPHM
 
@@ -249,22 +275,35 @@ class ServingPipeline:
         logger.info("[Pipeline] Bearing state reset (FE buffer + monitoring baseline).")
 
     def reload_model(self) -> None:
-        """Force reload the deployed model from the ModelRegistry."""
+        """
+        Force reload the deployed model from the ModelRegistry.
+
+        Called by run_serving.py when champion.json changes (hot-swap).
+        Always called between bursts — never mid-prediction.
+        """
         self._inference.reload_model()
+        logger.info("[Pipeline] Model reloaded from ModelRegistry.")
 
     # ── Internals ─────────────────────────────────────────────────────────────
 
     def _run_stages(
         self,
-        run_id:       str,
-        bearing_name: str,
-        burst_idx:    int,
-        h_signal:     np.ndarray,
-        v_signal:     np.ndarray,
+        run_id:               str,
+        bearing_name:         str,
+        burst_idx:            int,
+        h_signal:             np.ndarray,
+        v_signal:             np.ndarray,
+        precomputed_features: Optional[Dict[str, float]] = None,
     ) -> Dict[str, Any]:
 
         # ── Stage 1: Feature Engineering ─────────────────────────────────────
-        fe_out = self._fe.process_burst(burst_idx, h_signal, v_signal)
+        if precomputed_features is not None:
+            # SCADA simulator path: use features already extracted from raw signals.
+            # Feed them into the FE stage's rolling window without re-extracting.
+            fe_out = self._fe.process_burst_precomputed(burst_idx, precomputed_features)
+        else:
+            # Standard path: extract features from raw signals.
+            fe_out = self._fe.process_burst(burst_idx, h_signal, v_signal)
 
         if not fe_out["ready"]:
             return {
@@ -283,7 +322,7 @@ class ServingPipeline:
         # ── Stage 2: Inference ────────────────────────────────────────────────
         infer_out = self._inference.run(fe_out)
 
-        # ── Stage 3: Predictive Maintenance ───────────────────────────────────
+        # ── Stage 3: Predictive Maintenance ──────────────────────────────────
         pm_out = self._pm.run(infer_out)
 
         # ── Stage 4: Monitoring ───────────────────────────────────────────────

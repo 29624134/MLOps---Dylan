@@ -1,22 +1,43 @@
+"""
+utils/model_registry.py
+═══════════════════════════════════════════════════════════════════════════════
+Central registry for all trained models.
+
+Stores globally at model_registry/registry.json — not scoped to a run_id —
+so all runs share a single registry.
+
+Key responsibilities
+────────────────────
+1. Track model versions and metadata across all runs
+2. Manage model approval workflow (pending → approved → deployed → archived)
+3. Retrieve deployed models for serving
+4. Maintain model lineage via metadata
+5. Write champion.json pointer for atomic hot-swap (run_serving.py watches this)
+6. Compare pending models against the current champion and promote if better
+"""
+
 import json
 import os
 import hashlib
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, List, Optional, Any
 from enum import Enum
 
 logger = logging.getLogger(__name__)
 
+# ── Champion pointer path — watched by run_serving.py for hot-swap ────────────
+CHAMPION_PATH = os.path.join("model_registry", "champion.json")
+
 
 class ModelStatus(Enum):
-    """Model lifecycle states"""
-    PENDING      = "pending"       # Just trained, awaiting review
-    APPROVED     = "approved"      # Approved for production
-    REJECTED     = "rejected"      # Rejected by domain expert
-    DEPLOYED     = "deployed"      # Currently in production
-    ARCHIVED     = "archived"      # Retired from production
-    EXPERIMENTAL = "experimental"  # From external research
+    """Model lifecycle states."""
+    PENDING      = "pending"        # Just trained, awaiting review/comparison
+    APPROVED     = "approved"       # Approved for production
+    REJECTED     = "rejected"       # Rejected by domain expert
+    DEPLOYED     = "deployed"       # Currently in production
+    ARCHIVED     = "archived"       # Retired from production
+    EXPERIMENTAL = "experimental"   # From external research
 
 
 class ModelRegistry:
@@ -29,13 +50,6 @@ class ModelRegistry:
 
     run_id is preserved for lineage by passing it in metadata when calling
     register_model(), and is filterable via list_models(run_id=...).
-
-    Key responsibilities
-    -------------------
-    1. Track model versions and metadata across all runs
-    2. Manage model approval workflow
-    3. Retrieve deployed models for serving
-    4. Maintain model lineage via metadata
     """
 
     REGISTRY_FILENAME = "registry.json"
@@ -101,7 +115,7 @@ class ModelRegistry:
                 return m
         return None
 
-    # ── Public API ────────────────────────────────────────────────────────────
+    # ── Public API — Registration & Lifecycle ─────────────────────────────────
 
     def register_model(
         self,
@@ -165,7 +179,7 @@ class ModelRegistry:
         return model_id
 
     def approve_model(self, model_id: str, approved_by: str) -> bool:
-        """Transition pending -> approved."""
+        """Transition pending → approved."""
         registry = self._load_registry()
         record   = self._find(registry, model_id)
         if record is None:
@@ -179,7 +193,7 @@ class ModelRegistry:
         return True
 
     def reject_model(self, model_id: str, rejected_by: str) -> bool:
-        """Transition pending -> rejected."""
+        """Transition pending → rejected."""
         registry = self._load_registry()
         record   = self._find(registry, model_id)
         if record is None:
@@ -194,7 +208,7 @@ class ModelRegistry:
 
     def deploy_model(self, model_id: str) -> bool:
         """
-        Transition approved -> deployed.
+        Transition approved → deployed.
         Automatically archives any previously deployed model for the same
         target_feature so only one deployed model exists per feature.
         """
@@ -276,8 +290,7 @@ class ModelRegistry:
         target_feature : str, optional
             Filter by target feature (e.g. 'RUL_s').
         run_id : str, optional
-            Filter by run_id stored in metadata — useful for finding all
-            models produced by a specific training run.
+            Filter by run_id stored in metadata.
         """
         registry = self._load_registry()
         results  = registry["models"]
@@ -309,3 +322,177 @@ class ModelRegistry:
                 f"(id={m['model_id']}, run={run_id})"
             )
         logger.info("─" * 72)
+
+    # ── Champion pointer — hot-swap support ───────────────────────────────────
+
+    def write_champion_pointer(self, model_id: str) -> bool:
+        """
+        Write model_registry/champion.json pointing to the newly deployed model.
+
+        Called automatically by compare_and_promote() after deploy_model().
+        Can also be called manually after a manual deploy.
+
+        run_serving.py watches this file for mtime changes between bursts.
+        When detected it calls pipeline.reload_model() to hot-swap without
+        missing a prediction.
+
+        Uses write-then-rename (os.replace) for atomicity — the serving
+        pipeline can never read a half-written file.
+
+        Returns True on success.
+        """
+        record = self.get_model(model_id)
+        if record is None:
+            logger.error(f"write_champion_pointer: model '{model_id}' not found.")
+            return False
+
+        champion = {
+            "model_id":    model_id,
+            "model_path":  record.get("model_path"),
+            "metrics":     record.get("metrics", {}),
+            "promoted_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+        os.makedirs(os.path.dirname(CHAMPION_PATH), exist_ok=True)
+        tmp_path = CHAMPION_PATH + ".tmp"
+        try:
+            with open(tmp_path, "w") as f:
+                json.dump(champion, f, indent=2)
+            os.replace(tmp_path, CHAMPION_PATH)   # atomic on POSIX
+            logger.info(
+                f"champion.json updated → {model_id}  "
+                f"(run_serving.py will hot-swap on next burst boundary)"
+            )
+            return True
+        except Exception as e:
+            logger.error(f"Failed to write champion.json: {e}")
+            return False
+
+    def read_champion_pointer(self) -> Optional[Dict]:
+        """
+        Read the current champion.json pointer.
+        Returns the champion dict or None if no champion file exists.
+        """
+        if not os.path.exists(CHAMPION_PATH):
+            return None
+        try:
+            with open(CHAMPION_PATH) as f:
+                return json.load(f)
+        except Exception as e:
+            logger.warning(f"Could not read champion.json: {e}")
+            return None
+
+    def compare_and_promote(
+        self,
+        run_id: str,
+        metric: str = "mae_s",
+    ) -> Dict[str, Any]:
+        """
+        Compare the best pending model from run_id against the currently
+        deployed champion and promote if better (lower metric = better).
+
+        Flow
+        ────
+        1. Find all pending models for this run_id
+        2. Pick the one with the best (lowest) metric value
+        3. Compare against the currently deployed model's metric
+        4. If new model is better (or no champion exists):
+               approve → deploy → write champion.json
+           Else:
+               leave as pending for manual review
+
+        Parameters
+        ----------
+        run_id : str
+            The training run whose pending models to compare.
+        metric : str
+            The metric to compare on (default: 'mae_s', lower is better).
+
+        Returns
+        -------
+        dict with keys:
+            promoted   : bool         — True if new model was deployed
+            model_id   : str | None   — ID of the best pending model evaluated
+            new_score  : float | None — new model's metric value
+            old_score  : float | None — current champion's metric value (or None)
+            reason     : str          — human-readable explanation of decision
+        """
+        pending = self.list_models(run_id=run_id, status="pending")
+        if not pending:
+            msg = f"No pending models found for run_id='{run_id}'."
+            logger.warning(f"[Registry] compare_and_promote: {msg}")
+            return {
+                "promoted":  False,
+                "model_id":  None,
+                "new_score": None,
+                "old_score": None,
+                "reason":    msg,
+            }
+
+        # Pick best pending model by metric (lower is better)
+        best      = min(
+            pending,
+            key=lambda m: m.get("metrics", {}).get(metric, float("inf"))
+        )
+        new_score    = best.get("metrics", {}).get(metric)
+        new_metrics  = best.get("metrics", {})
+        model_id     = best["model_id"]
+
+        # Get currently deployed champion for this feature
+        target       = best.get("target_feature", "RUL_s")
+        current      = self.get_deployed_model(target)
+        old_score    = current.get("metrics", {}).get(metric) if current else None
+        old_metrics  = current.get("metrics", {}) if current else {}
+
+        # Log full metric comparison across all 4 metrics
+        logger.info(
+            f"[Registry] ── Model Comparison ──────────────────────────────\n"
+            f"  Metric      │ New Model          │ Current Champion\n"
+            f"  ────────────┼────────────────────┼──────────────────\n"
+            f"  mae_s       │ {str(round(new_metrics.get('mae_s', None), 1) if new_metrics.get('mae_s') is not None else 'None'):<18} │ "
+            f"{str(round(old_metrics.get('mae_s', None), 1) if old_metrics.get('mae_s') is not None else 'None')}\n"
+            f"  rmse_s      │ {str(round(new_metrics.get('rmse_s', None), 1) if new_metrics.get('rmse_s') is not None else 'None'):<18} │ "
+            f"{str(round(old_metrics.get('rmse_s', None), 1) if old_metrics.get('rmse_s') is not None else 'None')}\n"
+            f"  mape        │ {str(round(new_metrics.get('mape', None), 2) if new_metrics.get('mape') is not None else 'None'):<18} │ "
+            f"{str(round(old_metrics.get('mape', None), 2) if old_metrics.get('mape') is not None else 'None')}\n"
+        )
+
+        # Decision logic
+        if current is None:
+            reason  = "No existing champion — promoting new model unconditionally."
+            promote = True
+        elif new_score is None:
+            reason  = (
+                f"New model '{model_id}' has no '{metric}' metric — "
+                f"cannot compare. Left as PENDING for manual review."
+            )
+            promote = False
+        elif new_score < old_score:
+            reason  = (
+                f"New model is BETTER: {metric} {old_score:.2f} → {new_score:.2f}. "
+                f"Promoting to champion."
+            )
+            promote = True
+        else:
+            reason  = (
+                f"New model is NOT better: new {metric}={new_score:.2f} >= "
+                f"current {old_score:.2f}. Retaining existing champion."
+            )
+            promote = False
+
+        logger.info(f"[Registry] Decision: {reason}")
+
+        if promote:
+            self.approve_model(model_id, approved_by="auto_compare_and_promote")
+            self.deploy_model(model_id)
+            self.write_champion_pointer(model_id)
+
+        return {
+            "promoted":    promote,
+            "model_id":    model_id,
+            "new_score":   new_score,
+            "old_score":   old_score,
+            "new_metrics": new_metrics,
+            "old_metrics": old_metrics,
+            "reason":      reason,
+        }

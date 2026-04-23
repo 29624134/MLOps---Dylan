@@ -10,7 +10,7 @@ import streamlit as st
 import pandas as pd
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from api_client import trigger_workflow, get_workflow_status, run_bearing_pipeline
+from dashboard.api_client import trigger_workflow, get_workflow_status, run_bearing_pipeline
 
 st.markdown("# 🚀 Pipeline Control")
 st.markdown("Trigger and monitor the MLOps workflow orchestrator.")

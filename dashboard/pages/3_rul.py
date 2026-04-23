@@ -10,7 +10,7 @@ import plotly.graph_objects as go
 import pandas as pd
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from api_client import get_latest_bearing_records, get_serving_history
+from dashboard.api_client import get_latest_bearing_records, get_serving_history
 
 st.markdown("# 📊 RUL Monitor")
 st.markdown("Remaining Useful Life predictions and predictive maintenance alerts.")
@@ -19,8 +19,7 @@ st.markdown("---")
 # ── Controls ──────────────────────────────────────────────────────────────────
 col1, col2, col3 = st.columns([3, 2, 1])
 with col1:
-    bearing = st.selectbox("Bearing", ["Bearing1_5", "Bearing1_4", "Bearing1_6",
-                                        "Bearing1_7", "Bearing2_3"], index=0)
+    bearing = st.selectbox("Bearing", ["Bearing1_2","Bearing1_3","Bearing1_4","Bearing1_5","Bearing1_6","Bearing1_7", "Bearing2_3"], index=0)
 with col2:
     n_records = st.slider("Records to display", 20, 500, 100, step=10)
 with col3:

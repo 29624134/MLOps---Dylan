@@ -11,7 +11,7 @@ from datetime import datetime
 import requests
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from api_client import get_serving_history
+from dashboard.api_client import get_serving_history
 
 
 # ── API helpers ───────────────────────────────────────────────────────────────

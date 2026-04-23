@@ -11,7 +11,7 @@ import pandas as pd
 import json
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from api_client import get_serving_history, get_run_summary
+from dashboard.api_client import get_serving_history, get_run_summary
 
 st.markdown("# 📜 Audit / Serving History")
 st.markdown("Full audit trail from the Serving History store (Step 9 → Step 10).")
