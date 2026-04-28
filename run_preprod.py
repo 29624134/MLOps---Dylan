@@ -165,7 +165,7 @@ def run_preprod(
         from pymongo import MongoClient
         client        = MongoClient(mongo_uri, serverSelectionTimeoutMS=5000)
         db            = client[db_name]
-        confirmed_col = db["confirmed_faults"]
+        confirmed_col = db["feature_store_mirrored"]
         preprod_col   = db["preprod_runs"]   # tracks which data was used in each run
 
         # 1a. Poll until confirmed fault data arrives in MongoDB.
