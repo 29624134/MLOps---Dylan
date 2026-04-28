@@ -11,10 +11,10 @@ Wires the 4 stages in order and handles all outputs:
     Stage 4: MLOps Monitoring     → stats, drift flags
 
 Pipeline outputs (per diagram):
-    step 6  → Feature Store    (versioned features, MongoDB)
-    step 8  → Export Service   (RUL CSV + optional JSON to External destination)
-    step 9  → Serving History  (full pipeline record, MongoDB)
-    Audit   → Audit Service    (every record forwarded to ExportSvc → External)
+    step 7  → Feature Store    (versioned features)
+    step 9  → Serving History  (full pipeline record)
+    step 8  → Dashboard        (via monitoring output — RUL metrics)
+             Export Service    (stubbed — structural connection only)
 
 Design notes
 ────────────
@@ -72,6 +72,22 @@ from serving_pipeline.predictive_maintenance import PredictiveMaintenance
 logger = logging.getLogger(__name__)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Export Service stub
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _stub_export_service(pipeline_output: Dict[str, Any]) -> None:
+    """
+    Stub for the Export Service connection (diagram arrow ServPipeline → ExportSvc).
+    Structural connection is present; no functional implementation per §2 instructions.
+    """
+    logger.debug("[ExportSvc] stub — export not implemented.")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ServingPipeline
+# ─────────────────────────────────────────────────────────────────────────────
+
 class ServingPipeline:
     """
     End-to-end Serving Pipeline DAG.
@@ -88,9 +104,6 @@ class ServingPipeline:
         warning_threshold_s     : int  (default 14400)
         baseline_path           : str  (default "model_registry/monitoring_baseline.json")
         enable_serving_history  : bool (default True)
-        export_output_dir       : str  (default "export_output")
-        enable_export_json      : bool (default False)
-        enable_export_service   : bool (default True)
     """
 
     def __init__(self, config: Optional[Dict[str, Any]] = None):
@@ -142,39 +155,6 @@ class ServingPipeline:
                     "Results will not be persisted."
                 )
 
-        # ── Export Service (step 8: ServPipeline → ExportSvc → External) ──────
-        self._exporter = None
-        if cfg.get("enable_export_service", True):
-            try:
-                from export_service.export_service import ExportService
-                self._exporter = ExportService({
-                    "output_dir":       cfg.get("export_output_dir", "export_output"),
-                    "enable_rul_csv":   True,
-                    "enable_audit_csv": True,
-                    "enable_json":      cfg.get("enable_export_json", False),
-                })
-            except Exception as exc:
-                logger.warning(
-                    f"[Pipeline] Could not initialise ExportService: {exc}. "
-                    "Export will be skipped."
-                )
-
-        # ── Audit Service (ServHistory → AuditSvc → External) ────────────────
-        self._auditor = None
-        try:
-            from utils.audit_service import AuditService
-            self._auditor = AuditService({
-                "mongo_uri":  self._mongo_uri,
-                "db_name":    self._db_name,
-                "output_dir": cfg.get("export_output_dir", "export_output"),
-                "enable_json": cfg.get("enable_export_json", False),
-            })
-        except Exception as exc:
-            logger.warning(
-                f"[Pipeline] Could not initialise AuditService: {exc}. "
-                "Audit export will be skipped."
-            )
-
         logger.info("[Pipeline] ServingPipeline initialised — all 4 stages ready.")
 
     # ── Public API ────────────────────────────────────────────────────────────
@@ -196,7 +176,7 @@ class ServingPipeline:
         run_id, bearing_name, burst_idx : identifiers
         h_signal, v_signal              : raw vibration arrays (used when
                                           precomputed_features is None)
-        precomputed_features            : dict of feature values already
+        precomputed_features            : dict of 18 feature values already
                                           extracted by scada_simulator.py.
                                           When provided, the FE stage uses
                                           these values directly and builds the
@@ -297,6 +277,7 @@ class ServingPipeline:
     def reload_model(self) -> None:
         """
         Force reload the deployed model from the ModelRegistry.
+
         Called by run_serving.py when champion.json changes (hot-swap).
         Always called between bursts — never mid-prediction.
         """
@@ -317,8 +298,11 @@ class ServingPipeline:
 
         # ── Stage 1: Feature Engineering ─────────────────────────────────────
         if precomputed_features is not None:
+            # SCADA simulator path: use features already extracted from raw signals.
+            # Feed them into the FE stage's rolling window without re-extracting.
             fe_out = self._fe.process_burst_precomputed(burst_idx, precomputed_features)
         else:
+            # Standard path: extract features from raw signals.
             fe_out = self._fe.process_burst(burst_idx, h_signal, v_signal)
 
         if not fe_out["ready"]:
@@ -346,7 +330,6 @@ class ServingPipeline:
 
         # ── Step 9: Write to Serving History ─────────────────────────────────
         record_id = None
-        sh_record = None
         if self._sh:
             features_dict = {
                 name: float(val)
@@ -355,6 +338,7 @@ class ServingPipeline:
                     fe_out["feature_vector"].tolist(),
                 )
             }
+            # Attach quality labels to the features dict
             features_dict["_quality"] = fe_out.get("quality_labels") or {}
 
             record_id = self._sh.save_pipeline_output(
@@ -373,39 +357,12 @@ class ServingPipeline:
                 monitoring_out= mon_out,
                 pipeline_ok   = True,
             )
-            # Build a minimal record dict for the Audit Service
-            sh_record = {
-                "run_id":       run_id,
-                "bearing_name": bearing_name,
-                "burst_idx":    burst_idx,
-                "pipeline_ok":  True,
-                "inference":    {
-                    "rul_s":       infer_out.get("rul_s"),
-                    "rul_min":     infer_out.get("rul_min"),
-                    "data_quality": infer_out.get("data_quality", "clean"),
-                    "model_version": infer_out.get("model_version", "unknown"),
-                },
-                "pm":           pm_out,
-                "monitoring":   mon_out,
-            }
 
-        # ── Step 8: Export Service (ServPipeline → ExportSvc → External) ─────
-        pipeline_result = {
-            "ok":        True,
-            "ready":     True,
-            "run_id":    run_id,
-            "bearing":   bearing_name,
-            "burst_idx": burst_idx,
-            "inference": infer_out,
-            "pm":        pm_out,
-            "monitoring": mon_out,
-        }
-        if self._exporter is not None:
-            self._exporter.export_pipeline_output(pipeline_result)
-
-        # ── Audit Service (ServHistory → AuditSvc → External) ────────────────
-        if self._auditor is not None and sh_record is not None:
-            self._auditor.audit_record(sh_record)
+        # ── Export Service stub (structural connection) ────────────────────────
+        _stub_export_service({
+            "run_id": run_id, "bearing": bearing_name, "burst_idx": burst_idx,
+            "pm": pm_out, "monitoring": mon_out,
+        })
 
         return {
             "ok":         True,

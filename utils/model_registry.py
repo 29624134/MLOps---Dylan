@@ -1,35 +1,25 @@
 """
 utils/model_registry.py
 ═══════════════════════════════════════════════════════════════════════════════
-Central registry for all trained models — MongoDB-backed.
+Central registry for all trained models.
 
-Mirrors WorkflowRegistry: MongoDB is the primary store; champion.json on disk
-is only the lightweight hot-swap pointer watched by run_serving.py.
-
-Fix #3  — Registry now lives in MongoDB (collection: model_registry), NOT in
-           model_registry/registry.json.  Falls back to JSON if Mongo is
-           unavailable so the system degrades gracefully.
-Fix #5  — compare_and_promote() checks whether serving is currently active
-           (via the serving_lock collection) before writing champion.json.
-           If serving is busy the promotion is deferred and retried
-           periodically until the burst boundary is free.
+Stores globally at model_registry/registry.json — not scoped to a run_id —
+so all runs share a single registry.
 
 Key responsibilities
 ────────────────────
-1. Track model versions and metadata across all runs (in MongoDB)
+1. Track model versions and metadata across all runs
 2. Manage model approval workflow (pending → approved → deployed → archived)
 3. Retrieve deployed models for serving
 4. Maintain model lineage via metadata
 5. Write champion.json pointer for atomic hot-swap (run_serving.py watches this)
-6. Compare pending models against the current champion and promote if better,
-   but NEVER push a new model while serving is mid-burst.
+6. Compare pending models against the current champion and promote if better
 """
 
 import json
 import os
 import hashlib
 import logging
-import time
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Any
 from enum import Enum
@@ -39,121 +29,91 @@ logger = logging.getLogger(__name__)
 # ── Champion pointer path — watched by run_serving.py for hot-swap ────────────
 CHAMPION_PATH = os.path.join("model_registry", "champion.json")
 
-# ── MongoDB defaults ───────────────────────────────────────────────────────────
-DEFAULT_MONGO_URI = os.environ.get("MONGO_URI", "mongodb://localhost:27017")
-DEFAULT_DB_NAME   = os.environ.get("MONGO_DB",  "phm_mlops")
-from utils.db_collections import COL_MODEL_REGISTRY, COL_SERVING_LOCK
-COLLECTION        = COL_MODEL_REGISTRY   # "model_registry"
-LOCK_COLLECTION   = COL_SERVING_LOCK     # used by run_serving.py to signal active burst
-
 
 class ModelStatus(Enum):
     """Model lifecycle states."""
-    PENDING      = "pending"
-    APPROVED     = "approved"
-    REJECTED     = "rejected"
-    DEPLOYED     = "deployed"
-    ARCHIVED     = "archived"
-    EXPERIMENTAL = "experimental"
+    PENDING      = "pending"        # Just trained, awaiting review/comparison
+    APPROVED     = "approved"       # Approved for production
+    REJECTED     = "rejected"       # Rejected by domain expert
+    DEPLOYED     = "deployed"       # Currently in production
+    ARCHIVED     = "archived"       # Retired from production
+    EXPERIMENTAL = "experimental"   # From external research
 
 
 class ModelRegistry:
     """
-    Central registry for all trained models — primary store is MongoDB.
+    Central registry for all trained models.
 
-    Falls back to model_registry/registry.json if MongoDB is unavailable.
-    Public API is unchanged so all callers (orchestrator, run_preprod, API)
-    work without modification.
+    Stores globally at model_registry/registry.json — not scoped to a
+    run_id — so all runs share a single registry, mirroring the
+    WorkflowRegistry pattern.
+
+    run_id is preserved for lineage by passing it in metadata when calling
+    register_model(), and is filterable via list_models(run_id=...).
     """
 
-    FALLBACK_JSON = os.path.join("model_registry", "registry.json")
+    REGISTRY_FILENAME = "registry.json"
 
-    def __init__(
-        self,
-        registry_path: Optional[str] = None,   # kept for backward compat, ignored when Mongo up
-        mongo_uri:     Optional[str] = None,
-        db_name:       Optional[str] = None,
-    ):
-        self._mongo_uri = mongo_uri or DEFAULT_MONGO_URI
-        self._db_name   = db_name   or DEFAULT_DB_NAME
-        self._col       = None
-        self._lock_col  = None
-        self._fallback  = False
-
-        # Keep legacy fallback path for when Mongo is down
+    def __init__(self, registry_path: Optional[str] = None):
+        """
+        Parameters
+        ----------
+        registry_path : str, optional
+            Override the registry file path. Defaults to
+            ``model_registry/registry.json`` relative to cwd.
+        """
         if registry_path is None:
-            registry_path = self.FALLBACK_JSON
+            registry_path = os.path.join("model_registry", self.REGISTRY_FILENAME)
+
         if not os.path.isabs(registry_path):
             registry_path = os.path.abspath(registry_path)
+
         self.registry_path = registry_path
         self.registry_dir  = os.path.dirname(registry_path)
         os.makedirs(self.registry_dir, exist_ok=True)
 
-        # Always create the fallback JSON — used as safety net even when MongoDB
-        # is up, so _load_fallback() never crashes on a missing file.
-        self._ensure_fallback_json()
+        logger.info(f"ModelRegistry initialised at: {self.registry_path}")
 
-        try:
-            col, lock_col = self._connect()
-            col.create_index("model_id",       name="idx_model_id",  unique=True, sparse=True)
-            col.create_index("status",         name="idx_status")
-            col.create_index("target_feature", name="idx_target")
-            logger.info(
-                f"ModelRegistry connected to MongoDB → {self._db_name}.{COLLECTION}"
-            )
-        except Exception as exc:
-            logger.warning(
-                f"ModelRegistry: MongoDB unavailable ({exc}). "
-                f"Falling back to JSON at {self.registry_path}."
-            )
-            self._fallback = True
-
-    # ── MongoDB connection ────────────────────────────────────────────────────
-
-    def _connect(self):
-        from pymongo import MongoClient
-        client          = MongoClient(self._mongo_uri, serverSelectionTimeoutMS=3000)
-        client.admin.command("ping")
-        db              = client[self._db_name]
-        self._col       = db[COLLECTION]
-        self._lock_col  = db[LOCK_COLLECTION]
-        return self._col, self._lock_col
-
-    def _collection(self):
-        if self._col is not None:
-            return self._col
-        col, _ = self._connect()
-        return col
-
-    def _lock_collection(self):
-        if self._lock_col is not None:
-            return self._lock_col
-        _, lock_col = self._connect()
-        return lock_col
-
-    # ── Fallback JSON helpers ─────────────────────────────────────────────────
-
-    def _ensure_fallback_json(self):
-        os.makedirs(self.registry_dir, exist_ok=True)
         if not os.path.exists(self.registry_path):
-            self._save_fallback({"version": "1.0",
-                                  "created_at": datetime.now().isoformat(),
-                                  "models": []})
-
-    def _load_fallback(self) -> Dict:
-        if not os.path.exists(self.registry_path):
-            self._ensure_fallback_json()
-        with open(self.registry_path) as fh:
-            return json.load(fh)
-
-    def _save_fallback(self, data: Dict):
-        with open(self.registry_path, "w") as fh:
-            json.dump(data, fh, indent=2)
+            logger.info("  Creating new model registry file.")
+            self._initialize_registry()
+        else:
+            try:
+                reg = self._load_registry()
+                logger.info(
+                    f"  Loaded existing registry with "
+                    f"{len(reg.get('models', []))} model(s)."
+                )
+            except Exception as exc:
+                logger.error(f"  Failed to load existing registry: {exc}")
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
+    def _initialize_registry(self):
+        initial = {
+            "version":    "1.0",
+            "created_at": datetime.now().isoformat(),
+            "models":     [],
+        }
+        self._save_registry(initial)
+
+    def _load_registry(self) -> Dict:
+        with open(self.registry_path, "r") as fh:
+            return json.load(fh)
+
+    def _save_registry(self, registry: Dict):
+        with open(self.registry_path, "w") as fh:
+            json.dump(registry, fh, indent=2)
+
     def _generate_model_id(self, model_path: str, timestamp: str) -> str:
-        return hashlib.md5(f"{model_path}_{timestamp}".encode()).hexdigest()[:12]
+        unique = f"{model_path}_{timestamp}"
+        return hashlib.md5(unique.encode()).hexdigest()[:12]
+
+    def _find(self, registry: Dict, model_id: str) -> Optional[Dict]:
+        for m in registry["models"]:
+            if m["model_id"] == model_id:
+                return m
+        return None
 
     # ── Public API — Registration & Lifecycle ─────────────────────────────────
 
@@ -166,160 +126,143 @@ class ModelRegistry:
         training_data_info: Dict[str, Any],
         metadata:           Optional[Dict] = None,
     ) -> str:
-        timestamp = datetime.now(timezone.utc).isoformat()
+        """
+        Register a newly trained model.
+
+        Parameters
+        ----------
+        model_path : str
+            Path to the saved model file (.pt).
+        model_type : str
+            Model class name (e.g. 'RULNetModel').
+        target_feature : str
+            Feature being predicted (e.g. 'RUL_s').
+        metrics : dict
+            Performance metrics e.g. {'mae_s': 1200.0, 'mean_abs_pct': 0.12}.
+        training_data_info : dict
+            Info about training data (num files, window size, source, etc.).
+        metadata : dict, optional
+            Arbitrary extra fields. Pass run_id here for lineage:
+            ``metadata={"run_id": run_id, "hyperparameters": {...}}``.
+
+        Returns
+        -------
+        str — the generated model_id.
+        """
+        timestamp = datetime.now().isoformat()
         model_id  = self._generate_model_id(model_path, timestamp)
 
-        record = {
+        record: Dict[str, Any] = {
             "model_id":           model_id,
             "model_path":         model_path,
             "model_type":         model_type,
             "target_feature":     target_feature,
+            "status":             ModelStatus.PENDING.value,
             "metrics":            metrics,
             "training_data_info": training_data_info,
-            "metadata":           metadata or {},
-            "status":             ModelStatus.PENDING.value,
             "registered_at":      timestamp,
+            "approved_at":        None,
+            "approved_by":        None,
+            "deployed_at":        None,
+            "archived_at":        None,
+            "metadata":           metadata or {},
         }
 
-        if not self._fallback:
-            try:
-                self._collection().insert_one({**record, "_id": model_id})
-                logger.info(
-                    f"Model registered in MongoDB: {model_id} "
-                    f"({model_type} → {target_feature}, status=pending)"
-                )
-                return model_id
-            except Exception as e:
-                logger.warning(f"MongoDB register failed, using fallback JSON: {e}")
+        registry = self._load_registry()
+        registry["models"].append(record)
+        self._save_registry(registry)
 
-        # Fallback JSON path
-        data = self._load_fallback()
-        data["models"].append(record)
-        self._save_fallback(data)
-        logger.info(f"Model registered in fallback JSON: {model_id}")
+        logger.info(
+            f"Registered model '{model_type}' -> '{target_feature}' "
+            f"(id={model_id}, run={metadata.get('run_id', 'n/a') if metadata else 'n/a'})"
+        )
         return model_id
 
-    def approve_model(self, model_id: str, approved_by: str = "system") -> bool:
-        now = datetime.now(timezone.utc).isoformat()
-        if not self._fallback:
-            try:
-                res = self._collection().update_one(
-                    {"_id": model_id},
-                    {"$set": {"status": ModelStatus.APPROVED.value,
-                               "approved_at": now, "approved_by": approved_by}},
-                )
-                if res.matched_count:
-                    logger.info(f"Model {model_id} approved by '{approved_by}'.")
-                    return True
-            except Exception as e:
-                logger.warning(f"MongoDB approve failed: {e}")
+    def approve_model(self, model_id: str, approved_by: str) -> bool:
+        """Transition pending → approved."""
+        registry = self._load_registry()
+        record   = self._find(registry, model_id)
+        if record is None:
+            logger.error(f"approve_model: id '{model_id}' not found.")
+            return False
+        record["status"]      = ModelStatus.APPROVED.value
+        record["approved_at"] = datetime.now().isoformat()
+        record["approved_by"] = approved_by
+        self._save_registry(registry)
+        logger.info(f"Model {model_id} approved by '{approved_by}'.")
+        return True
 
-        # Fallback
-        data = self._load_fallback()
-        for m in data["models"]:
-            if m["model_id"] == model_id:
-                m["status"] = ModelStatus.APPROVED.value
-                m["approved_at"] = now
-                m["approved_by"] = approved_by
-                self._save_fallback(data)
-                logger.info(f"Model {model_id} approved (fallback JSON).")
-                return True
-        logger.error(f"approve_model: id '{model_id}' not found.")
-        return False
-
-    def reject_model(self, model_id: str, rejected_by: str = "system") -> bool:
-        now = datetime.now(timezone.utc).isoformat()
-        if not self._fallback:
-            try:
-                res = self._collection().update_one(
-                    {"_id": model_id},
-                    {"$set": {"status": ModelStatus.REJECTED.value,
-                               "rejected_at": now, "rejected_by": rejected_by}},
-                )
-                if res.matched_count:
-                    logger.info(f"Model {model_id} rejected.")
-                    return True
-            except Exception as e:
-                logger.warning(f"MongoDB reject failed: {e}")
-
-        data = self._load_fallback()
-        for m in data["models"]:
-            if m["model_id"] == model_id:
-                m["status"] = ModelStatus.REJECTED.value
-                m["rejected_at"] = now
-                m["rejected_by"] = rejected_by
-                self._save_fallback(data)
-                return True
-        logger.error(f"reject_model: id '{model_id}' not found.")
-        return False
+    def reject_model(self, model_id: str, rejected_by: str) -> bool:
+        """Transition pending → rejected."""
+        registry = self._load_registry()
+        record   = self._find(registry, model_id)
+        if record is None:
+            logger.error(f"reject_model: id '{model_id}' not found.")
+            return False
+        record["status"]      = ModelStatus.REJECTED.value
+        record["rejected_at"] = datetime.now().isoformat()
+        record["rejected_by"] = rejected_by
+        self._save_registry(registry)
+        logger.info(f"Model {model_id} rejected by '{rejected_by}'.")
+        return True
 
     def deploy_model(self, model_id: str) -> bool:
         """
         Transition approved → deployed.
-        Archives any previously deployed model for the same target_feature.
+        Automatically archives any previously deployed model for the same
+        target_feature so only one deployed model exists per feature.
         """
-        now    = datetime.now(timezone.utc).isoformat()
-        record = self.get_model(model_id)
+        registry = self._load_registry()
+        record   = self._find(registry, model_id)
+
         if record is None:
             logger.error(f"deploy_model: id '{model_id}' not found.")
             return False
         if record["status"] != ModelStatus.APPROVED.value:
             logger.error(
-                f"deploy_model: model '{model_id}' is '{record['status']}', not 'approved'."
+                f"deploy_model: model '{model_id}' is '{record['status']}', "
+                f"not 'approved'."
             )
             return False
 
-        # Archive any currently deployed model for the same feature
-        existing = self.list_models(status=ModelStatus.DEPLOYED.value,
-                                    target_feature=record["target_feature"])
-        for m in existing:
-            if m["model_id"] != model_id:
-                self._set_status(m["model_id"], ModelStatus.ARCHIVED.value,
-                                  {"archived_at": now})
+        now = datetime.now().isoformat()
+        for m in registry["models"]:
+            if (m["target_feature"] == record["target_feature"]
+                    and m["status"] == ModelStatus.DEPLOYED.value
+                    and m["model_id"] != model_id):
+                m["status"]      = ModelStatus.ARCHIVED.value
+                m["archived_at"] = now
                 logger.info(f"  Archived previously deployed model: {m['model_id']}")
 
-        self._set_status(model_id, ModelStatus.DEPLOYED.value, {"deployed_at": now})
+        record["status"]      = ModelStatus.DEPLOYED.value
+        record["deployed_at"] = now
+        self._save_registry(registry)
         logger.info(f"Model {model_id} deployed for '{record['target_feature']}'.")
         return True
 
     def archive_model(self, model_id: str) -> bool:
-        self._set_status(model_id, ModelStatus.ARCHIVED.value,
-                          {"archived_at": datetime.now(timezone.utc).isoformat()})
+        """Manually archive a model."""
+        registry = self._load_registry()
+        record   = self._find(registry, model_id)
+        if record is None:
+            logger.error(f"archive_model: id '{model_id}' not found.")
+            return False
+        record["status"]      = ModelStatus.ARCHIVED.value
+        record["archived_at"] = datetime.now().isoformat()
+        self._save_registry(registry)
         logger.info(f"Model {model_id} archived.")
         return True
-
-    def _set_status(self, model_id: str, status: str, extra: Dict = None):
-        update = {"status": status, **(extra or {})}
-        if not self._fallback:
-            try:
-                self._collection().update_one({"_id": model_id}, {"$set": update})
-                return
-            except Exception as e:
-                logger.warning(f"MongoDB _set_status failed: {e}")
-        data = self._load_fallback()
-        for m in data["models"]:
-            if m["model_id"] == model_id:
-                m.update(update)
-                self._save_fallback(data)
-                return
 
     # ── Queries ───────────────────────────────────────────────────────────────
 
     def get_deployed_model(self, target_feature: str) -> Optional[Dict]:
-        if not self._fallback:
-            try:
-                doc = self._collection().find_one(
-                    {"target_feature": target_feature,
-                     "status": ModelStatus.DEPLOYED.value},
-                )
-                if doc:
-                    doc.pop("_id", None)
-                    return doc
-            except Exception as e:
-                logger.warning(f"MongoDB get_deployed_model failed: {e}")
-
-        data = self._load_fallback()
-        for m in data["models"]:
+        """
+        Return the currently deployed model for a given target feature.
+        Primary method used by live serving and the predict endpoint.
+        Returns None if no deployed model exists.
+        """
+        registry = self._load_registry()
+        for m in registry["models"]:
             if (m["target_feature"] == target_feature
                     and m["status"] == ModelStatus.DEPLOYED.value):
                 return m
@@ -327,21 +270,9 @@ class ModelRegistry:
         return None
 
     def get_model(self, model_id: str) -> Optional[Dict]:
-        if not self._fallback:
-            try:
-                doc = self._collection().find_one({"_id": model_id})
-                if doc:
-                    doc.pop("_id", None)
-                    doc["model_id"] = model_id
-                    return doc
-            except Exception as e:
-                logger.warning(f"MongoDB get_model failed: {e}")
-
-        data = self._load_fallback()
-        for m in data["models"]:
-            if m["model_id"] == model_id:
-                return m
-        return None
+        """Return a model record by its ID."""
+        registry = self._load_registry()
+        return self._find(registry, model_id)
 
     def list_models(
         self,
@@ -349,41 +280,37 @@ class ModelRegistry:
         target_feature: Optional[str] = None,
         run_id:         Optional[str] = None,
     ) -> List[Dict]:
-        query: Dict[str, Any] = {}
-        if status:
-            query["status"] = status
-        if target_feature:
-            query["target_feature"] = target_feature
-        if run_id:
-            query["metadata.run_id"] = run_id
+        """
+        List model records with optional filters.
 
-        if not self._fallback:
-            try:
-                docs = list(self._collection().find(query))
-                for d in docs:
-                    mid = d.pop("_id", None)
-                    if mid and "model_id" not in d:
-                        d["model_id"] = mid
-                return docs
-            except Exception as e:
-                logger.warning(f"MongoDB list_models failed: {e}")
+        Parameters
+        ----------
+        status : str, optional
+            Filter by status string (e.g. 'pending', 'deployed').
+        target_feature : str, optional
+            Filter by target feature (e.g. 'RUL_s').
+        run_id : str, optional
+            Filter by run_id stored in metadata.
+        """
+        registry = self._load_registry()
+        results  = registry["models"]
 
-        # Fallback
-        data    = self._load_fallback()
-        results = data["models"]
         if status:
             results = [m for m in results if m["status"] == status]
         if target_feature:
             results = [m for m in results if m["target_feature"] == target_feature]
         if run_id:
-            results = [m for m in results
-                       if m.get("metadata", {}).get("run_id") == run_id]
+            results = [
+                m for m in results
+                if m.get("metadata", {}).get("run_id") == run_id
+            ]
         return results
 
     def print_status(self, target_feature: Optional[str] = None):
+        """Log a human-readable status summary."""
         models = self.list_models(target_feature=target_feature)
         logger.info("─" * 72)
-        logger.info(f"{'MODEL REGISTRY (MongoDB)':^72}")
+        logger.info(f"{'MODEL REGISTRY':^72}")
         logger.info("─" * 72)
         if not models:
             logger.info("  (empty)")
@@ -396,63 +323,28 @@ class ModelRegistry:
             )
         logger.info("─" * 72)
 
-    # ── Serving lock — Fix #5 ─────────────────────────────────────────────────
-
-    def is_serving_active(self) -> bool:
-        """
-        Return True if run_serving.py has signalled that it is mid-burst.
-
-        run_serving.py writes a document to the 'serving_lock' collection
-        before processing each burst and removes it (or sets active=False)
-        after the burst completes. This prevents champion.json being rewritten
-        during an in-flight prediction.
-        """
-        if self._fallback:
-            return False   # cannot check, assume safe
-        try:
-            doc = self._lock_collection().find_one({"active": True})
-            return doc is not None
-        except Exception as e:
-            logger.warning(f"Could not check serving_lock: {e}. Assuming inactive.")
-            return False
-
     # ── Champion pointer — hot-swap support ───────────────────────────────────
 
-    def write_champion_pointer(
-        self,
-        model_id:             str,
-        max_wait_s:           float = 30.0,
-        retry_interval_s:     float = 1.0,
-    ) -> bool:
+    def write_champion_pointer(self, model_id: str) -> bool:
         """
         Write model_registry/champion.json pointing to the newly deployed model.
 
-        Fix #5: Waits until serving is NOT mid-burst before writing, so the
-        serving pipeline never loads a half-written champion during a prediction.
-        Waits up to max_wait_s seconds, then proceeds anyway (safety fallback).
+        Called automatically by compare_and_promote() after deploy_model().
+        Can also be called manually after a manual deploy.
 
-        Uses write-then-rename (os.replace) for atomicity.
+        run_serving.py watches this file for mtime changes between bursts.
+        When detected it calls pipeline.reload_model() to hot-swap without
+        missing a prediction.
+
+        Uses write-then-rename (os.replace) for atomicity — the serving
+        pipeline can never read a half-written file.
+
+        Returns True on success.
         """
         record = self.get_model(model_id)
         if record is None:
             logger.error(f"write_champion_pointer: model '{model_id}' not found.")
             return False
-
-        # ── Wait for serving to be idle (Fix #5) ─────────────────────────────
-        waited = 0.0
-        while self.is_serving_active() and waited < max_wait_s:
-            logger.info(
-                f"[Champion] Serving is mid-burst — waiting {retry_interval_s}s "
-                f"before writing champion.json ({waited:.0f}/{max_wait_s:.0f}s waited)..."
-            )
-            time.sleep(retry_interval_s)
-            waited += retry_interval_s
-
-        if waited >= max_wait_s:
-            logger.warning(
-                f"[Champion] Serving did not become idle within {max_wait_s}s. "
-                f"Proceeding with champion.json write (atomic swap will still be safe)."
-            )
 
         champion = {
             "model_id":    model_id,
@@ -477,6 +369,10 @@ class ModelRegistry:
             return False
 
     def read_champion_pointer(self) -> Optional[Dict]:
+        """
+        Read the current champion.json pointer.
+        Returns the champion dict or None if no champion file exists.
+        """
         if not os.path.exists(CHAMPION_PATH):
             return None
         try:
@@ -495,46 +391,108 @@ class ModelRegistry:
         Compare the best pending model from run_id against the currently
         deployed champion and promote if better (lower metric = better).
 
-        Fix #5: Promotion defers writing champion.json until serving is idle.
+        Flow
+        ────
+        1. Find all pending models for this run_id
+        2. Pick the one with the best (lowest) metric value
+        3. Compare against the currently deployed model's metric
+        4. If new model is better (or no champion exists):
+               approve → deploy → write champion.json
+           Else:
+               leave as pending for manual review
+
+        Parameters
+        ----------
+        run_id : str
+            The training run whose pending models to compare.
+        metric : str
+            The metric to compare on (default: 'mae_s', lower is better).
+
+        Returns
+        -------
+        dict with keys:
+            promoted   : bool         — True if new model was deployed
+            model_id   : str | None   — ID of the best pending model evaluated
+            new_score  : float | None — new model's metric value
+            old_score  : float | None — current champion's metric value (or None)
+            reason     : str          — human-readable explanation of decision
         """
-        pending = self.list_models(run_id=run_id, status=ModelStatus.PENDING.value)
+        pending = self.list_models(run_id=run_id, status="pending")
         if not pending:
-            return {"model_id": None, "promoted": False,
-                    "reason": f"No pending models for run_id={run_id}"}
+            msg = f"No pending models found for run_id='{run_id}'."
+            logger.warning(f"[Registry] compare_and_promote: {msg}")
+            return {
+                "promoted":  False,
+                "model_id":  None,
+                "new_score": None,
+                "old_score": None,
+                "reason":    msg,
+            }
 
-        best_pending = min(
+        # Pick best pending model by metric (lower is better)
+        best      = min(
             pending,
-            key=lambda m: m.get("metrics", {}).get(metric, float("inf")),
+            key=lambda m: m.get("metrics", {}).get(metric, float("inf"))
         )
-        new_val  = best_pending.get("metrics", {}).get(metric, float("inf"))
-        new_id   = best_pending["model_id"]
-        new_path = best_pending["model_path"]
+        new_score    = best.get("metrics", {}).get(metric)
+        new_metrics  = best.get("metrics", {})
+        model_id     = best["model_id"]
 
-        # Compare against current champion
-        current_champion = self.read_champion_pointer()
-        if current_champion:
-            champ_id  = current_champion["model_id"]
-            champ_rec = self.get_model(champ_id)
-            champ_val = (champ_rec.get("metrics", {}).get(metric, float("inf"))
-                         if champ_rec else float("inf"))
-        else:
-            champ_val = float("inf")
+        # Get currently deployed champion for this feature
+        target       = best.get("target_feature", "RUL_s")
+        current      = self.get_deployed_model(target)
+        old_score    = current.get("metrics", {}).get(metric) if current else None
+        old_metrics  = current.get("metrics", {}) if current else {}
 
-        if new_val < champ_val:
-            # New model is better — approve, deploy, write champion
-            self.approve_model(new_id, approved_by="preprod_auto")
-            self.deploy_model(new_id)
-            self.write_champion_pointer(new_id)   # Fix #5: waits for idle burst
-            reason = (
-                f"New model promoted: {metric}={new_val:.2f} < "
-                f"champion {metric}={champ_val:.2f}"
+        # Log full metric comparison across all 4 metrics
+        logger.info(
+            f"[Registry] ── Model Comparison ──────────────────────────────\n"
+            f"  Metric      │ New Model          │ Current Champion\n"
+            f"  ────────────┼────────────────────┼──────────────────\n"
+            f"  mae_s       │ {str(round(new_metrics.get('mae_s', None), 1) if new_metrics.get('mae_s') is not None else 'None'):<18} │ "
+            f"{str(round(old_metrics.get('mae_s', None), 1) if old_metrics.get('mae_s') is not None else 'None')}\n"
+            f"  rmse_s      │ {str(round(new_metrics.get('rmse_s', None), 1) if new_metrics.get('rmse_s') is not None else 'None'):<18} │ "
+            f"{str(round(old_metrics.get('rmse_s', None), 1) if old_metrics.get('rmse_s') is not None else 'None')}\n"
+            f"  mape        │ {str(round(new_metrics.get('mape', None), 2) if new_metrics.get('mape') is not None else 'None'):<18} │ "
+            f"{str(round(old_metrics.get('mape', None), 2) if old_metrics.get('mape') is not None else 'None')}\n"
+        )
+
+        # Decision logic
+        if current is None:
+            reason  = "No existing champion — promoting new model unconditionally."
+            promote = True
+        elif new_score is None:
+            reason  = (
+                f"New model '{model_id}' has no '{metric}' metric — "
+                f"cannot compare. Left as PENDING for manual review."
             )
-            logger.info(f"[{run_id}] {reason}")
-            return {"model_id": new_id, "promoted": True, "reason": reason}
+            promote = False
+        elif new_score < old_score:
+            reason  = (
+                f"New model is BETTER: {metric} {old_score:.2f} → {new_score:.2f}. "
+                f"Promoting to champion."
+            )
+            promote = True
         else:
-            reason = (
-                f"New model NOT promoted: {metric}={new_val:.2f} >= "
-                f"champion {metric}={champ_val:.2f}. Left as PENDING."
+            reason  = (
+                f"New model is NOT better: new {metric}={new_score:.2f} >= "
+                f"current {old_score:.2f}. Retaining existing champion."
             )
-            logger.info(f"[{run_id}] {reason}")
-            return {"model_id": new_id, "promoted": False, "reason": reason}
+            promote = False
+
+        logger.info(f"[Registry] Decision: {reason}")
+
+        if promote:
+            self.approve_model(model_id, approved_by="auto_compare_and_promote")
+            self.deploy_model(model_id)
+            self.write_champion_pointer(model_id)
+
+        return {
+            "promoted":    promote,
+            "model_id":    model_id,
+            "new_score":   new_score,
+            "old_score":   old_score,
+            "new_metrics": new_metrics,
+            "old_metrics": old_metrics,
+            "reason":      reason,
+        }
