@@ -65,7 +65,7 @@ logger = logging.getLogger("scada_simulator")
 # ── Constants ─────────────────────────────────────────────────────────────────
 DEFAULT_MONGO_URI   = "mongodb://localhost:27017"
 DEFAULT_DB_NAME     = "phm_mlops"
-FS_LIVE_COLLECTION  = "feature_store"       # Feature Store live collection
+FS_LIVE_COLLECTION  = "live_features"       # Feature Store live collection
 STATE_DIR           = "scada_state"          # Tracks resume position
 BURST_PERIOD_S      = 10.0                   # IEEE PHM: 1 burst every 10 s
 SAMPLES_PER_BURST   = 2560                   # IEEE PHM: 25.6 kHz × 0.1 s
@@ -172,8 +172,8 @@ class LiveFeatureStoreWriter:
 
         # Ensure indexes for fast polling by serving pipeline
         self._col.create_index(
-            [("bearing_name", ASCENDING), ("burst_idx", ASCENDING), ("doc_type", ASCENDING)],
-            unique=True, name="idx_bearing_burst_type"
+            [("bearing_name", ASCENDING), ("burst_idx", ASCENDING)],
+            unique=True, name="idx_bearing_burst"
         )
         self._col.create_index(
             [("bearing_name", ASCENDING), ("consumed", ASCENDING)],
@@ -198,7 +198,6 @@ class LiveFeatureStoreWriter:
         doc = {
             "bearing_name": bearing_name,
             "burst_idx":    burst_idx,
-            "doc_type":     "scada_burst",   # for easier querying and debugging
             "time_s":       time_s,
             "sent_at":      datetime.now(timezone.utc).isoformat(),
             "scada_stats":  scada_stats,   # 10 simple stats from SCADA
