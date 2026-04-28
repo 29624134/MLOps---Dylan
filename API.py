@@ -272,6 +272,8 @@ class RegisterWorkflowRequest(BaseModel):
 
 # ── Bearing lifecycle models ──────────────────────────────────────────────────
 
+# ── Bearing lifecycle models ──────────────────────────────────────────────────
+
 class FaultConfirmRequest(BaseModel):
     bearing_name:   str   = Field(..., json_schema_extra={"example": "Bearing1_5"})
     run_id:         str   = Field(..., description="Workflow run_id that produced the features")
