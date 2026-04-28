@@ -13,13 +13,13 @@
       "name": "Bearing1_1",
       "role": "train",
       "condition": 1,
-      "status": "extracted"
+      "status": "available"
     },
     {
       "name": "Bearing1_2",
       "role": "live",
       "condition": 1,
-      "status": "extracted"
+      "status": "confirmed"
     },
     {
       "name": "Bearing1_3",
@@ -43,7 +43,7 @@
       "name": "Bearing1_6",
       "role": "val",
       "condition": 1,
-      "status": "extracted"
+      "status": "available"
     },
     {
       "name": "Bearing1_7",
@@ -67,7 +67,7 @@
       "name": "Bearing2_3",
       "role": "val",
       "condition": 2,
-      "status": "extracted"
+      "status": "available"
     },
     {
       "name": "Bearing2_4",

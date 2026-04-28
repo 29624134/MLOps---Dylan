@@ -91,7 +91,11 @@ class RULTrainerPHM:
 
     def _add_rolling_features(self, df: pd.DataFrame) -> pd.DataFrame:
         """Add rolling mean/std/slope features matching the training pipeline."""
-        base_cols = [c for c in df.columns if c not in DROP_COLS]
+        base_cols = [c for c in df.columns
+                     if c not in DROP_COLS
+                     and not c.endswith("_mean")
+                     and not c.endswith("_std")
+                     and not c.endswith("_slope")]
         new_cols  = {}
         for col in base_cols:
             new_cols[f"{col}_mean"]  = df[col].rolling(self.window_size).mean()
@@ -108,6 +112,12 @@ class RULTrainerPHM:
             self.logger.warning(f"  File not found: {path}")
             return None
         df = pd.read_csv(path)
+        # Deduplicate column names — duplicate columns from MongoDB-sourced
+        # temp CSVs cause pd.concat to crash with InvalidIndexError.
+        if df.columns.duplicated().any():
+            dupes = df.columns[df.columns.duplicated()].tolist()
+            self.logger.warning(f"  Duplicate columns in {path}: {dupes} — dropping.")
+            df = df.loc[:, ~df.columns.duplicated()]
         if TARGET not in df.columns:
             self.logger.warning(f"  No '{TARGET}' column in {path} — skipping.")
             return None
