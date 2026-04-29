@@ -3,8 +3,19 @@ utils/model_registry.py
 ═══════════════════════════════════════════════════════════════════════════════
 Central registry for all trained models.
 
-Stores globally at model_registry/registry.json — not scoped to a run_id —
-so all runs share a single registry.
+Storage
+───────
+Primary  : MongoDB  phm_mlops.model_registry  (one document per model)
+Fallback : model_registry/registry.json       (if MongoDB unavailable)
+
+Follows the same MongoDB-primary / JSON-fallback pattern as WorkflowRegistry
+so the two registries feel consistent.
+
+Connection priority
+───────────────────
+1. Constructor kwargs  (mongo_uri, db_name)
+2. Environment variables MONGO_URI / MONGO_DB
+3. Defaults: mongodb://localhost:27017 / phm_mlops
 
 Key responsibilities
 ────────────────────
@@ -14,6 +25,14 @@ Key responsibilities
 4. Maintain model lineage via metadata
 5. Write champion.json pointer for atomic hot-swap (run_serving.py watches this)
 6. Compare pending models against the current champion and promote if better
+
+Backward compatibility
+──────────────────────
+The full public API is unchanged — every caller (model_trainer.py,
+run_preprod.py, orchestrator.py, API endpoints) works without modification.
+If MongoDB is unavailable, the registry transparently falls back to the
+original registry.json file so the system degrades gracefully.
+═══════════════════════════════════════════════════════════════════════════════
 """
 
 import json
@@ -44,9 +63,8 @@ class ModelRegistry:
     """
     Central registry for all trained models.
 
-    Stores globally at model_registry/registry.json — not scoped to a
-    run_id — so all runs share a single registry, mirroring the
-    WorkflowRegistry pattern.
+    Stores in MongoDB phm_mlops.model_registry (one document per model).
+    Falls back to model_registry/registry.json if MongoDB is unavailable.
 
     run_id is preserved for lineage by passing it in metadata when calling
     register_model(), and is filterable via list_models(run_id=...).
@@ -54,42 +72,103 @@ class ModelRegistry:
 
     REGISTRY_FILENAME = "registry.json"
 
-    def __init__(self, registry_path: Optional[str] = None):
+    def __init__(
+        self,
+        registry_path: Optional[str] = None,
+        mongo_uri:     Optional[str] = None,
+        db_name:       Optional[str] = None,
+    ):
         """
         Parameters
         ----------
         registry_path : str, optional
-            Override the registry file path. Defaults to
+            Override the JSON fallback file path. Defaults to
             ``model_registry/registry.json`` relative to cwd.
+        mongo_uri : str, optional
+            MongoDB connection URI. Falls back to MONGO_URI env var or
+            mongodb://localhost:27017.
+        db_name : str, optional
+            MongoDB database name. Falls back to MONGO_DB env var or
+            phm_mlops.
         """
+        from utils.db_collections import COL_MODEL_REGISTRY
+
+        self._mongo_uri = (
+            mongo_uri
+            or os.environ.get("MONGO_URI", "mongodb://localhost:27017")
+        )
+        self._db_name  = (
+            db_name
+            or os.environ.get("MONGO_DB", "phm_mlops")
+        )
+        self._col_name = COL_MODEL_REGISTRY   # "model_registry"
+        self._col      = None
+        self._fallback = False
+
+        # ── JSON fallback path ────────────────────────────────────────────────
         if registry_path is None:
             registry_path = os.path.join("model_registry", self.REGISTRY_FILENAME)
-
         if not os.path.isabs(registry_path):
             registry_path = os.path.abspath(registry_path)
-
         self.registry_path = registry_path
         self.registry_dir  = os.path.dirname(registry_path)
         os.makedirs(self.registry_dir, exist_ok=True)
 
-        logger.info(f"ModelRegistry initialised at: {self.registry_path}")
+        # ── Connect to MongoDB ────────────────────────────────────────────────
+        try:
+            col = self._collection()
+            col.create_index("model_id",       name="idx_model_id",     unique=True)
+            col.create_index("status",         name="idx_status")
+            col.create_index("target_feature", name="idx_target_feature")
+            col.create_index(
+                [("target_feature", 1), ("status", 1)],
+                name="idx_target_status",
+            )
+            col.create_index(
+                [("metadata.run_id", 1), ("status", 1)],
+                name="idx_run_status",
+                sparse=True,
+            )
+            n = col.count_documents({})
+            logger.info(
+                f"ModelRegistry connected to MongoDB "
+                f"→ {self._db_name}.{self._col_name} ({n} model(s))"
+            )
+        except Exception as exc:
+            logger.warning(
+                f"ModelRegistry: MongoDB unavailable ({exc}). "
+                f"Falling back to JSON at {self.registry_path}."
+            )
+            self._fallback = True
+            if not os.path.exists(self.registry_path):
+                logger.info("  Creating new JSON fallback registry file.")
+                self._initialize_registry()
+            else:
+                try:
+                    reg = self._load_registry()
+                    logger.info(
+                        f"  Loaded existing JSON registry with "
+                        f"{len(reg.get('models', []))} model(s)."
+                    )
+                except Exception as load_exc:
+                    logger.error(f"  Failed to load JSON registry: {load_exc}")
 
-        if not os.path.exists(self.registry_path):
-            logger.info("  Creating new model registry file.")
-            self._initialize_registry()
-        else:
-            try:
-                reg = self._load_registry()
-                logger.info(
-                    f"  Loaded existing registry with "
-                    f"{len(reg.get('models', []))} model(s)."
-                )
-            except Exception as exc:
-                logger.error(f"  Failed to load existing registry: {exc}")
+    # ── Connection ────────────────────────────────────────────────────────────
+
+    def _collection(self):
+        """Return (and cache) the MongoDB collection handle."""
+        if self._col is not None:
+            return self._col
+        from pymongo import MongoClient
+        client    = MongoClient(self._mongo_uri, serverSelectionTimeoutMS=3000)
+        client.admin.command("ping")
+        self._col = client[self._db_name][self._col_name]
+        return self._col
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
     def _initialize_registry(self):
+        """Create an empty JSON fallback file."""
         initial = {
             "version":    "1.0",
             "created_at": datetime.now().isoformat(),
@@ -98,10 +177,48 @@ class ModelRegistry:
         self._save_registry(initial)
 
     def _load_registry(self) -> Dict:
+        """
+        Load registry — MongoDB primary, JSON fallback.
+
+        Returns a dict with key 'models' containing a list of model records.
+        """
+        if not self._fallback:
+            try:
+                col    = self._collection()
+                models = list(col.find({}, {"_id": 0}))
+                return {"version": "1.0", "models": models}
+            except Exception as exc:
+                logger.warning(
+                    f"ModelRegistry: MongoDB read failed ({exc}). "
+                    f"Using JSON fallback."
+                )
+        # JSON fallback
         with open(self.registry_path, "r") as fh:
             return json.load(fh)
 
     def _save_registry(self, registry: Dict):
+        """
+        Persist registry — MongoDB primary, JSON fallback.
+
+        For MongoDB, each model record is upserted by model_id so this is
+        safe to call repeatedly (idempotent).
+        """
+        if not self._fallback:
+            try:
+                col = self._collection()
+                for record in registry.get("models", []):
+                    col.replace_one(
+                        {"model_id": record["model_id"]},
+                        record,
+                        upsert=True,
+                    )
+                return
+            except Exception as exc:
+                logger.warning(
+                    f"ModelRegistry: MongoDB write failed ({exc}). "
+                    f"Using JSON fallback."
+                )
+        # JSON fallback
         with open(self.registry_path, "w") as fh:
             json.dump(registry, fh, indent=2)
 
@@ -415,6 +532,8 @@ class ModelRegistry:
             model_id   : str | None   — ID of the best pending model evaluated
             new_score  : float | None — new model's metric value
             old_score  : float | None — current champion's metric value (or None)
+            new_metrics: dict         — all metrics for the new model
+            old_metrics: dict         — all metrics for the current champion
             reason     : str          — human-readable explanation of decision
         """
         pending = self.list_models(run_id=run_id, status="pending")
@@ -434,27 +553,27 @@ class ModelRegistry:
             pending,
             key=lambda m: m.get("metrics", {}).get(metric, float("inf"))
         )
-        new_score    = best.get("metrics", {}).get(metric)
-        new_metrics  = best.get("metrics", {})
-        model_id     = best["model_id"]
+        new_score   = best.get("metrics", {}).get(metric)
+        new_metrics = best.get("metrics", {})
+        model_id    = best["model_id"]
 
         # Get currently deployed champion for this feature
-        target       = best.get("target_feature", "RUL_s")
-        current      = self.get_deployed_model(target)
-        old_score    = current.get("metrics", {}).get(metric) if current else None
-        old_metrics  = current.get("metrics", {}) if current else {}
+        target      = best.get("target_feature", "RUL_s")
+        current     = self.get_deployed_model(target)
+        old_score   = current.get("metrics", {}).get(metric) if current else None
+        old_metrics = current.get("metrics", {}) if current else {}
 
         # Log full metric comparison across all 4 metrics
         logger.info(
             f"[Registry] ── Model Comparison ──────────────────────────────\n"
             f"  Metric      │ New Model          │ Current Champion\n"
             f"  ────────────┼────────────────────┼──────────────────\n"
-            f"  mae_s       │ {str(round(new_metrics.get('mae_s', None), 1) if new_metrics.get('mae_s') is not None else 'None'):<18} │ "
-            f"{str(round(old_metrics.get('mae_s', None), 1) if old_metrics.get('mae_s') is not None else 'None')}\n"
+            f"  mae_s       │ {str(round(new_metrics.get('mae_s',  None), 1) if new_metrics.get('mae_s')  is not None else 'None'):<18} │ "
+            f"{str(round(old_metrics.get('mae_s',  None), 1) if old_metrics.get('mae_s')  is not None else 'None')}\n"
             f"  rmse_s      │ {str(round(new_metrics.get('rmse_s', None), 1) if new_metrics.get('rmse_s') is not None else 'None'):<18} │ "
             f"{str(round(old_metrics.get('rmse_s', None), 1) if old_metrics.get('rmse_s') is not None else 'None')}\n"
-            f"  mape        │ {str(round(new_metrics.get('mape', None), 2) if new_metrics.get('mape') is not None else 'None'):<18} │ "
-            f"{str(round(old_metrics.get('mape', None), 2) if old_metrics.get('mape') is not None else 'None')}\n"
+            f"  mape        │ {str(round(new_metrics.get('mape',   None), 2) if new_metrics.get('mape')   is not None else 'None'):<18} │ "
+            f"{str(round(old_metrics.get('mape',   None), 2) if old_metrics.get('mape')   is not None else 'None')}\n"
         )
 
         # Decision logic

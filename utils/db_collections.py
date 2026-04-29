@@ -14,10 +14,13 @@ phm_mlops (database)
 │                             + monitoring metrics written back by run_serving.py
 ├── feature_store_mirrored  ← Confirmed fault features for retraining
 │                             written by confirm_fault_and_push_to_store()
-├── serving_history         ← Full prediction audit log, one doc per burst
+├── RUL_predictions         ← Full prediction audit log, one doc per burst
+├── serving_history         ← logs serving latency, throughput (e.g., number
+│                             of API calls), resource usage (e.g., CPU/database
+│                             usage), model/correction metrics, model versions,
+│                             and feedback metadata
 ├── model_registry          ← Model lifecycle: pending→approved→deployed→archived
 ├── workflow_registry       ← Workflow DAG versions (CI/CD)
-├── serving_lock            ← Burst-boundary lock (prevents mid-burst hot-swap)
 └── preprod_runs            ← Tracks which fault data has been used in retraining
 ═══════════════════════════════════════════════════════════════════════════════
 """
@@ -26,6 +29,7 @@ phm_mlops (database)
 
 # Historical run-to-failure features for train/val bearings.
 # Written once by seed_historical_data.py; read by orchestrator for training.
+# Never read from CSV after seeding — all training data comes from here.
 COL_FACTORY_FEATURES = "factory_features"
 
 # Live SCADA burst data written by scada_simulator.py.
@@ -38,15 +42,25 @@ COL_FEATURE_STORE = "feature_store"
 # Replaces old: 'confirmed_faults'
 COL_FEATURE_STORE_MIRRORED = "feature_store_mirrored"
 
+# ── Predictions ────────────────────────────────────────────────────────────────
+
+# Full prediction audit log — one document per burst.
+# Written by run_serving.py; stores raw inference output, PM status,
+# monitoring flags, feature snapshot, and model version for each burst.
+COL_RUL_PREDICTIONS = "RUL_predictions"
+
 # ── Serving & audit ────────────────────────────────────────────────────────────
 
-# Full pipeline output per burst — inference, PM status, monitoring flags.
-# Written by run_serving.py; read by both GUIs and the API audit endpoint.
+# Serving telemetry and operational metadata per burst:
+# latency, throughput (API call counts), resource usage (CPU/DB),
+# model/correction metrics, model versions, and feedback metadata.
+# Written by run_serving.py; read by the Dashboard and Audit Service.
 COL_SERVING_HISTORY = "serving_history"
 
 # ── Registries ─────────────────────────────────────────────────────────────────
 
 # Model lifecycle tracking (MongoDB-backed ModelRegistry).
+# lifecycle: pending → approved → deployed → archived
 COL_MODEL_REGISTRY = "model_registry"
 
 # Workflow DAG version tracking (MongoDB-backed WorkflowRegistry).
@@ -56,6 +70,7 @@ COL_WORKFLOW_REGISTRY = "workflow_registry"
 
 # Burst-boundary lock written by run_serving.py before each burst.
 # model_registry.write_champion_pointer() waits for this to clear.
+# Internal use only — not part of the public collection layout.
 COL_SERVING_LOCK = "serving_lock"
 
 # Records which confirmed fault bearings have already been used in retraining.

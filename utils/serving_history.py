@@ -1,39 +1,34 @@
 """
 utils/serving_history.py
 ═══════════════════════════════════════════════════════════════════════════════
-Serving History — MongoDB-backed store for pipeline run outputs.
+Two MongoDB-backed stores written by run_serving.py after each burst:
+
+RUL_predictions  (COL_RUL_PREDICTIONS)
+────────────────────────────────────────
+Full prediction audit log — one document per burst.
+Stores: features, raw inference output, PM status, monitoring flags,
+model version, pipeline health.
+Written by: ServingHistory.save_pipeline_output()
+Read by:    Dashboard (RUL Monitor), Audit Service, Export Service
+
+serving_history  (COL_SERVING_HISTORY)
+────────────────────────────────────────
+Operational telemetry — one document per burst.
+Stores: latency (ms), throughput (bursts processed), resource usage
+(CPU %, memory MB), model version, correction/feedback metadata.
+Written by: ServingTelemetry.record()
+Read by:    Dashboard (Serving Telemetry page), Audit Service
 
 Diagram connections:
-    ServPipeline  ──(step 9)──►  ServHistory   [this module]
-    ServHistory   ──(step 10)──► AuditSvc      [metadata query method]
-
-Collection: phm_mlops.serving_history
-Each document represents one complete pipeline run for one bearing burst,
-storing features, predictions, maintenance status, monitoring flags, and
-the model version that produced the result.
-
-Usage
-─────
-    from utils.serving_history import ServingHistory
-
-    sh = ServingHistory(mongo_uri="mongodb://localhost:27017", db_name="phm_mlops")
-
-    record_id = sh.save_pipeline_output(
-        run_id        = "serve_20260407_123456",
-        bearing_name  = "Bearing1_5",
-        burst_idx     = 42,
-        model_version = "rul_model_v3",
-        features      = {...},           # quality-labelled feature dict
-        inference_out = {...},           # raw prediction values
-        pm_out        = {...},           # RUL status, thresholds
-        monitoring_out= {...},           # stats, drift flags
-    )
-
-    # Audit Service query (step 10)
-    records = sh.get_serving_metadata(run_id="serve_20260407_123456")
+    ServPipeline ──(step 9)──► RUL_predictions    [ServingHistory]
+    ServPipeline ──(step 9)──► serving_history     [ServingTelemetry]
+    Both         ──(step 10)─► AuditSvc
+═══════════════════════════════════════════════════════════════════════════════
 """
 
 import logging
+import os
+import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -44,50 +39,42 @@ logger = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Schema constants
+# Collection names — always imported from db_collections, never hardcoded
 # ─────────────────────────────────────────────────────────────────────────────
 
-COLLECTION_NAME = "serving_history"
-
-# Recommended indexes — created once via ensure_indexes()
-_INDEXES = [
-    [("run_id",       ASCENDING)],
-    [("bearing_name", ASCENDING)],
-    [("timestamp",    DESCENDING)],
-    [("run_id",       ASCENDING), ("bearing_name", ASCENDING)],
-    [("pm_status",    ASCENDING)],
-]
+from utils.db_collections import COL_RUL_PREDICTIONS, COL_SERVING_HISTORY
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ServingHistory
+# ServingHistory — RUL_predictions collection
+# Full prediction audit log, one document per burst
 # ─────────────────────────────────────────────────────────────────────────────
 
 class ServingHistory:
     """
-    Persists the output of every Serving Pipeline run to MongoDB.
+    Persists the full pipeline output for every burst to RUL_predictions.
 
     One document per (run_id, bearing_name, burst_idx) triple.
 
     Document schema
     ───────────────
     {
-      run_id         : str           — workflow run identifier
-      bearing_name   : str           — e.g. "Bearing1_5"
-      burst_idx      : int           — burst index within the bearing stream
-      timestamp      : datetime      — UTC wall-clock time of pipeline run
-      model_version  : str           — model_id from ModelRegistry
-      features       : dict          — quality-labelled feature vector
-      inference      : {             — raw model output
+      run_id         : str       — workflow run identifier
+      bearing_name   : str       — e.g. "Bearing1_5"
+      burst_idx      : int       — burst index within the bearing stream
+      timestamp      : datetime  — UTC wall-clock time of pipeline run
+      model_version  : str       — model_id from ModelRegistry
+      features       : dict      — quality-labelled 76-dim feature vector
+      inference      : {
           rul_s          : float
           rul_min        : float
           horizon_preds  : list[float]
       }
-      pm_status      : str           — "healthy" | "warning" | "critical"
-      pm_out         : dict          — full predictive-maintenance output
-      monitoring     : dict          — stats, drift flags, anomaly flags
-      pipeline_ok    : bool          — True if all 4 stages completed cleanly
-      error          : str | None    — set if pipeline_ok is False
+      pm_status      : str       — "healthy" | "warning" | "critical"
+      pm_out         : dict      — full predictive-maintenance output
+      monitoring     : dict      — stats, drift flags, anomaly flags
+      pipeline_ok    : bool      — True if all 4 stages completed cleanly
+      error          : str|None  — set if pipeline_ok is False
     }
     """
 
@@ -95,8 +82,26 @@ class ServingHistory:
         self._uri     = mongo_uri
         self._db_name = db_name
         self._client  = MongoClient(mongo_uri, serverSelectionTimeoutMS=5000)
-        self._col     = self._client[db_name][COLLECTION_NAME]
-        logger.info(f"ServingHistory connected → {db_name}.{COLLECTION_NAME}")
+        self._col     = self._client[db_name][COL_RUL_PREDICTIONS]
+        self._ensure_indexes()
+        logger.info(
+            f"ServingHistory connected → {db_name}.{COL_RUL_PREDICTIONS}"
+        )
+
+    def _ensure_indexes(self):
+        try:
+            self._col.create_index("run_id",       name="idx_run_id")
+            self._col.create_index("bearing_name", name="idx_bearing_name")
+            self._col.create_index(
+                [("timestamp", DESCENDING)], name="idx_timestamp_desc"
+            )
+            self._col.create_index(
+                [("run_id", ASCENDING), ("bearing_name", ASCENDING)],
+                name="idx_run_bearing",
+            )
+            self._col.create_index("pm_status", name="idx_pm_status")
+        except Exception as e:
+            logger.warning(f"[ServingHistory] Index creation warning: {e}")
 
     # ── Write ─────────────────────────────────────────────────────────────────
 
@@ -114,8 +119,7 @@ class ServingHistory:
         error:          Optional[str] = None,
     ) -> str:
         """
-        Persist one pipeline run record.
-
+        Persist one full pipeline output record to RUL_predictions.
         Returns the MongoDB inserted_id as a string.
         """
         doc = {
@@ -134,12 +138,12 @@ class ServingHistory:
         }
 
         try:
-            result = self._col.insert_one(doc)
+            result    = self._col.insert_one(doc)
             record_id = str(result.inserted_id)
             logger.info(
-                f"[ServingHistory] Saved → run={run_id}  bearing={bearing_name}"
-                f"  burst={burst_idx}  status={pm_out.get('status', '?')}"
-                f"  id={record_id}"
+                f"[RUL_predictions] Saved → run={run_id}  "
+                f"bearing={bearing_name}  burst={burst_idx}  "
+                f"status={pm_out.get('status', '?')}  id={record_id}"
             )
             return record_id
         except PyMongoError as exc:
@@ -153,10 +157,7 @@ class ServingHistory:
         burst_idx:    int,
         error:        str,
     ) -> str:
-        """
-        Save a minimal error record when the pipeline fails mid-run.
-        Ensures every initiated pipeline run has a traceable entry.
-        """
+        """Save a minimal error record when the pipeline fails mid-burst."""
         return self.save_pipeline_output(
             run_id        = run_id,
             bearing_name  = bearing_name,
@@ -178,12 +179,7 @@ class ServingHistory:
         bearing_name: Optional[str] = None,
         limit:        int = 100,
     ) -> List[Dict[str, Any]]:
-        """
-        Retrieve serving history records for the Audit Service (step 10).
-
-        Filters by run_id and/or bearing_name.  Returns up to `limit` records
-        sorted newest-first, with _id converted to string for serialisability.
-        """
+        """Retrieve prediction records for the Audit Service (step 10)."""
         query: Dict[str, Any] = {}
         if run_id:
             query["run_id"] = run_id
@@ -196,15 +192,13 @@ class ServingHistory:
             .sort("timestamp", DESCENDING)
             .limit(limit)
         )
-
         records = []
         for doc in cursor:
             doc["_id"] = str(doc["_id"])
             records.append(doc)
-
         logger.info(
-            f"[ServingHistory] Queried {len(records)} record(s)"
-            + (f" for run_id={run_id}" if run_id else "")
+            f"[RUL_predictions] Queried {len(records)} record(s)"
+            + (f" run={run_id}" if run_id else "")
             + (f" bearing={bearing_name}" if bearing_name else "")
         )
         return records
@@ -228,73 +222,143 @@ class ServingHistory:
         return docs
 
     def get_run_summary(self, run_id: str) -> Dict[str, Any]:
-        """
-        High-level summary of a pipeline run — used by the Dashboard and
-        Audit Service to quickly assess run health.
-        """
-        pipeline = [
-            {"$match": {"run_id": run_id}},
-            {"$group": {
-                "_id":            "$run_id",
-                "total_bursts":   {"$sum": 1},
-                "ok_count":       {"$sum": {"$cond": ["$pipeline_ok", 1, 0]}},
-                "error_count":    {"$sum": {"$cond": ["$pipeline_ok", 0, 1]}},
-                "critical_count": {"$sum": {"$cond": [{"$eq": ["$pm_status", "critical"]}, 1, 0]}},
-                "warning_count":  {"$sum": {"$cond": [{"$eq": ["$pm_status", "warning"]},  1, 0]}},
-                "healthy_count":  {"$sum": {"$cond": [{"$eq": ["$pm_status", "healthy"]},  1, 0]}},
-                "first_ts":       {"$min": "$timestamp"},
-                "last_ts":        {"$max": "$timestamp"},
-                "bearings":       {"$addToSet": "$bearing_name"},
-            }},
-        ]
-        results = list(self._col.aggregate(pipeline))
-        if not results:
-            return {"run_id": run_id, "total_bursts": 0}
+        """High-level summary of a pipeline run."""
+        total     = self._col.count_documents({"run_id": run_id})
+        ok_count  = self._col.count_documents({"run_id": run_id, "pipeline_ok": True})
+        alerts    = self._col.count_documents({"run_id": run_id, "pm_status": "critical"})
+        warnings  = self._col.count_documents({"run_id": run_id, "pm_status": "warning"})
+        return {
+            "run_id":         run_id,
+            "total_bursts":   total,
+            "ok_count":       ok_count,
+            "error_count":    total - ok_count,
+            "critical_count": alerts,
+            "warning_count":  warnings,
+        }
 
-        summary = results[0]
-        summary.pop("_id", None)
-        summary["run_id"] = run_id
-        return summary
 
-    def get_drift_flags(
-        self,
-        bearing_name: str,
-        limit: int = 50,
-    ) -> List[Dict[str, Any]]:
-        """
-        Return recent monitoring records where drift was detected.
-        Useful for dashboard alerting.
-        """
-        cursor = (
-            self._col
-            .find({
-                "bearing_name": bearing_name,
-                "monitoring.drift_detected": True,
-            })
-            .sort("timestamp", DESCENDING)
-            .limit(limit)
+# ─────────────────────────────────────────────────────────────────────────────
+# ServingTelemetry — serving_history collection
+# Operational metadata per burst: latency, throughput, resource usage,
+# model version, correction/feedback metadata
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ServingTelemetry:
+    """
+    Records operational telemetry for every processed burst to serving_history.
+
+    One document per (run_id, bearing_name, burst_idx) triple.
+
+    Document schema
+    ───────────────
+    {
+      run_id            : str    — serving run identifier
+      bearing_name      : str    — e.g. "Bearing1_5"
+      burst_idx         : int    — burst index
+      timestamp         : datetime  — UTC time
+      model_version     : str    — model_id used for this burst
+      latency_ms        : float  — wall-clock time to process the burst (ms)
+      pipeline_ok       : bool   — whether all 4 stages succeeded
+      pm_status         : str    — "healthy" | "warning" | "critical"
+      rul_s             : float  — predicted RUL in seconds
+      rul_min           : float  — predicted RUL in minutes
+      drift_detected    : bool   — data drift flag from monitoring stage
+      anomaly_flag      : bool   — anomaly flag from monitoring stage
+      correction        : dict   — feedback/correction metadata (if any)
+          confirmed_fault   : bool
+          worker_name       : str
+          confirmed_at      : str
+      cpu_percent       : float|None   — process CPU % at time of burst
+      memory_mb         : float|None   — process RSS memory in MB
+      bursts_this_session : int  — cumulative bursts processed this run
+    }
+    """
+
+    def __init__(self, mongo_uri: str, db_name: str = "phm_mlops"):
+        self._uri     = mongo_uri
+        self._db_name = db_name
+        self._client  = MongoClient(mongo_uri, serverSelectionTimeoutMS=5000)
+        self._col     = self._client[db_name][COL_SERVING_HISTORY]
+        self._ensure_indexes()
+        logger.info(
+            f"ServingTelemetry connected → {db_name}.{COL_SERVING_HISTORY}"
         )
-        return [
-            {
-                "burst_idx": d.get("burst_idx"),
-                "timestamp": d.get("timestamp"),
-                "drift_features": d.get("monitoring", {}).get("drift_features", []),
-                "anomaly_flag": d.get("monitoring", {}).get("anomaly_flag", False),
-            }
-            for d in cursor
-        ]
 
-    # ── Admin ─────────────────────────────────────────────────────────────────
+    def _ensure_indexes(self):
+        try:
+            self._col.create_index("run_id",       name="idx_run_id")
+            self._col.create_index("bearing_name", name="idx_bearing_name")
+            self._col.create_index(
+                [("timestamp", DESCENDING)], name="idx_timestamp_desc"
+            )
+            self._col.create_index("model_version", name="idx_model_version")
+        except Exception as e:
+            logger.warning(f"[ServingTelemetry] Index creation warning: {e}")
 
-    def ensure_indexes(self) -> None:
-        """Create recommended indexes. Safe to call multiple times (idempotent)."""
-        for key_spec in _INDEXES:
-            self._col.create_index(key_spec)
-        logger.info(f"[ServingHistory] Indexes ensured on '{COLLECTION_NAME}'.")
+    def record(
+        self,
+        run_id:               str,
+        bearing_name:         str,
+        burst_idx:            int,
+        model_version:        str,
+        latency_ms:           float,
+        pipeline_ok:          bool,
+        pm_status:            str,
+        rul_s:                Optional[float],
+        rul_min:              Optional[float],
+        drift_detected:       bool,
+        anomaly_flag:         bool,
+        bursts_this_session:  int,
+        correction:           Optional[Dict[str, Any]] = None,
+        cpu_percent:          Optional[float] = None,
+        memory_mb:            Optional[float] = None,
+    ) -> None:
+        """
+        Write one telemetry record to serving_history.
 
-    def count(self, run_id: Optional[str] = None) -> int:
-        query = {"run_id": run_id} if run_id else {}
-        return self._col.count_documents(query)
+        Call this after every successfully processed burst in run_serving.py.
+        Failures are also recorded (pipeline_ok=False) so nothing is invisible.
+        """
+        doc = {
+            "run_id":               run_id,
+            "bearing_name":         bearing_name,
+            "burst_idx":            burst_idx,
+            "timestamp":            datetime.now(timezone.utc),
+            "model_version":        model_version,
+            "latency_ms":           round(latency_ms, 3),
+            "pipeline_ok":          pipeline_ok,
+            "pm_status":            pm_status,
+            "rul_s":                rul_s,
+            "rul_min":              rul_min,
+            "drift_detected":       drift_detected,
+            "anomaly_flag":         anomaly_flag,
+            "bursts_this_session":  bursts_this_session,
+            "correction":           correction or {},
+            "cpu_percent":          cpu_percent,
+            "memory_mb":            memory_mb,
+        }
+        try:
+            self._col.insert_one(doc)
+        except PyMongoError as exc:
+            logger.warning(f"[ServingTelemetry] Failed to write telemetry: {exc}")
 
-    def close(self) -> None:
-        self._client.close()
+    def get_session_stats(self, run_id: str) -> Dict[str, Any]:
+        """Return aggregated telemetry for a run — used by the Dashboard."""
+        docs = list(self._col.find({"run_id": run_id}, {"_id": 0}))
+        if not docs:
+            return {}
+        latencies = [d["latency_ms"] for d in docs if d.get("latency_ms") is not None]
+        return {
+            "run_id":           run_id,
+            "total_bursts":     len(docs),
+            "avg_latency_ms":   round(sum(latencies) / len(latencies), 2) if latencies else None,
+            "max_latency_ms":   round(max(latencies), 2) if latencies else None,
+            "min_latency_ms":   round(min(latencies), 2) if latencies else None,
+            "ok_count":         sum(1 for d in docs if d.get("pipeline_ok")),
+            "error_count":      sum(1 for d in docs if not d.get("pipeline_ok")),
+            "critical_count":   sum(1 for d in docs if d.get("pm_status") == "critical"),
+            "warning_count":    sum(1 for d in docs if d.get("pm_status") == "warning"),
+            "drift_count":      sum(1 for d in docs if d.get("drift_detected")),
+            "anomaly_count":    sum(1 for d in docs if d.get("anomaly_flag")),
+            "model_versions":   list({d["model_version"] for d in docs if d.get("model_version")}),
+        }

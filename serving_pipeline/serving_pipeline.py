@@ -13,7 +13,7 @@ Wires the 4 stages in order and handles all outputs:
 Pipeline outputs (per diagram):
     step 6  → Feature Store    (versioned features, MongoDB)
     step 8  → Export Service   (RUL CSV + optional JSON to External destination)
-    step 9  → Serving History  (full pipeline record, MongoDB)
+    step 9  → Serving History  (full pipeline record → RUL_predictions, MongoDB)
     Audit   → Audit Service    (every record forwarded to ExportSvc → External)
 
 Design notes
@@ -27,6 +27,10 @@ Design notes
   features already extracted by the SCADA simulator, the FE stage uses them
   directly and skips re-extraction from raw signals.
 - reload_model() is public — called by run_serving.py on hot-swap detection.
+
+ServingHistory now writes to RUL_predictions (COL_RUL_PREDICTIONS).
+Indexes are created automatically in ServingHistory.__init__ — do NOT call
+ensure_indexes() here.
 
 Usage
 ─────
@@ -55,7 +59,7 @@ Usage
         burst_idx           = burst_idx,
         h_signal            = np.array([0.0]),   # ignored when precomputed
         v_signal            = np.array([0.0]),   # ignored when precomputed
-        precomputed_features= features_dict,     # from live_features FS
+        precomputed_features= features_dict,     # from feature_store FS
     )
 """
 
@@ -96,9 +100,9 @@ class ServingPipeline:
     def __init__(self, config: Optional[Dict[str, Any]] = None):
         cfg = config or {}
 
-        self._mongo_uri  = cfg.get("mongo_uri", "mongodb://localhost:27017")
-        self._db_name    = cfg.get("db_name", "phm_mlops")
-        self._enable_sh  = cfg.get("enable_serving_history", True)
+        self._mongo_uri = cfg.get("mongo_uri", "mongodb://localhost:27017")
+        self._db_name   = cfg.get("db_name", "phm_mlops")
+        self._enable_sh = cfg.get("enable_serving_history", True)
 
         # ── Stage 1: Feature Engineering ─────────────────────────────────────
         self._fe = ServingFeatureEngineer(
@@ -126,7 +130,9 @@ class ServingPipeline:
             )
         )
 
-        # ── Serving History ───────────────────────────────────────────────────
+        # ── Serving History → RUL_predictions ────────────────────────────────
+        # ServingHistory.__init__ creates indexes automatically.
+        # Do NOT call ensure_indexes() — it no longer exists.
         self._sh = None
         if self._enable_sh:
             try:
@@ -135,11 +141,10 @@ class ServingPipeline:
                     mongo_uri=self._mongo_uri,
                     db_name=self._db_name,
                 )
-                self._sh.ensure_indexes()
             except Exception as exc:
                 logger.warning(
                     f"[Pipeline] Could not connect to Serving History: {exc}. "
-                    "Results will not be persisted."
+                    "Results will not be persisted to RUL_predictions."
                 )
 
         # ── Export Service (step 8: ServPipeline → ExportSvc → External) ──────
@@ -164,9 +169,9 @@ class ServingPipeline:
         try:
             from utils.audit_service import AuditService
             self._auditor = AuditService({
-                "mongo_uri":  self._mongo_uri,
-                "db_name":    self._db_name,
-                "output_dir": cfg.get("export_output_dir", "export_output"),
+                "mongo_uri":   self._mongo_uri,
+                "db_name":     self._db_name,
+                "output_dir":  cfg.get("export_output_dir", "export_output"),
                 "enable_json": cfg.get("enable_export_json", False),
             })
         except Exception as exc:
@@ -204,12 +209,12 @@ class ServingPipeline:
                                           re-extraction from raw signals.
 
         Returns a structured dict with outputs from all stages plus the
-        Serving History record_id. Always safe to use — check result["ok"].
+        RUL_predictions record_id. Always safe to use — check result["ok"].
         """
         try:
             return self._run_stages(
                 run_id, bearing_name, burst_idx,
-                h_signal, v_signal, precomputed_features
+                h_signal, v_signal, precomputed_features,
             )
         except Exception as exc:
             logger.error(
@@ -227,17 +232,17 @@ class ServingPipeline:
                     pass
 
             return {
-                "ok":          False,
-                "ready":       False,
-                "run_id":      run_id,
-                "bearing":     bearing_name,
-                "burst_idx":   burst_idx,
-                "error":       error_str,
-                "record_id":   record_id,
-                "fe":          None,
-                "inference":   None,
-                "pm":          None,
-                "monitoring":  None,
+                "ok":         False,
+                "ready":      False,
+                "run_id":     run_id,
+                "bearing":    bearing_name,
+                "burst_idx":  burst_idx,
+                "error":      error_str,
+                "record_id":  record_id,
+                "fe":         None,
+                "inference":  None,
+                "pm":         None,
+                "monitoring": None,
             }
 
     def run_bearing(
@@ -292,7 +297,9 @@ class ServingPipeline:
         """Reset per-bearing state (FE window + monitoring baseline)."""
         self._fe.reset()
         self._monitor.reset_baseline()
-        logger.info("[Pipeline] Bearing state reset (FE buffer + monitoring baseline).")
+        logger.info(
+            "[Pipeline] Bearing state reset (FE buffer + monitoring baseline)."
+        )
 
     def reload_model(self) -> None:
         """
@@ -338,13 +345,13 @@ class ServingPipeline:
         # ── Stage 2: Inference ────────────────────────────────────────────────
         infer_out = self._inference.run(fe_out)
 
-        # ── Stage 3: Predictive Maintenance ──────────────────────────────────
+        # ── Stage 3: Predictive Maintenance ───────────────────────────────────
         pm_out = self._pm.run(infer_out)
 
         # ── Stage 4: Monitoring ───────────────────────────────────────────────
         mon_out = self._monitor.run(fe_out)
 
-        # ── Step 9: Write to Serving History ─────────────────────────────────
+        # ── Step 9: Write to RUL_predictions ─────────────────────────────────
         record_id = None
         sh_record = None
         if self._sh:
@@ -373,20 +380,20 @@ class ServingPipeline:
                 monitoring_out= mon_out,
                 pipeline_ok   = True,
             )
-            # Build a minimal record dict for the Audit Service
+            # Build minimal record for the Audit Service
             sh_record = {
                 "run_id":       run_id,
                 "bearing_name": bearing_name,
                 "burst_idx":    burst_idx,
                 "pipeline_ok":  True,
-                "inference":    {
-                    "rul_s":       infer_out.get("rul_s"),
-                    "rul_min":     infer_out.get("rul_min"),
-                    "data_quality": infer_out.get("data_quality", "clean"),
+                "inference": {
+                    "rul_s":         infer_out.get("rul_s"),
+                    "rul_min":       infer_out.get("rul_min"),
+                    "data_quality":  infer_out.get("data_quality", "clean"),
                     "model_version": infer_out.get("model_version", "unknown"),
                 },
-                "pm":           pm_out,
-                "monitoring":   mon_out,
+                "pm":        pm_out,
+                "monitoring": mon_out,
             }
 
         # ── Step 8: Export Service (ServPipeline → ExportSvc → External) ─────
@@ -408,12 +415,12 @@ class ServingPipeline:
             self._auditor.audit_record(sh_record)
 
         return {
-            "ok":         True,
-            "ready":      True,
-            "run_id":     run_id,
-            "bearing":    bearing_name,
-            "burst_idx":  burst_idx,
-            "fe":         {
+            "ok":        True,
+            "ready":     True,
+            "run_id":    run_id,
+            "bearing":   bearing_name,
+            "burst_idx": burst_idx,
+            "fe": {
                 "quality_labels": fe_out.get("quality_labels"),
                 "base_features":  fe_out.get("base_features"),
             },

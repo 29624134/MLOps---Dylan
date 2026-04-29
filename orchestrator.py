@@ -5,20 +5,20 @@ Workflow Orchestrator — bearing-by-bearing edition.
 
 start_workflow() behaviour
 ──────────────────────────
+The orchestrator does NOT ingest or extract data.  All historical data is
+seeded into MongoDB by seed_historical_data.py before the first run.
+Live/SCADA data is handled entirely by the Serving Pipeline (run_serving.py).
+
 FIRST RUN  (no deployed model in model registry):
-    1. Ingest   current live bearing
-    2. Extract  current live bearing
-    2b. Backfill MongoDB for train/val bearings
-    3. Validate val bearings
-    4. Train    on train bearings
-    5. Select & deploy best model
-    6. Serving Pipeline — current live bearing (legacy path only)
+    1. Validate  — val bearings (reads features.csv from disk for schema check)
+    2. Train     — reads all data from MongoDB factory_features
+    3. Select & deploy best model
 
 SUBSEQUENT RUNS  (deployed model already exists):
-    Phases 2b–5 are skipped. Serving is now handled by run_serving.py.
+    All phases skipped — serving is handled by run_serving.py.
 
 run_training_only() — called by run_preprod.py after fault confirmation:
-    Retrains on confirmed_faults (FS Mirrored) + train-role bearings.
+    Retrains on feature_store_mirrored + factory_features (all from MongoDB).
     Does NOT touch the live Feature Store or Serving Pipeline.
     Registers new model as PENDING — run_preprod.py handles promotion.
 
@@ -35,8 +35,6 @@ import traceback
 from datetime import datetime
 from typing import Dict, Any, List, Optional
 
-from scripts.data_ingestor import DataIngestorPHM
-from scripts.feature_extractor import FeatureExtractorPHM
 from scripts.data_validator import DataValidatorPHM
 from models.model_trainer import RULTrainerPHM
 import pandas as pd
@@ -297,14 +295,22 @@ class WorkflowExecutor:
         config_overrides: Dict = None,
     ) -> str:
         """
-        Run the full workflow end-to-end.
+        Run the training workflow.
+
+        The orchestrator is responsible ONLY for:
+            validate → train → select & deploy model
+
+        It does NOT ingest or extract data — that is handled by:
+            seed_historical_data.py  (historical train/val data → MongoDB)
+            run_serving.py / scada_simulator.py  (live SCADA data)
 
         FIRST RUN (no deployed model):
-            ingest → extract → backfill → validate → train → select → serve
+            1. Validate  — schema check on val bearings
+            2. Train     — reads from MongoDB factory_features
+            3. Select    — deploy best model, write champion.json
 
-        SUBSEQUENT RUNS (deployed model exists):
-            ingest → extract only
-            (Serving is handled externally by run_serving.py)
+        SUBSEQUENT RUNS (deployed model already exists):
+            All phases skipped. Serving continues via run_serving.py.
         """
         run_id = f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         self.state_manager.init_state(run_id, workflow_name)
@@ -312,56 +318,35 @@ class WorkflowExecutor:
         try:
             from utils.model_registry import ModelRegistry
             currently_deployed = ModelRegistry().get_deployed_model("RUL_s")
-            live_bearing       = self.registry.current_live_bearing()
-
-            # ── 1. Ingest live bearing ────────────────────────────────────────
-            if live_bearing:
-                logger.info(f"[{run_id}] Phase 1: Ingestion — {live_bearing['name']}")
-                self._run_ingestion(run_id, live_bearing)
-
-            # ── 2. Extract live bearing ───────────────────────────────────────
-            if live_bearing:
-                logger.info(f"[{run_id}] Phase 2: Feature extraction — {live_bearing['name']}")
-                self._run_extraction(run_id, live_bearing)
 
             if not currently_deployed:
-                # First run — train a model from scratch
-                logger.info(f"[{run_id}] No deployed model found — running full pipeline.")
+                logger.info(
+                    f"[{run_id}] No deployed model found — running training pipeline."
+                )
 
-                # Also extract all train/val bearings
-                for b in self.registry.train_bearings() + self.registry.val_bearings():
-                    if b["name"] != (live_bearing["name"] if live_bearing else ""):
-                        self._run_extraction(run_id, b)
-
-                # 2b. MongoDB backfill
-                logger.info(f"[{run_id}] Phase 2b: MongoDB backfill (train/val)")
-                self._run_mongo_backfill(run_id)
-
-                # 3. Validation
-                logger.info(f"[{run_id}] Phase 3: Validation")
+                # 1. Validation
+                logger.info(f"[{run_id}] Phase 1: Validation")
                 self._run_validation(run_id)
 
-                # 4. Training
-                logger.info(f"[{run_id}] Phase 4: Training")
+                # 2. Training (reads from MongoDB factory_features)
+                logger.info(f"[{run_id}] Phase 2: Training")
                 self._run_training(run_id)
 
-                # 5. Model selection
-                logger.info(f"[{run_id}] Phase 5: Model selection")
+                # 3. Model selection
+                logger.info(f"[{run_id}] Phase 3: Model selection")
                 self._run_model_selection(run_id)
 
             else:
                 logger.info(
-                    f"[{run_id}] Phases 2b–5: Skipped "
-                    f"(deployed model already exists — serving handled by run_serving.py)"
+                    f"[{run_id}] Deployed model already exists "
+                    f"('{currently_deployed['model_id']}') — "
+                    f"skipping training. Serving is handled by run_serving.py."
                 )
 
-            # ── 6. Serving Pipeline ───────────────────────────────────────────────
-            # Serving is handled by run_serving.py which is started automatically
-            # by the API's ProcessManager after this workflow completes.
-            # The legacy _run_serving_pipeline() is no longer called here.
+            self.state_manager.mark_workflow_complete(run_id)
             logger.info(
-                f"[{run_id}] Phase 6: Serving Pipeline — "
-                f"handled by run_serving.py (started by ProcessManager after workflow)"
+                f"[{run_id}] Workflow complete. "
+                f"Serving Pipeline is handled by run_serving.py."
             )
 
         except Exception as e:
@@ -385,19 +370,17 @@ class WorkflowExecutor:
         Pre-Production retraining path — called by run_preprod.py.
 
         Retrains ONLY using:
-          - All train-role bearings (features.csv on disk)
-          - Confirmed fault data from MongoDB 'confirmed_faults' collection
-            (Feature Store Mirrored), restored to disk if not already present
+          - All train-role bearings (from MongoDB factory_features)
+          - Confirmed fault data from MongoDB feature_store_mirrored
 
         The live Feature Store and Serving Pipeline are NOT touched.
         The Serving Pipeline continues making predictions concurrently.
 
         Steps
         ─────
-        1. Restore confirmed fault CSVs from MongoDB if not on disk
-        2. Validate train + val feature files
-        3. Train model
-        4. Register new model as PENDING in ModelRegistry
+        1. Validate val bearings
+        2. Train model (reads from MongoDB — no CSV restore needed)
+        3. Register new model as PENDING in ModelRegistry
            → run_preprod.py calls registry.compare_and_promote() to decide
              whether to write champion.json and hot-swap in run_serving.py
 
@@ -412,22 +395,18 @@ class WorkflowExecutor:
         run_id : str
         """
         logger.info(f"[{run_id}] Pre-Production retraining started.")
-        logger.info(f"[{run_id}] Data source: FS Mirrored (confirmed_faults) + train bearings.")
+        logger.info(f"[{run_id}] Data source: factory_features + feature_store_mirrored (MongoDB).")
         logger.info(f"[{run_id}] Live Feature Store and Serving Pipeline are UNAFFECTED.")
 
         self.state_manager.init_state(run_id, "preprod_training")
 
         try:
-            # 1. Restore confirmed fault CSVs from FS Mirrored (MongoDB)
-            logger.info(f"[{run_id}] Phase 1: Restoring confirmed faults from FS Mirrored...")
-            self._restore_confirmed_faults_from_mongo(run_id, mongo_uri, db_name)
-
-            # 2. Validate feature files
-            logger.info(f"[{run_id}] Phase 2: Validation")
+            # 1. Validate feature files
+            logger.info(f"[{run_id}] Phase 1: Validation")
             self._run_validation(run_id)
 
-            # 3. Train
-            logger.info(f"[{run_id}] Phase 3: Training")
+            # 2. Train (reads from MongoDB)
+            logger.info(f"[{run_id}] Phase 2: Training")
             self._run_training(run_id)
 
             self.state_manager.mark_workflow_complete(run_id)
@@ -459,7 +438,7 @@ class WorkflowExecutor:
 
         1. Reads the bearing's features.csv
         2. Re-labels RUL from the confirmed failure point
-        3. Pushes labelled data to MongoDB 'confirmed_faults' (Feature Store Mirrored)
+        3. Pushes labelled data to MongoDB feature_store_mirrored
         4. Sets bearing status to 'confirmed'
         """
         bearing = self.registry.get_bearing(bearing_name)
@@ -487,10 +466,11 @@ class WorkflowExecutor:
         mongo_cfg = self._mongo_config()
         if mongo_cfg.get("enabled"):
             from utils.MongoDB import FeatureStore
+            from utils.db_collections import COL_FEATURE_STORE_MIRRORED
             store = FeatureStore({
                 "mongo_uri":       mongo_cfg["uri"],
                 "db_name":         mongo_cfg["db_name"],
-                "collection_name": "confirmed_faults",
+                "collection_name": COL_FEATURE_STORE_MIRRORED,
                 "dataset_id":      bearing_name,
                 "version":         run_id,
                 "df_path":         confirmed_path,
@@ -506,7 +486,7 @@ class WorkflowExecutor:
             result = store.run()
             logger.info(
                 f"[{bearing_name}] Confirmed fault features pushed to "
-                f"MongoDB 'confirmed_faults' (Feature Store Mirrored)."
+                f"MongoDB '{COL_FEATURE_STORE_MIRRORED}' (feature_store_mirrored)."
             )
         else:
             result = {"skipped": "MongoDB not enabled"}
@@ -537,6 +517,7 @@ class WorkflowExecutor:
             "log_path":        os.path.join(template["log_base"], f"{step_id}.log"),
         }
 
+        from scripts.data_ingestor import DataIngestorPHM
         self._execute(run_id, step_id, "ingestion", config,
                       lambda cfg: DataIngestorPHM(cfg).run())
 
@@ -571,6 +552,7 @@ class WorkflowExecutor:
             "n_consecutive":     template.get("n_consecutive", 5),
         }
 
+        from scripts.feature_extractor import FeatureExtractorPHM
         self._execute(run_id, step_id, "feature_engineering", config,
                       lambda cfg: FeatureExtractorPHM(cfg).run())
 
@@ -661,72 +643,182 @@ class WorkflowExecutor:
 
         self._execute(run_id, step_id, "validation", config, _validate)
 
-    def _confirmed_fault_files(self) -> List[str]:
+    def _confirmed_fault_dataframes(self) -> List[pd.DataFrame]:
         """
-        Return paths to features_confirmed.csv for every live bearing that has
-        been confirmed by the maintenance tech. These are included as extra
-        training data alongside the normal train-role bearings.
+        Return DataFrames for every confirmed live bearing from MongoDB
+        feature_store_mirrored collection.
+
+        Replaces the old _confirmed_fault_files() which returned disk CSV paths.
+        Called internally by _run_training() to augment the base training set.
         """
-        confirmed = []
-        for b in self.registry.live_bearings():
-            if b.get("status") == "confirmed":
-                path = os.path.join(
-                    self.registry.source_path(b), "features_confirmed.csv"
-                )
-                if os.path.exists(path):
-                    confirmed.append(path)
-                    logger.info(f"  [confirmed fault] Including {path} in training data")
-                else:
+        mongo_cfg = self._mongo_config()
+        if not mongo_cfg.get("enabled"):
+            logger.info("  MongoDB not enabled — no confirmed fault DataFrames loaded.")
+            return []
+
+        from pymongo import MongoClient
+        from utils.db_collections import COL_FEATURE_STORE_MIRRORED
+
+        confirmed_dfs = []
+        try:
+            client = MongoClient(mongo_cfg["uri"], serverSelectionTimeoutMS=5000)
+            db     = client[mongo_cfg["db_name"]]
+            col    = db[COL_FEATURE_STORE_MIRRORED]
+
+            for b in self.registry.live_bearings():
+                if b.get("status") != "confirmed":
+                    continue
+                docs = list(col.find({"dataset_id": b["name"]}))
+                if not docs:
                     logger.warning(
-                        f"  [{b['name']}] Status is 'confirmed' but "
-                        f"features_confirmed.csv not found — skipping."
+                        f"  [{b['name']}] Status is 'confirmed' but no documents found "
+                        f"in {COL_FEATURE_STORE_MIRRORED} — skipping."
                     )
-        return confirmed
+                    continue
+                df = pd.DataFrame(docs).drop(
+                    columns=["_id", "version", "metadata"], errors="ignore"
+                )
+                confirmed_dfs.append(df)
+                logger.info(
+                    f"  [{b['name']}] Loaded {len(df)} confirmed fault rows "
+                    f"from {COL_FEATURE_STORE_MIRRORED} (MongoDB)"
+                )
+            client.close()
+        except Exception as e:
+            logger.warning(
+                f"  Could not load confirmed fault DataFrames from MongoDB: {e}. "
+                f"Training will proceed with base train set only."
+            )
+
+        return confirmed_dfs
 
     def _run_training(self, run_id: str):
+        """
+        Load training, validation, and test DataFrames from MongoDB and run
+        the RUL trainer.  No CSV files are read.
+
+        Data sources
+        ────────────
+        Train  : factory_features (train-role bearings)
+                 + feature_store_mirrored (confirmed fault bearings)
+        Val    : factory_features (val-role bearings)
+        Test   : factory_features (test-role bearings)
+
+        seed_historical_data.py must have been run first to populate
+        factory_features before this step is reached.
+        """
         step    = self._training_step()
         config  = self.contract_manager.resolve_config(step["config"], run_id)
         step_id = "training"
 
-        # Base training files from train-role bearings
-        train_files = [
-            os.path.join(self.registry.source_path(b), "features.csv")
-            for b in self.registry.train_bearings()
-            if os.path.exists(os.path.join(self.registry.source_path(b), "features.csv"))
-        ]
+        mongo_cfg = self._mongo_config()
+        if not mongo_cfg.get("enabled"):
+            logger.error(
+                f"[{run_id}] MongoDB is not enabled in workflow.yaml — "
+                f"cannot load training data. Set mongodb.enabled: true."
+            )
+            self.state_manager.update_step_status(
+                run_id, step_id, "FAILED", "MongoDB not enabled"
+            )
+            return
 
-        # Add confirmed fault data from live bearings validated by the tech
-        confirmed_files = self._confirmed_fault_files()
-        train_files.extend(confirmed_files)
+        from pymongo import MongoClient
+        from utils.db_collections import COL_FACTORY_FEATURES
 
-        val_files = [
-            os.path.join(self.registry.source_path(b), "features.csv")
-            for b in self.registry.val_bearings()
-            if os.path.exists(os.path.join(self.registry.source_path(b), "features.csv"))
-        ]
+        client = MongoClient(mongo_cfg["uri"], serverSelectionTimeoutMS=5000)
+        try:
+            client.admin.command("ping")
+        except Exception as e:
+            logger.error(f"[{run_id}] Cannot connect to MongoDB: {e}")
+            self.state_manager.update_step_status(
+                run_id, step_id, "FAILED", f"MongoDB connection failed: {e}"
+            )
+            return
 
-        # Test files used only for evaluation (mae_s metric) — never for training
-        test_files = [
-            os.path.join(self.registry.source_path(b), "features.csv")
-            for b in self.registry.all_bearings()
-            if b["role"] == "test"
-            and os.path.exists(os.path.join(self.registry.source_path(b), "features.csv"))
-        ]
+        db = client[mongo_cfg["db_name"]]
 
-        if not train_files:
-            logger.warning(f"[{run_id}] No training files found — skipping training.")
+        # ── Load train DataFrames from factory_features ───────────────────────
+        train_dfs: List[pd.DataFrame] = []
+        for b in self.registry.train_bearings():
+            docs = list(db[COL_FACTORY_FEATURES].find({"dataset_id": b["name"]}))
+            if not docs:
+                logger.warning(
+                    f"  [{b['name']}] No documents in {COL_FACTORY_FEATURES} — "
+                    f"skipping. Run seed_historical_data.py first."
+                )
+                continue
+            df = pd.DataFrame(docs).drop(
+                columns=["_id", "version", "metadata"], errors="ignore"
+            )
+            train_dfs.append(df)
+            logger.info(
+                f"  [{b['name']}] Loaded {len(df)} train rows "
+                f"from {COL_FACTORY_FEATURES} (MongoDB)"
+            )
+
+        # ── Add confirmed fault DataFrames from feature_store_mirrored ────────
+        confirmed_dfs = self._confirmed_fault_dataframes()
+        train_dfs.extend(confirmed_dfs)
+
+        # ── Load val DataFrames from factory_features ─────────────────────────
+        val_dfs: List[pd.DataFrame] = []
+        for b in self.registry.val_bearings():
+            docs = list(db[COL_FACTORY_FEATURES].find({"dataset_id": b["name"]}))
+            if not docs:
+                logger.warning(
+                    f"  [{b['name']}] No val documents in {COL_FACTORY_FEATURES} — skipping."
+                )
+                continue
+            df = pd.DataFrame(docs).drop(
+                columns=["_id", "version", "metadata"], errors="ignore"
+            )
+            val_dfs.append(df)
+            logger.info(
+                f"  [{b['name']}] Loaded {len(df)} val rows "
+                f"from {COL_FACTORY_FEATURES} (MongoDB)"
+            )
+
+        # ── Load test DataFrames from factory_features ────────────────────────
+        test_dfs: List[tuple] = []   # list of (bearing_name, df)
+        for b in self.registry.all_bearings():
+            if b["role"] != "test":
+                continue
+            docs = list(db[COL_FACTORY_FEATURES].find({"dataset_id": b["name"]}))
+            if not docs:
+                continue
+            df = pd.DataFrame(docs).drop(
+                columns=["_id", "version", "metadata"], errors="ignore"
+            )
+            test_dfs.append((b["name"], df))
+            logger.info(
+                f"  [{b['name']}] Loaded {len(df)} test rows "
+                f"from {COL_FACTORY_FEATURES} (MongoDB)"
+            )
+
+        client.close()
+
+        if not train_dfs:
+            logger.warning(
+                f"[{run_id}] No training data found in MongoDB — skipping training. "
+                f"Ensure seed_historical_data.py has been run."
+            )
             self.state_manager.update_step_status(run_id, step_id, "SKIPPED")
             return
 
         logger.info(
-            f"[{run_id}] Training on {len(train_files)} train file(s) "
-            f"({len(confirmed_files)} confirmed fault file(s) included), "
-            f"{len(val_files)} val file(s), "
-            f"{len(test_files)} test file(s) for evaluation."
+            f"[{run_id}] Training on {len(train_dfs)} train bearing(s) "
+            f"({len(confirmed_dfs)} confirmed fault bearing(s) included), "
+            f"{len(val_dfs)} val bearing(s), "
+            f"{len(test_dfs)} test bearing(s) — all from MongoDB."
         )
-        config["train_files"] = train_files
-        config["val_files"]   = val_files
-        config["test_files"]  = test_files
+
+        # Pass DataFrames to trainer — no CSV paths used
+        config["train_dataframes"] = train_dfs
+        config["val_dataframes"]   = val_dfs
+        config["test_dataframes"]  = test_dfs
+        config.pop("train_files", None)
+        config.pop("val_files",   None)
+        config.pop("test_files",  None)
 
         self._execute(run_id, step_id, "training", config,
                       lambda cfg: RULTrainerPHM(cfg).run(run_id=run_id))
@@ -791,49 +883,38 @@ class WorkflowExecutor:
         from utils.model_registry import ModelRegistry
         registry = ModelRegistry()
         result   = registry.compare_and_promote(run_id=run_id, metric=metric)
-
-        if not result["model_id"]:
-            raise RuntimeError(f"No pending models found for run_id={run_id}")
-
         logger.info(
-            f"[{run_id}] Model selection: {result['reason']}"
+            f"[{run_id}] Model selection result: "
+            f"promoted={result['promoted']}  "
+            f"model_id={result['model_id']}  "
+            f"reason={result['reason']}"
         )
-
-        # Return a dict with model_id so the orchestrator state can record it
-        return {"model_id": result["model_id"], "promoted": result["promoted"]}
+        return result
 
     def _run_serving_pipeline(self, run_id: str):
         """
-        Legacy serving pipeline path — used on the first run and when
-        triggered via the old /workflow/trigger endpoint.
-
-        In the new architecture, serving is handled by run_serving.py which
-        polls live_features independently. This method is kept for backward
-        compatibility only.
+        Legacy serving pipeline step — kept for backward compatibility.
+        In normal operation, serving is handled by run_serving.py.
         """
-        live_bearing = self.registry.current_live_bearing()
-        if not live_bearing:
-            logger.info(f"[{run_id}] Serving Pipeline skipped — no live bearing.")
-            return
-
         step    = self._serving_pipeline_step()
         config  = self.contract_manager.resolve_config(step["config"], run_id)
         step_id = "serving_pipeline"
 
-        self.state_manager.update_step_status(run_id, step_id, "RUNNING")
-        logger.info(f"  [{run_id}] Step '{step_id}' (serving_pipeline) — RUNNING")
-
         try:
-            from serving_pipeline.serving_pipeline import ServingPipeline
-            from scripts.data_ingestor import DataIngestorPHM
-            from utils.model_registry import ModelRegistry
+            live_bearing = self.registry.current_live_bearing()
+            if not live_bearing:
+                logger.warning(f"[{run_id}] No live bearing found — skipping serving pipeline.")
+                self.state_manager.update_step_status(run_id, step_id, "SKIPPED")
+                return
 
-            model_entry = ModelRegistry().get_deployed_model("RUL_s")
-            if not model_entry:
+            from utils.model_registry import ModelRegistry
+            if not ModelRegistry().get_deployed_model("RUL_s"):
                 raise RuntimeError(
-                    "No deployed model found. Ensure training + model selection completed."
+                    "No deployed model found. "
+                    "Ensure training + model selection completed."
                 )
 
+            from serving_pipeline.pipeline import ServingPipeline
             pipeline = ServingPipeline(config={
                 "mongo_uri":              self._mongo_config().get("uri"),
                 "db_name":                self._mongo_config().get("db_name"),
@@ -869,88 +950,6 @@ class WorkflowExecutor:
             self.state_manager.update_step_status(run_id, step_id, "FAILED", str(e))
             logger.error(f"  [{run_id}] Serving pipeline FAILED: {e}", exc_info=True)
             raise
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # PRIVATE: Restore confirmed faults from MongoDB to disk
-    # ─────────────────────────────────────────────────────────────────────────
-
-    def _restore_confirmed_faults_from_mongo(
-        self,
-        run_id:    str,
-        mongo_uri: str,
-        db_name:   str,
-    ) -> None:
-        """
-        Pull confirmed fault records from MongoDB 'confirmed_faults' collection
-        and write them to disk as features_confirmed.csv so the trainer can
-        include them in the training set.
-
-        This is the read path from the Feature Store Mirrored (FS Mirrored).
-        The FS Mirrored is populated by confirm_fault_and_push_to_store() when
-        a maintenance worker confirms a fault on the dashboard.
-
-        If features_confirmed.csv already exists on disk for a bearing, the
-        restore is skipped (idempotent).
-        """
-        try:
-            from pymongo import MongoClient
-
-            client = MongoClient(mongo_uri, serverSelectionTimeoutMS=5000)
-            db     = client[db_name]
-            col    = db["confirmed_faults"]
-
-            bearings_with_faults = col.distinct("dataset_id")
-            if not bearings_with_faults:
-                logger.info(
-                    f"[{run_id}] No confirmed faults in MongoDB — "
-                    f"training on base train set only."
-                )
-                return
-
-            for bearing_name in bearings_with_faults:
-                bearing = self.registry.get_bearing(bearing_name)
-                if not bearing:
-                    logger.warning(
-                        f"[{run_id}] Confirmed fault bearing '{bearing_name}' "
-                        f"not found in registry — skipping."
-                    )
-                    continue
-
-                source_folder  = self.registry.source_path(bearing)
-                confirmed_path = os.path.join(source_folder, "features_confirmed.csv")
-
-                if os.path.exists(confirmed_path):
-                    logger.info(
-                        f"[{run_id}] [{bearing_name}] features_confirmed.csv "
-                        f"already on disk — skipping restore."
-                    )
-                    continue
-
-                # Pull all records for this bearing from MongoDB
-                records = list(col.find({"dataset_id": bearing_name}))
-                if not records:
-                    continue
-
-                # Strip MongoDB internal fields before writing to CSV
-                for r in records:
-                    r.pop("_id",      None)
-                    r.pop("dataset_id", None)
-                    r.pop("version",  None)
-                    r.pop("metadata", None)
-
-                df = pd.DataFrame(records)
-                os.makedirs(source_folder, exist_ok=True)
-                df.to_csv(confirmed_path, index=False)
-                logger.info(
-                    f"[{run_id}] [{bearing_name}] Restored {len(df)} confirmed "
-                    f"fault rows from FS Mirrored → {confirmed_path}"
-                )
-
-        except Exception as e:
-            logger.warning(
-                f"[{run_id}] Could not restore confirmed faults from MongoDB: {e}. "
-                f"Training will proceed with base train set only."
-            )
 
     # ─────────────────────────────────────────────────────────────────────────
     # PRIVATE: Workflow step templates (read from workflow.yaml)
