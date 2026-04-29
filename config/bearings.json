@@ -19,7 +19,7 @@
       "name": "Bearing1_2",
       "role": "live",
       "condition": 1,
-      "status": "confirmed"
+      "status": "extracted"
     },
     {
       "name": "Bearing1_3",
