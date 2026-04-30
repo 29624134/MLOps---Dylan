@@ -12,15 +12,15 @@ Feature computation split (matching real SCADA behaviour):
                                                                Total = 18 features
 
 The 5 simple stats are computed here from raw signals and written to the live
-Feature Store (MongoDB 'live_features'). run_serving.py reads them and computes
+Feature Store (MongoDB 'feature_store'). run_serving.py reads them and computes
 the 4 derived stats before passing the full 18-feature vector into the pipeline.
 
-The Serving Pipeline (run_serving.py) polls 'live_features' independently and
+The Serving Pipeline (run_serving.py) polls 'feature_store' independently and
 makes predictions as new bursts arrive. These two processes are fully decoupled
 — the simulator does NOT call the serving pipeline directly.
 
 Architecture position:
-    [SCADA Simulator] --burst features--> [FS: live_features] <-- [run_serving.py]
+    [SCADA Simulator] --burst features--> [FS: feature_store] <-- [run_serving.py]
 
 Usage
 ─────
@@ -63,20 +63,21 @@ logging.basicConfig(
 logger = logging.getLogger("scada_simulator")
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-DEFAULT_MONGO_URI   = "mongodb://localhost:27017"
-DEFAULT_DB_NAME     = "phm_mlops"
-FS_LIVE_COLLECTION  = "live_features"       # Feature Store live collection
-STATE_DIR           = "scada_state"          # Tracks resume position
-BURST_PERIOD_S      = 10.0                   # IEEE PHM: 1 burst every 10 s
-SAMPLES_PER_BURST   = 2560                   # IEEE PHM: 25.6 kHz × 0.1 s
+DEFAULT_MONGO_URI  = "mongodb://localhost:27017"
+DEFAULT_DB_NAME    = "phm_mlops"
+STATE_DIR          = "scada_state"
+BURST_PERIOD_S     = 10.0
+SAMPLES_PER_BURST  = 2560
+
+# ── Collection name — single source of truth ──────────────────────────────────
+# Live SCADA bursts go into 'feature_store' (COL_FEATURE_STORE in db_collections).
+# run_serving.py reads from the same collection.
+from utils.db_collections import COL_FEATURE_STORE
+FS_LIVE_COLLECTION = COL_FEATURE_STORE   # "feature_store"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SCADA-side feature extraction — simple stats only
-#
-# A real SCADA system computes these 5 statistics cheaply on-device and
-# transmits them. The 4 derived stats (skew, kurt, crest, form) require more
-# computation and are calculated by your system in run_serving.py after receipt.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _scada_stats(h: np.ndarray, v: np.ndarray) -> dict:
@@ -112,7 +113,7 @@ class SimulatorState:
 
     def __init__(self, bearing_name: str):
         os.makedirs(STATE_DIR, exist_ok=True)
-        self._path = os.path.join(STATE_DIR, f"{bearing_name}_state.json")
+        self._path  = os.path.join(STATE_DIR, f"{bearing_name}_state.json")
         self._state = self._load()
 
     def _load(self) -> dict:
@@ -149,7 +150,7 @@ class SimulatorState:
 
 class LiveFeatureStoreWriter:
     """
-    Writes one SCADA stats row per burst into MongoDB 'live_features' collection.
+    Writes one SCADA stats row per burst into MongoDB 'feature_store' collection.
 
     Each document schema:
     {
@@ -173,11 +174,11 @@ class LiveFeatureStoreWriter:
         # Ensure indexes for fast polling by serving pipeline
         self._col.create_index(
             [("bearing_name", ASCENDING), ("burst_idx", ASCENDING)],
-            unique=True, name="idx_bearing_burst"
+            unique=True, name="idx_bearing_burst",
         )
         self._col.create_index(
             [("bearing_name", ASCENDING), ("consumed", ASCENDING)],
-            name="idx_bearing_consumed"
+            name="idx_bearing_consumed",
         )
         logger.info(
             f"[FeatureStore] Connected → {db_name}.{FS_LIVE_COLLECTION}"
@@ -200,8 +201,8 @@ class LiveFeatureStoreWriter:
             "burst_idx":    burst_idx,
             "time_s":       time_s,
             "sent_at":      datetime.now(timezone.utc).isoformat(),
-            "scada_stats":  scada_stats,   # 10 simple stats from SCADA
-            "consumed":     False,          # Serving pipeline sets this to True
+            "scada_stats":  scada_stats,
+            "consumed":     False,
         }
         try:
             self._col.insert_one(doc)
@@ -218,14 +219,16 @@ class LiveFeatureStoreWriter:
         try:
             self._col.insert_one({
                 "bearing_name": bearing_name,
-                "burst_idx":    -1,          # sentinel
+                "burst_idx":    -1,
                 "time_s":       -1.0,
                 "sent_at":      datetime.now(timezone.utc).isoformat(),
                 "features":     {},
                 "consumed":     False,
-                "session_end":  True,        # Serving pipeline watches for this
+                "session_end":  True,
             })
-            logger.info(f"[FeatureStore] Session-end sentinel written for {bearing_name}.")
+            logger.info(
+                f"[FeatureStore] Session-end sentinel written for {bearing_name}."
+            )
         except Exception as e:
             logger.warning(f"Could not write session-end sentinel: {e}")
 
@@ -238,10 +241,13 @@ class LiveFeatureStoreWriter:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Burst reader (wraps DataIngestorPHM.stream_bursts)
+# Bearing path resolver
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _resolve_bearing_path(bearing_name: Optional[str], bearing_path: Optional[str]) -> str:
+def _resolve_bearing_path(
+    bearing_name: Optional[str],
+    bearing_path: Optional[str],
+) -> str:
     if bearing_path:
         return bearing_path
 
@@ -250,7 +256,6 @@ def _resolve_bearing_path(bearing_name: Optional[str], bearing_path: Optional[st
         with open(config_path) as f:
             cfg = json.load(f)
 
-        # Try source_path field first (explicit override)
         for entry in cfg.get("bearings", []):
             if entry.get("name") == bearing_name:
                 sp = entry.get("source_path", "")
@@ -258,7 +263,6 @@ def _resolve_bearing_path(bearing_name: Optional[str], bearing_path: Optional[st
                     return sp
                 break
 
-        # Fall back to base_path + bearing_name (matches orchestrator logic)
         base_path = cfg.get("base_path", "")
         if base_path:
             candidate = os.path.join(base_path, bearing_name)
@@ -288,11 +292,11 @@ def run_simulator(
     """
     Core simulator loop.
 
-    1. Connects to MongoDB FS
+    1. Connects to MongoDB feature_store
     2. Resolves which burst to start from (resume support)
-    3. Streams bursts from CSV files
-    4. Extracts features per burst
-    5. Writes features to live_features collection
+    3. Streams bursts from acc_*.csv files
+    4. Computes SCADA-side simple stats (5 per axis = 10 values)
+    5. Writes stats to feature_store collection
     6. Sleeps burst_period between bursts (if realtime=True)
     7. Writes session-end sentinel when all bursts are done
     """
@@ -303,16 +307,15 @@ def run_simulator(
     logger.info(f"  Data path : {bearing_path}")
     logger.info(f"  Mode      : {'realtime (10 s sleep)' if realtime else 'fast replay'}")
     logger.info(f"  MongoDB   : {mongo_uri} / {db_name}")
+    logger.info(f"  FS coll   : {FS_LIVE_COLLECTION}")
     logger.info(f"  Resume    : {resume}")
     logger.info("=" * 60)
 
-    # ── Connect to FS ─────────────────────────────────────────────────────────
     fs_writer = LiveFeatureStoreWriter(mongo_uri=mongo_uri, db_name=db_name)
     if not fs_writer.ping():
         logger.error("Cannot reach MongoDB. Is it running?")
         sys.exit(1)
 
-    # ── State (resume support) ────────────────────────────────────────────────
     state = SimulatorState(bearing_name)
     if not resume:
         state.reset()
@@ -320,7 +323,6 @@ def run_simulator(
     if start_from > 0:
         logger.info(f"Resuming from burst {start_from}")
 
-    # ── Import ingestor ───────────────────────────────────────────────────────
     try:
         from scripts.data_ingestor import DataIngestorPHM
     except ImportError:
@@ -335,30 +337,25 @@ def run_simulator(
         "output_location": bearing_path,
     })
 
-    # ── Stream bursts ─────────────────────────────────────────────────────────
-    sent = 0
+    sent    = 0
     skipped = 0
     try:
         for burst in ingestor.stream_bursts(
             bearing_path,
             burst_period=burst_period,
-            realtime=False,          # We manage sleep ourselves for better control
+            realtime=False,
         ):
             burst_idx = burst["burst_idx"]
 
-            # Skip already-sent bursts (resume mode)
             if burst_idx < start_from:
                 skipped += 1
                 continue
 
-            # Compute SCADA-side simple stats (5 per axis = 10 values)
-            # skew, kurt, crest, form are derived by run_serving.py
             scada_stats = _scada_stats(
                 h=burst["h_signal"],
                 v=burst["v_signal"],
             )
 
-            # Write to Feature Store
             ok = fs_writer.write_burst(
                 bearing_name=bearing_name,
                 burst_idx=burst_idx,
@@ -374,23 +371,24 @@ def run_simulator(
                     f"time={burst['time_s']:>8.1f}s | "
                     f"h_rms={scada_stats.get('h_rms', 0):.4f} | "
                     f"v_rms={scada_stats.get('v_rms', 0):.4f} | "
-                    f"sent to FS ✓  [10 SCADA stats]"
+                    f"sent to {FS_LIVE_COLLECTION} ✓  [10 SCADA stats]"
                 )
 
-            # Sleep between bursts (realtime mode)
             if realtime:
                 time.sleep(burst_period)
 
     except KeyboardInterrupt:
-        logger.info(f"\nStopped by user. Sent {sent} bursts (skipped {skipped} already sent).")
+        logger.info(
+            f"\nStopped by user. Sent {sent} bursts "
+            f"(skipped {skipped} already sent)."
+        )
         logger.info(f"Resume from burst {state.last_burst_idx() + 1} next time.")
         sys.exit(0)
 
-    # ── All bursts sent — write sentinel ──────────────────────────────────────
     logger.info(
         f"\n{'='*60}\n"
         f"  All {sent} bursts sent for {bearing_name}.\n"
-        f"  Writing session-end sentinel to Feature Store...\n"
+        f"  Writing session-end sentinel to {FS_LIVE_COLLECTION}...\n"
         f"{'='*60}"
     )
     fs_writer.mark_session_end(bearing_name)
@@ -414,19 +412,19 @@ Examples:
         """,
     )
     src = parser.add_mutually_exclusive_group()
-    src.add_argument("--bearing",      type=str, help="Bearing name (looked up in bearings.json)")
-    src.add_argument("--bearing_path", type=str, help="Explicit path to bearing data folder")
+    src.add_argument("--bearing",      type=str,
+                     help="Bearing name (looked up in config/bearings.json)")
+    src.add_argument("--bearing_path", type=str,
+                     help="Explicit path to bearing data folder")
 
-    parser.add_argument("--realtime",    action="store_true", default=False,
-                        help="Sleep burst_period seconds between bursts (default: fast replay)")
+    parser.add_argument("--realtime",     action="store_true", default=False,
+                        help="Sleep burst_period seconds between bursts")
     parser.add_argument("--burst_period", type=float, default=BURST_PERIOD_S,
                         help=f"Seconds between bursts (default: {BURST_PERIOD_S})")
-    parser.add_argument("--mongo_uri",  type=str, default=DEFAULT_MONGO_URI,
-                        help=f"MongoDB URI (default: {DEFAULT_MONGO_URI})")
-    parser.add_argument("--db_name",    type=str, default=DEFAULT_DB_NAME,
-                        help=f"MongoDB database name (default: {DEFAULT_DB_NAME})")
-    parser.add_argument("--resume",     action="store_true", default=False,
-                        help="Resume from last sent burst (default: start from beginning)")
+    parser.add_argument("--mongo_uri",    type=str,   default=DEFAULT_MONGO_URI)
+    parser.add_argument("--db_name",      type=str,   default=DEFAULT_DB_NAME)
+    parser.add_argument("--resume",       action="store_true", default=False,
+                        help="Resume from last sent burst")
     return parser.parse_args()
 
 
@@ -441,11 +439,11 @@ if __name__ == "__main__":
     bearing_path = _resolve_bearing_path(args.bearing, args.bearing_path)
 
     run_simulator(
-        bearing_name=bearing_name,
-        bearing_path=bearing_path,
-        mongo_uri=args.mongo_uri,
-        db_name=args.db_name,
-        realtime=args.realtime,
-        burst_period=args.burst_period,
-        resume=args.resume,
+        bearing_name  = bearing_name,
+        bearing_path  = bearing_path,
+        mongo_uri     = args.mongo_uri,
+        db_name       = args.db_name,
+        realtime      = args.realtime,
+        burst_period  = args.burst_period,
+        resume        = args.resume,
     )

@@ -6,25 +6,33 @@ Unified trainer for PHM 2012 RUL models.
 Pipeline:
     load_data() -> train() -> evaluate() -> save_model() -> register_model() -> run(run_id)
 
+Data sources
+────────────
+Primary  : DataFrames loaded from MongoDB factory_features by the orchestrator
+           and passed in via config keys train_dataframes / val_dataframes /
+           test_dataframes.  The orchestrator never passes CSV file paths for
+           training data — it reads from MongoDB first.
+
+Fallback : CSV file paths via train_files / val_files / test_files — kept
+           for backward compatibility with external scripts (IEEE original
+           code, standalone notebooks) that still run directly from disk.
+
 Metrics computed and stored in ModelRegistry
 ────────────────────────────────────────────
     mae_s        — Mean Absolute Error in seconds (primary comparison metric)
     rmse_s       — Root Mean Square Error in seconds (penalises large errors)
     mape         — Mean Absolute Percentage Error (relative, bearing-agnostic)
-    phm_score    — Asymmetric penalty score:
-                   late predictions (optimistic) penalised more than early ones
-                   Formula: sum(exp(-e/13)-1 if e<0 else exp(e/10)-1)
-                   Lower is better. Reflects real maintenance cost asymmetry.
+    mean_abs_pct — Alias for mape (backward compatibility)
+═══════════════════════════════════════════════════════════════════════════════
 """
 
 import os
-import json
 import logging
 import numpy as np
 import pandas as pd
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 from sklearn.preprocessing import StandardScaler
 
 from utils.model_registry import ModelRegistry
@@ -32,10 +40,10 @@ from models.rul_net_model import RULNetModel
 
 logger = logging.getLogger(__name__)
 
-# GT RULs — used for point-in-time evaluation at last recorded burst
-# These are ground truth values from the bearing run-to-failure recordings.
-# For train/val bearings these are derived from the failure point in features.csv.
-# For test bearings these are known from when the recording was stopped.
+# GT RULs — used for point-in-time evaluation at last recorded burst.
+# For train/val bearings these are derived from the failure point in the
+# feature data.  For test bearings these are known from when the recording
+# was stopped.
 ACTUAL_RUL_S = {
     "Bearing1_3": 5730,  "Bearing1_4":  339,  "Bearing1_5": 1610,
     "Bearing1_6": 1460,  "Bearing1_7": 7570,  "Bearing2_3": 7530,
@@ -48,30 +56,44 @@ DROP_COLS = ["file_id", "burst_idx", "time_s", TARGET]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Metric helpers
+# Trainer
 # ─────────────────────────────────────────────────────────────────────────────
 
 class RULTrainerPHM:
     """
     Unified trainer for PHM 2012 RUL models.
 
-    Config keys
-    -----------
+    Config keys — MongoDB path (preferred, used by orchestrator)
+    ─────────────────────────────────────────────────────────────
+    train_dataframes : list[pd.DataFrame]         — training bearing DataFrames
+    val_dataframes   : list[pd.DataFrame]         — validation bearing DataFrames
+    test_dataframes  : list[tuple[str, pd.DataFrame]] — (bearing_name, df) pairs
+    output_location  : str
+    window_size      : int
+    rul_scale        : float
+    model_params     : dict
+    state_location   : str   (optional)
+    log_path         : str   (optional)
+
+    Config keys — CSV fallback (external scripts / backward compatibility)
+    ──────────────────────────────────────────────────────────────────────
     train_files      : list[str]  — feature CSV paths for training bearings
     val_files        : list[str]  — feature CSV paths for validation bearings
     test_files       : list[str]  — feature CSV paths for test bearings
-    output_location  : str        — folder to save model and results
-    window_size      : int        — rolling feature window (default: 40)
-    rul_scale        : float      — RUL normalisation factor (default: 30000.0)
-    model_params     : dict       — hyperparameters forwarded to RULNetModel
-    state_location   : str        — completion flag path (optional)
-    log_path         : str        — log file path (optional)
     """
 
     def __init__(self, config: dict):
-        self.train_files     = config.get("train_files", [])
-        self.val_files       = config.get("val_files", [])
-        self.test_files      = config.get("test_files", [])
+        # ── MongoDB DataFrame path ────────────────────────────────────────────
+        # list[pd.DataFrame] for train/val; list[(name, df)] for test
+        self.train_dataframes = config.get("train_dataframes", [])
+        self.val_dataframes   = config.get("val_dataframes",   [])
+        self.test_dataframes  = config.get("test_dataframes",  [])  # list[(str, df)]
+
+        # ── Legacy CSV path (external scripts / backward compat) ──────────────
+        self.train_files = config.get("train_files", [])
+        self.val_files   = config.get("val_files",   [])
+        self.test_files  = config.get("test_files",  [])
+
         self.output_location = config.get("output_location", "workflow_data/models")
         self.window_size     = config.get("window_size", 40)
         self.rul_scale       = config.get("rul_scale", 30000.0)
@@ -85,13 +107,29 @@ class RULTrainerPHM:
 
         self.logger = logging.getLogger(__name__)
 
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
+    # ── Internal helpers ──────────────────────────────────────────────────────
 
-    def _add_rolling_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Add rolling mean/std/slope features matching the training pipeline."""
-        base_cols = [c for c in df.columns if c not in DROP_COLS]
+    def _add_rolling_features(self, df: pd.DataFrame) -> Optional[pd.DataFrame]:
+        """Add rolling mean/std/slope features matching the serving pipeline."""
+        if df is None or len(df) < self.window_size:
+            return None
+        if TARGET not in df.columns:
+            self.logger.warning(f"  No '{TARGET}' column — skipping DataFrame.")
+            return None
+
+        # Drop all non-numeric columns before rolling.
+        # MongoDB documents carry extra string fields (dataset_id, version, etc.)
+        # that must be removed before any rolling operation is attempted.
+        numeric_cols = df.select_dtypes(include="number").columns.tolist()
+        keep_cols    = list(dict.fromkeys(numeric_cols + [c for c in DROP_COLS if c in df.columns]))
+        df = df[keep_cols].copy()
+
+        df = df.dropna(subset=[TARGET]).reset_index(drop=True)
+        if len(df) < self.window_size:
+            return None
+
+        # Only roll over numeric feature columns (exclude DROP_COLS)
+        base_cols = [c for c in df.columns if c not in DROP_COLS and pd.api.types.is_numeric_dtype(df[c])]
         new_cols  = {}
         for col in base_cols:
             new_cols[f"{col}_mean"]  = df[col].rolling(self.window_size).mean()
@@ -103,7 +141,8 @@ class RULTrainerPHM:
         return df.dropna().reset_index(drop=True)
 
     def _load_bearing(self, path: str) -> Optional[pd.DataFrame]:
-        """Load a bearing features.csv and add rolling features."""
+        """Load a bearing features.csv from disk and add rolling features.
+        Used only by the CSV fallback path."""
         if not os.path.exists(path):
             self.logger.warning(f"  File not found: {path}")
             return None
@@ -130,13 +169,61 @@ class RULTrainerPHM:
                 return part
         return Path(path).stem
 
-    # ------------------------------------------------------------------
-    # Pipeline steps
-    # ------------------------------------------------------------------
+    # ── Pipeline steps ────────────────────────────────────────────────────────
 
     def load_data(self) -> tuple:
-        train_dfs = [df for f in self.train_files if (df := self._load_bearing(f)) is not None]
-        val_dfs   = [df for f in self.val_files   if (df := self._load_bearing(f)) is not None]
+        """
+        Load and prepare training and validation data.
+
+        Uses MongoDB DataFrames if available (orchestrator path), otherwise
+        falls back to reading from CSV files (external scripts path).
+
+        Returns
+        -------
+        X_train, y_train_scaled, X_val, y_val, scaler
+        """
+        # ── MongoDB DataFrame path (preferred) ────────────────────────────────
+        if self.train_dataframes:
+            self.logger.info(
+                f"Loading data from {len(self.train_dataframes)} train DataFrame(s) "
+                f"and {len(self.val_dataframes)} val DataFrame(s) [MongoDB path]."
+            )
+            train_dfs = []
+            for df in self.train_dataframes:
+                result = self._add_rolling_features(df.copy())
+                if result is not None and len(result) > 0:
+                    train_dfs.append(result)
+                else:
+                    self.logger.warning(
+                        f"  A train DataFrame was skipped "
+                        f"(too short or missing '{TARGET}' column)."
+                    )
+
+            val_dfs = []
+            for df in self.val_dataframes:
+                result = self._add_rolling_features(df.copy())
+                if result is not None and len(result) > 0:
+                    val_dfs.append(result)
+                else:
+                    self.logger.warning(
+                        f"  A val DataFrame was skipped "
+                        f"(too short or missing '{TARGET}' column)."
+                    )
+
+        # ── CSV fallback path (external scripts / backward compat) ────────────
+        else:
+            self.logger.info(
+                f"Loading data from {len(self.train_files)} train CSV(s) "
+                f"and {len(self.val_files)} val CSV(s) [CSV fallback path]."
+            )
+            train_dfs = [
+                df for f in self.train_files
+                if (df := self._load_bearing(f)) is not None
+            ]
+            val_dfs = [
+                df for f in self.val_files
+                if (df := self._load_bearing(f)) is not None
+            ]
 
         if not train_dfs:
             raise RuntimeError("No training data could be loaded.")
@@ -186,21 +273,63 @@ class RULTrainerPHM:
             rmse_s    — sqrt(mean(errors^2)) across all test bearings
             mape      — mean absolute percentage error
 
-        All metrics are also stored per-bearing in summary_rows for the
-        results CSV.
+        Uses test_dataframes if available (MongoDB path), falls back to
+        test_files CSV paths, then falls back to val data if neither is set.
         """
-
-        summary_rows = []
-
-        eval_files = self.test_files if self.test_files else self.val_files
-        if not self.test_files:
+        # ── Resolve evaluation items: list of (bearing_name, df) ─────────────
+        if self.test_dataframes:
+            # MongoDB path: list of (name, df) tuples
+            self.logger.info(
+                f"Evaluating on {len(self.test_dataframes)} test DataFrame(s) [MongoDB path]."
+            )
+            eval_items: List[Tuple[str, Optional[pd.DataFrame]]] = [
+                (name, self._add_rolling_features(df.copy()))
+                for name, df in self.test_dataframes
+            ]
+        elif self.test_files:
+            # CSV fallback path
+            self.logger.info(
+                f"Evaluating on {len(self.test_files)} test CSV(s) [CSV fallback path]."
+            )
+            eval_items = [
+                (self._parse_bearing_name(f), self._load_bearing(f))
+                for f in self.test_files
+            ]
+        elif self.val_dataframes:
+            # No test set — fall back to val DataFrames
+            self.logger.info(
+                "No test data configured — falling back to val DataFrames for evaluation."
+            )
+            eval_items = [
+                (f"val_{i}", self._add_rolling_features(df.copy()))
+                for i, df in enumerate(self.val_dataframes)
+            ]
+        else:
+            # No test set — fall back to val CSVs
             self.logger.info(
                 "No test files configured — falling back to val bearings for evaluation."
             )
-        for test_path in eval_files:
-            bearing_name = self._parse_bearing_name(test_path)
-            df_test      = self._load_bearing(test_path)
-            if df_test is None:
+            eval_items = [
+                (self._parse_bearing_name(f), self._load_bearing(f))
+                for f in self.val_files
+            ]
+
+        if not eval_items:
+            self.logger.warning(
+                "No evaluation data available — all metrics will be None. "
+                "Check that test data is set in bearings config and features exist."
+            )
+            return {
+                "mae_s":        None,
+                "rmse_s":       None,
+                "mape":         None,
+                "mean_abs_pct": None,
+                "summary_rows": [],
+            }
+
+        summary_rows = []
+        for bearing_name, df_test in eval_items:
+            if df_test is None or len(df_test) == 0:
                 self.logger.warning(f"  [{bearing_name}] Could not load — skipping.")
                 continue
 
@@ -214,40 +343,37 @@ class RULTrainerPHM:
             gt_rul_s   = ACTUAL_RUL_S.get(bearing_name)
 
             if gt_rul_s is None:
-                # If not in ACTUAL_RUL_S, derive from last row of features.csv
+                # If not in ACTUAL_RUL_S, derive from last row of feature data
                 gt_rul_s = float(df_test[TARGET].iloc[-1])
                 self.logger.info(
-                    f"  {bearing_name}: GT RUL derived from features.csv "
-                    f"last row = {gt_rul_s:.0f} s"
+                    f"  {bearing_name}: GT RUL derived from last feature row "
+                    f"= {gt_rul_s:.0f} s"
                 )
 
-            error_s    = pred_rul_s - gt_rul_s
-            abs_err_s  = abs(error_s)
-            abs_pct    = abs_err_s / gt_rul_s * 100 if gt_rul_s > 0 else 0.0
-
-
-
+            error_s   = pred_rul_s - gt_rul_s
+            abs_err_s = abs(error_s)
+            abs_pct   = abs_err_s / gt_rul_s * 100 if gt_rul_s > 0 else 0.0
 
             summary_rows.append({
-                "bearing":      bearing_name,
-                "gt_rul_s":     gt_rul_s,
-                "pred_rul_s":   pred_rul_s,
-                "error_s":      error_s,
-                "abs_err_s":    abs_err_s,
-                "abs_pct_err":  abs_pct,
-                "timestamp":    datetime.now().isoformat(),
+                "bearing":     bearing_name,
+                "gt_rul_s":    gt_rul_s,
+                "pred_rul_s":  pred_rul_s,
+                "error_s":     error_s,
+                "abs_err_s":   abs_err_s,
+                "abs_pct_err": abs_pct,
+                "timestamp":   datetime.now().isoformat(),
             })
 
         if not summary_rows:
             self.logger.warning(
                 "No test bearings evaluated — all metrics will be None. "
-                "Check that test_files are set in bearings.json and features.csv exist."
+                "Check that test data is configured and features exist."
             )
             return {
-                "mae_s":       None,
-                "rmse_s":      None,
-                "mape":        None,
-                "mean_abs_pct": None,   # kept for backward compatibility
+                "mae_s":        None,
+                "rmse_s":       None,
+                "mape":         None,
+                "mean_abs_pct": None,
                 "summary_rows": [],
             }
 
@@ -255,9 +381,9 @@ class RULTrainerPHM:
         abs_errs = np.array([r["abs_err_s"] for r in summary_rows])
         pcts     = np.array([r["abs_pct_err"] for r in summary_rows])
 
-        mae_s     = float(np.mean(abs_errs))
-        rmse_s    = float(np.sqrt(np.mean(errors ** 2)))
-        mape      = float(np.mean(pcts))
+        mae_s  = float(np.mean(abs_errs))
+        rmse_s = float(np.sqrt(np.mean(errors ** 2)))
+        mape   = float(np.mean(pcts))
 
         self.logger.info(
             f"  {'='*75}\n"
@@ -270,7 +396,7 @@ class RULTrainerPHM:
             "mae_s":        mae_s,
             "rmse_s":       rmse_s,
             "mape":         mape,
-            "mean_abs_pct": mape,    # backward compatibility alias
+            "mean_abs_pct": mape,   # backward compatibility alias
             "summary_rows": summary_rows,
         }
 
@@ -309,12 +435,24 @@ class RULTrainerPHM:
         """
         registry = ModelRegistry()
 
+        # Report the actual data source in training_data_info
+        if self.train_dataframes:
+            source_desc = f"{len(self.train_dataframes)} bearing(s) from MongoDB factory_features"
+            num_train   = len(self.train_dataframes)
+            num_val     = len(self.val_dataframes)
+            num_test    = len(self.test_dataframes)
+        else:
+            source_desc = self.train_files
+            num_train   = len(self.train_files)
+            num_val     = len(self.val_files)
+            num_test    = len(self.test_files)
+
         training_data_info = {
-            "num_train_files": len(self.train_files),
-            "num_val_files":   len(self.val_files),
-            "num_test_files":  len(self.test_files),
+            "num_train_files": num_train,
+            "num_val_files":   num_val,
+            "num_test_files":  num_test,
             "window_size":     self.window_size,
-            "source":          self.train_files,
+            "source":          source_desc,
         }
 
         model_id = registry.register_model(
@@ -322,15 +460,14 @@ class RULTrainerPHM:
             model_type         = model.get_model_name(),
             target_feature     = TARGET,
             metrics            = {
-                "mae_s":      metrics["mae_s"],      # primary comparison metric
-                "rmse_s":     metrics["rmse_s"],     # penalises large errors
-                "mape":       metrics["mape"],       # relative error %
-                # backward compat
+                "mae_s":        metrics["mae_s"],
+                "rmse_s":       metrics["rmse_s"],
+                "mape":         metrics["mape"],
                 "mean_abs_pct": metrics["mean_abs_pct"],
             },
             training_data_info = training_data_info,
             metadata           = {
-                "run_id":         run_id,
+                "run_id":          run_id,
                 "hyperparameters": self.model_params,
             },
         )
@@ -338,9 +475,7 @@ class RULTrainerPHM:
         self.logger.info(f"Model registered with ID: {model_id}")
         return model_id
 
-    # ------------------------------------------------------------------
-    # Orchestrator entry point
-    # ------------------------------------------------------------------
+    # ── Orchestrator entry point ──────────────────────────────────────────────
 
     def run(self, run_id: str) -> Dict[str, Any]:
         """

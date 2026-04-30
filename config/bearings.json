@@ -7,13 +7,13 @@
     "Bearing1_5",
     "Bearing1_7"
   ],
-  "current_live_index": 3,
+  "current_live_index": 2,
   "bearings": [
     {
       "name": "Bearing1_1",
       "role": "train",
       "condition": 1,
-      "status": "extracted"
+      "status": "available"
     },
     {
       "name": "Bearing1_2",
@@ -25,25 +25,25 @@
       "name": "Bearing1_3",
       "role": "live",
       "condition": 1,
-      "status": "confirmed"
+      "status": "denied"
     },
     {
       "name": "Bearing1_4",
       "role": "live",
       "condition": 1,
-      "status": "confirmed"
+      "status": "extracted"
     },
     {
       "name": "Bearing1_5",
       "role": "live",
       "condition": 1,
-      "status": "extracted"
+      "status": "available"
     },
     {
       "name": "Bearing1_6",
       "role": "val",
       "condition": 1,
-      "status": "extracted"
+      "status": "available"
     },
     {
       "name": "Bearing1_7",
@@ -67,7 +67,7 @@
       "name": "Bearing2_3",
       "role": "val",
       "condition": 2,
-      "status": "extracted"
+      "status": "available"
     },
     {
       "name": "Bearing2_4",

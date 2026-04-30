@@ -12,19 +12,30 @@ This script is the ONLY process that owns the Serving Pipeline. It:
    written by scada_simulator.py
 3. Passes each burst through the 4-stage Serving Pipeline:
        Feature Engineering → Inference → Predictive Maintenance → Monitoring
-4. Writes results to Serving History (MongoDB)
-5. Writes monitoring metrics back to Feature Store ('monitoring_metrics')
-6. Checks model_registry/champion.json ONLY after receiving the first burst
+4. Writes full prediction audit to RUL_predictions (one doc per burst)
+5. Writes operational telemetry to serving_history (latency, throughput,
+   CPU, model version, feedback metadata — one doc per burst)
+6. Writes monitoring metrics back to Feature Store ('feature_store')
+7. Checks model_registry/champion.json ONLY after receiving the first burst
    from the current SCADA session — prevents stale champion detections on
    startup before any data has arrived
-7. Detects the session-end sentinel and idles until the next SCADA session
+8. Detects the session-end sentinel and idles until the next SCADA session
+
+MongoDB collections written by this script
+──────────────────────────────────────────
+RUL_predictions   ← full prediction audit log (features, inference, PM, monitoring)
+serving_history   ← operational telemetry (latency, CPU, throughput, model version)
+feature_store     ← monitoring metrics written back per burst (Point 3)
 
 Architecture:
-    [scada_simulator.py] --> [FS: live_features]
+    [scada_simulator.py] --> [FS: feature_store / live_features]
                                       |
                                  [run_serving.py]  <-- champion.json (hot-swap)
                                       |
-                         [Serving History + monitoring_metrics]
+                    ┌─────────────────┴──────────────────┐
+                    ▼                                     ▼
+            RUL_predictions                       serving_history
+         (full prediction audit)              (operational telemetry)
 
 Usage
 ─────
@@ -59,10 +70,13 @@ logger = logging.getLogger("run_serving")
 # ── Constants ─────────────────────────────────────────────────────────────────
 DEFAULT_MONGO_URI  = "mongodb://localhost:27017"
 DEFAULT_DB_NAME    = "phm_mlops"
-FS_LIVE_COLLECTION = "live_features"
-FS_MONITOR_COLL    = "monitoring_metrics"
+# Both SCADA bursts (live) and monitoring metrics written-back live in
+# the same 'feature_store' collection — matching COL_FEATURE_STORE in db_collections.
+from utils.db_collections import COL_FEATURE_STORE
+FS_LIVE_COLLECTION = COL_FEATURE_STORE   # "feature_store"
+FS_MONITOR_COLL    = COL_FEATURE_STORE   # monitoring metrics written back to same collection
 CHAMPION_PATH      = os.path.join("model_registry", "champion.json")
-DEFAULT_POLL_S     = 2.0      # seconds between FS polls when idle
+DEFAULT_POLL_S     = 2.0
 DEFAULT_BEARING    = "Bearing1_1"
 
 
@@ -95,10 +109,10 @@ def _derive_features(scada_stats: dict) -> dict:
         mean = scada_stats.get(f"{prefix}_mean", 0.0)
         mx   = scada_stats.get(f"{prefix}_max",  0.0)
 
-        features[f"{prefix}_skew"]  = 0.0                                      # approximation
-        features[f"{prefix}_kurt"]  = 0.0                                      # approximation
-        features[f"{prefix}_crest"] = mx / rms   if rms  > 1e-9 else 0.0      # exact
-        features[f"{prefix}_form"]  = rms / mean if abs(mean) > 1e-9 else 0.0 # exact
+        features[f"{prefix}_skew"]  = 0.0
+        features[f"{prefix}_kurt"]  = 0.0
+        features[f"{prefix}_crest"] = mx / rms   if rms  > 1e-9 else 0.0
+        features[f"{prefix}_form"]  = rms / mean if abs(mean) > 1e-9 else 0.0
 
     return features   # 18 values total
 
@@ -188,7 +202,7 @@ class ChampionWatcher:
 
 class LiveFeatureStoreReader:
     """
-    Reads unconsumed bursts from the 'live_features' MongoDB collection.
+    Reads unconsumed bursts from the live_features MongoDB collection.
     Marks each burst as consumed after the serving pipeline processes it.
     """
 
@@ -199,10 +213,10 @@ class LiveFeatureStoreReader:
         self._col    = self._db[FS_LIVE_COLLECTION]
         self._mon    = self._db[FS_MONITOR_COLL]
 
-        # Ensure monitoring_metrics collection has indexes
+        # Ensure monitoring metrics indexes
         self._mon.create_index(
             [("bearing_name", ASCENDING), ("burst_idx", ASCENDING)],
-            name="idx_mon_bearing_burst"
+            name="idx_mon_bearing_burst",
         )
         logger.info(f"[FS Reader] Connected → {db_name}.{FS_LIVE_COLLECTION}")
 
@@ -235,18 +249,17 @@ class LiveFeatureStoreReader:
         """
         Return the next unconsumed burst for this bearing (lowest burst_idx),
         or None if nothing is available yet. Excludes sentinel documents.
-        The returned doc contains 'scada_stats' (10 values) — caller must
-        call _derive_features() to get the full 18-feature dict.
+        The returned doc contains 'scada_stats' (10 values) — caller calls
+        _derive_features() to get the full 18-feature dict.
         """
-        doc = self._col.find_one(
+        return self._col.find_one(
             {
                 "bearing_name": bearing_name,
                 "consumed":     False,
-                "session_end":  {"$exists": False},   # exclude sentinel
+                "session_end":  {"$exists": False},
             },
             sort=[("burst_idx", 1)],
         )
-        return doc
 
     def mark_consumed(self, doc_id) -> None:
         """Mark a burst document as consumed by the serving pipeline."""
@@ -260,11 +273,10 @@ class LiveFeatureStoreReader:
 
     def check_session_end(self, bearing_name: str) -> bool:
         """Return True if the SCADA simulator has sent the session-end sentinel."""
-        sentinel = self._col.find_one({
+        return self._col.find_one({
             "bearing_name": bearing_name,
             "session_end":  True,
-        })
-        return sentinel is not None
+        }) is not None
 
     def write_monitoring_metrics(
         self,
@@ -277,13 +289,14 @@ class LiveFeatureStoreReader:
     ) -> None:
         """
         Write monitoring metrics back to the Feature Store (Point 3).
-        Collection: monitoring_metrics
+        Collection: feature_store
         """
         doc = {
             "bearing_name":   bearing_name,
             "burst_idx":      burst_idx,
             "run_id":         run_id,
             "recorded_at":    datetime.now(timezone.utc).isoformat(),
+            "type":           "monitoring_metrics",
             # Monitoring stage output
             "drift_detected": monitoring_out.get("drift_detected", False),
             "drift_features": monitoring_out.get("drift_features", []),
@@ -350,8 +363,6 @@ def run_serving(
         sys.exit(1)
 
     # ── Clear stale data from previous sessions ───────────────────────────────
-    # Must happen BEFORE initialising champion watcher or pipeline.
-    # Removes leftover bursts/sentinels so we only process fresh SCADA data.
     logger.info(f"Clearing stale data for {bearing_name} from previous sessions...")
     fs_reader.clear_stale_data(bearing_name)
 
@@ -368,8 +379,12 @@ def run_serving(
         "window_size": window_size,
     })
 
+    # ── Telemetry writer (serving_history collection) ─────────────────────────
+    from utils.serving_history import ServingTelemetry
+    telemetry = ServingTelemetry(mongo_uri=mongo_uri, db_name=db_name)
+
     # ── Champion watcher ──────────────────────────────────────────────────────
-    # Baseline is NOT set here — it is set after the first burst arrives.
+    # Baseline is NOT set here — set after the first burst arrives.
     # This prevents the existing champion.json triggering a false hot-swap
     # on startup before any SCADA data has been received.
     champion_watcher = ChampionWatcher(CHAMPION_PATH)
@@ -378,8 +393,7 @@ def run_serving(
 
     logger.info(f"Run ID: {run_id}")
     logger.info(
-        f"Stale data cleared — waiting for fresh bursts from "
-        f"SCADA simulator...\n"
+        f"Stale data cleared — waiting for fresh bursts from SCADA simulator...\n"
     )
 
     burst_count = 0
@@ -417,14 +431,12 @@ def run_serving(
                 continue
 
             # ── First burst received — set champion baseline now ──────────────
-            # Only after real data arrives do we record the current champion
-            # as the baseline. Any change AFTER this point is a genuine hot-swap.
             if not first_burst_seen:
                 champion_watcher.initialise_baseline()
                 first_burst_seen = True
                 logger.info(
-                    f"First burst received from SCADA — "
-                    f"champion baseline set, hot-swap monitoring active."
+                    "First burst received from SCADA — "
+                    "champion baseline set, hot-swap monitoring active."
                 )
 
             # ── Hot-swap check (between bursts — never mid-prediction) ────────
@@ -440,20 +452,17 @@ def run_serving(
 
             idle_logged = False
             burst_idx   = burst_doc["burst_idx"]
-            scada_stats = burst_doc["scada_stats"]   # 10 simple stats from SCADA
+            scada_stats = burst_doc["scada_stats"]
 
-            # ── Derive full 18-feature dict (system side) ─────────────────────
-            # SCADA sends: max, min, mean, sd, rms  (5 per axis)
-            # System adds: skew, kurt, crest, form  (4 per axis)
+            # ── Derive full 18-feature dict ───────────────────────────────────
             features = _derive_features(scada_stats)
 
-            # ── Run the full 4-stage pipeline ─────────────────────────────────
-            # Pass precomputed_features so FE stage uses derived features
-            # directly and builds the rolling window without re-extraction.
+            # ── Run the full 4-stage pipeline (timed for latency) ─────────────
             h_signal = np.array([features.get("h_rms", 0.0)], dtype=np.float32)
             v_signal = np.array([features.get("v_rms", 0.0)], dtype=np.float32)
 
-            result = pipeline.run_burst(
+            t_start = time.time()
+            result  = pipeline.run_burst(
                 run_id               = run_id,
                 bearing_name         = bearing_name,
                 burst_idx            = burst_idx,
@@ -461,31 +470,67 @@ def run_serving(
                 v_signal             = v_signal,
                 precomputed_features = features,
             )
+            latency_ms = (time.time() - t_start) * 1000.0
 
-            # Mark burst as consumed in FS
+            # ── Mark burst as consumed in FS ──────────────────────────────────
             fs_reader.mark_consumed(burst_doc["_id"])
 
-            # Write monitoring metrics back to FS (Point 3)
-            if result.get("ok") and result.get("ready"):
+            pm         = result.get("pm")         or {}
+            monitoring = result.get("monitoring") or {}
+            inference  = result.get("inference")  or {}
+            ok         = result.get("ok",    False)
+            ready      = result.get("ready", False)
+
+            # ── Write monitoring metrics back to feature_store (Point 3) ──────
+            if ok and ready:
                 fs_reader.write_monitoring_metrics(
                     bearing_name   = bearing_name,
                     burst_idx      = burst_idx,
                     run_id         = run_id,
-                    monitoring_out = result.get("monitoring") or {},
-                    pm_out         = result.get("pm") or {},
-                    inference_out  = result.get("inference") or {},
+                    monitoring_out = monitoring,
+                    pm_out         = pm,
+                    inference_out  = inference,
                 )
                 burst_count += 1
-                pm = result.get("pm") or {}
+
+            # ── Write operational telemetry to serving_history ────────────────
+            try:
+                import psutil
+                proc    = psutil.Process()
+                cpu_pct = proc.cpu_percent(interval=None)
+                mem_mb  = proc.memory_info().rss / 1024 / 1024
+            except Exception:
+                cpu_pct = None
+                mem_mb  = None
+
+            telemetry.record(
+                run_id              = run_id,
+                bearing_name        = bearing_name,
+                burst_idx           = burst_idx,
+                model_version       = champion_watcher.current_champion_id() or "unknown",
+                latency_ms          = latency_ms,
+                pipeline_ok         = ok,
+                pm_status           = pm.get("status", "unknown"),
+                rul_s               = pm.get("rul_s"),
+                rul_min             = pm.get("rul_min"),
+                drift_detected      = monitoring.get("drift_detected", False),
+                anomaly_flag        = monitoring.get("anomaly_flag", False),
+                bursts_this_session = burst_count,
+                cpu_percent         = cpu_pct,
+                memory_mb           = mem_mb,
+            )
+
+            # ── Log and check for critical threshold ──────────────────────────
+            if ok and ready:
                 logger.info(
                     f"  Burst {burst_idx:>4} | "
                     f"RUL={pm.get('rul_min', 0.0):>10.1f} min | "
                     f"status={pm.get('status', '—'):<8} | "
-                    f"drift={result.get('monitoring', {}).get('drift_detected', False)} | "
+                    f"latency={latency_ms:.1f}ms | "
+                    f"drift={monitoring.get('drift_detected', False)} | "
                     f"alert={pm.get('alert', False)}"
                 )
 
-                # Stop if critical threshold reached
                 if pm.get("status") == "critical":
                     logger.warning(
                         f"\n{'!'*60}\n"
@@ -496,7 +541,7 @@ def run_serving(
                     )
                     break
 
-            elif not result.get("ready"):
+            elif not ready:
                 logger.debug(
                     f"  Burst {burst_idx}: pipeline not ready yet "
                     f"(window warming up — {burst_count + 1}/{window_size})"
