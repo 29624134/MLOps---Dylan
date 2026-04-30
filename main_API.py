@@ -15,28 +15,38 @@ if hasattr(sys.stderr, "reconfigure"):
 import uvicorn
 
 
-def run_streamlit():
-    """Launch the Streamlit dashboard as a subprocess."""
+def _streamlit(script: str, port: int) -> None:
+    """Launch a Streamlit app as a subprocess on the given port."""
     subprocess.run(
-        [sys.executable, "-m", "streamlit", "run", "dashboard/app.py",
-         "--server.port", "8501",
-         "--server.headless", "true"],   # suppress the browser auto-open from Streamlit
+        [
+            sys.executable, "-m", "streamlit", "run", script,
+            "--server.port",     str(port),
+            "--server.headless", "true",   # suppress Streamlit's own browser pop-up
+        ],
         env={**os.environ, "PYTHONIOENCODING": "utf-8"},
     )
 
+
 if __name__ == "__main__":
-    # Start Streamlit in a background thread
-    streamlit_thread = threading.Thread(target=run_streamlit, daemon=True)
-    streamlit_thread.start()
+    # ── Start both Streamlit apps in background threads ───────────────────────
+    apps = [
+        ("dashboard/rul.py",          8501),   # RUL monitor
+        ("dashboard/fault_review.py", 8502),   # fault review
+    ]
+
+    for script, port in apps:
+        t = threading.Thread(target=_streamlit, args=(script, port), daemon=True)
+        t.start()
 
     print("=" * 55)
     print("  ⚙️  PHM MLOps System Starting")
     print("=" * 55)
-    print("  API docs  →  http://localhost:8000/docs")
-    print("  Dashboard →  http://localhost:8501")
+    print("  API docs      →  http://localhost:8000/docs")
+    print("  RUL Monitor   →  http://localhost:8501")
+    print("  Fault Review  →  http://localhost:8502")
     print("=" * 55)
 
-    # Run FastAPI (blocking — keeps the process alive)
+    # ── FastAPI (blocking — keeps the process alive) ──────────────────────────
     uvicorn.run(
         "API:app",
         host="0.0.0.0",

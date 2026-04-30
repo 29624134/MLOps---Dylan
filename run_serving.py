@@ -313,7 +313,28 @@ class LiveFeatureStoreReader:
             "data_quality":   inference_out.get("data_quality"),
         }
         try:
-            self._mon.insert_one(doc)
+
+            metrics = {
+                "run_id": run_id,
+                "recorded_at": datetime.now(timezone.utc).isoformat(),
+                "type": "monitoring_metrics",
+                "drift_detected": monitoring_out.get("drift_detected", False),
+                "drift_features": monitoring_out.get("drift_features", []),
+                "anomaly_flag": monitoring_out.get("anomaly_flag", False),
+                "baseline_ready": monitoring_out.get("baseline_ready", False),
+                "stats": monitoring_out.get("stats", {}),
+                "pm_status": pm_out.get("status"),
+                "rul_s": pm_out.get("rul_s"),
+                "rul_min": pm_out.get("rul_min"),
+                "alert": pm_out.get("alert", False),
+                "model_version": inference_out.get("model_version"),
+                "data_quality": inference_out.get("data_quality"),
+            }
+            self._mon.update_one(
+                {"bearing_name": bearing_name, "burst_idx": burst_idx},
+                {"$set": metrics},
+                upsert=True,
+            )
         except Exception as e:
             logger.warning(f"Could not write monitoring metrics: {e}")
 

@@ -7,7 +7,7 @@
     "Bearing1_5",
     "Bearing1_7"
   ],
-  "current_live_index": 2,
+  "current_live_index": 5,
   "bearings": [
     {
       "name": "Bearing1_1",
@@ -19,25 +19,25 @@
       "name": "Bearing1_2",
       "role": "live",
       "condition": 1,
-      "status": "extracted"
+      "status": "confirmed"
     },
     {
       "name": "Bearing1_3",
       "role": "live",
       "condition": 1,
-      "status": "denied"
+      "status": "confirmed"
     },
     {
       "name": "Bearing1_4",
       "role": "live",
       "condition": 1,
-      "status": "extracted"
+      "status": "confirmed"
     },
     {
       "name": "Bearing1_5",
       "role": "live",
       "condition": 1,
-      "status": "available"
+      "status": "confirmed"
     },
     {
       "name": "Bearing1_6",
@@ -49,7 +49,7 @@
       "name": "Bearing1_7",
       "role": "live",
       "condition": 1,
-      "status": "available"
+      "status": "confirmed"
     },
     {
       "name": "Bearing2_1",
