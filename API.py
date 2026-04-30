@@ -275,11 +275,11 @@ class RegisterWorkflowRequest(BaseModel):
 # ── Bearing lifecycle models ──────────────────────────────────────────────────
 
 class FaultConfirmRequest(BaseModel):
-    bearing_name:   str   = Field(..., json_schema_extra={"example": "Bearing1_5"})
-    run_id:         str   = Field(..., description="Workflow run_id that produced the features")
-    rul_at_failure: float = Field(0.0, description="Confirmed RUL at failure (seconds)")
-    worker_name:    str   = Field("Unknown", description="Maintenance tech name")
-    note:           str   = Field("", description="Optional note")
+    bearing_name:   str            = Field(..., description="Bearing being confirmed")
+    run_id:         Optional[str]  = Field(None, description="Workflow run_id (optional)")
+    rul_at_failure: float          = Field(0.0, description="Confirmed RUL at failure (seconds)")
+    worker_name:    str            = Field("Unknown", description="Maintenance tech name")
+    note:           str            = Field("", description="Optional note")
 
 class FaultDenyRequest(BaseModel):
     bearing_name: str = Field(..., json_schema_extra={"example": "Bearing1_5"})
@@ -939,7 +939,7 @@ def get_export_paths():
     Shown in the Dashboard → Retraining & Export Control page.
     """
     try:
-        from export_service.export_service import get_exporter
+        from utils.export_service import get_exporter
         exporter = get_exporter()
         return exporter.get_export_paths()
     except Exception as e:
