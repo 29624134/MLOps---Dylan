@@ -1,0 +1,136 @@
+{
+  "version": "1.0",
+  "created_at": "2026-04-01T10:30:10.011883",
+  "workflows": [
+    {
+      "workflow_id": "rul_prediction_v1",
+      "workflow_name": "rul_prediction",
+      "version": "1.0",
+      "status": "active",
+      "definition": {
+        "description": "PHM 2012 Bearing RUL Prediction Pipeline",
+        "version": "1.0",
+        "bearing_config": "config/bearings.json",
+        "mongodb": {
+          "enabled": true,
+          "uri": "mongodb://localhost:27017",
+          "db_name": "phm_mlops"
+        },
+        "steps": [
+          {
+            "id": "ingestion",
+            "type": "ingestion",
+            "config": {
+              "save_format": "parquet",
+              "state_base": "workflow_data/{run_id}/state",
+              "log_base": "workflow_data/{run_id}/logs"
+            }
+          },
+          {
+            "id": "feature_engineering",
+            "type": "feature_engineering",
+            "depends_on": ["ingestion"],
+            "config": {
+              "state_base": "workflow_data/{run_id}/state",
+              "log_base": "workflow_data/{run_id}/logs",
+              "burst_period": 10.0,
+              "failure_threshold": 20.0,
+              "n_consecutive": 1
+            }
+          },
+          {
+            "id": "validation",
+            "type": "validation",
+            "depends_on": ["feature_engineering"],
+            "config": {
+              "schema_path": "config/data_schema.json",
+              "output_location": "workflow_data/{run_id}/validation/validation.json",
+              "state_location": "workflow_data/{run_id}/state/validation.flag",
+              "log_path": "workflow_data/{run_id}/logs/validation.log"
+            }
+          },
+          {
+            "id": "training",
+            "type": "training",
+            "depends_on": ["validation"],
+            "config": {
+              "output_location": "workflow_data/{run_id}/models",
+              "state_location": "workflow_data/{run_id}/state/training.flag",
+              "log_path": "workflow_data/{run_id}/logs/training.log",
+              "window_size": 40,
+              "rul_scale": 30000.0,
+              "model_params": {
+                "horizon": 10,
+                "hidden_units": [128, 64],
+                "dropout": 0.25,
+                "epochs": 600,
+                "lr": 0.0001,
+                "batch_size": 32,
+                "patience": 30,
+                "seed": 42
+              }
+            }
+          },
+          {
+            "id": "model_selection",
+            "type": "model_selection",
+            "depends_on": ["training"],
+            "config": {
+              "metric": "mae_s",
+              "state_location": "workflow_data/{run_id}/state/model_selection.flag",
+              "log_path": "workflow_data/{run_id}/logs/model_selection.log"
+            }
+          },
+          {
+            "id": "live_serving",
+            "type": "live_serving",
+            "depends_on": ["model_selection"],
+            "config": {
+              "window_size": 40,
+              "burst_period": 10.0,
+              "realtime": false,
+              "output_base": "workflow_data/{run_id}/live",
+              "state_location": "workflow_data/{run_id}/state/live_serving.flag",
+              "log_path": "workflow_data/{run_id}/logs/live_serving.log"
+            }
+          },
+          {
+            "id": "serving_pipeline",
+            "type": "serving_pipeline",
+            "depends_on": ["live_serving"],
+            "config": {
+              "window_size": 40,
+              "burst_period": 10.0,
+              "realtime": false,
+              "critical_threshold_s": 3600,
+              "warning_threshold_s": 14400,
+              "baseline_path": "model_registry/monitoring_baseline.json",
+              "state_location": "workflow_data/{run_id}/state/serving_pipeline.flag",
+              "log_path": "workflow_data/{run_id}/logs/serving_pipeline.log"
+            }
+          }
+        ]
+      },
+      "trigger": {
+        "type": "manual",
+        "source": "bootstrap"
+      },
+      "git_hash": null,
+      "environment": {
+        "python": "3.9"
+      },
+      "registered_at": "2026-04-01T10:30:10.011883",
+      "approved_at": "2026-04-01T10:30:10.011883",
+      "approved_by": "bootstrap",
+      "activated_at": "2026-04-01T10:30:10.011883",
+      "deprecated_at": null,
+      "lineage": {
+        "parent_version": null
+      },
+      "metadata": {
+        "bootstrapped": true,
+        "source_file": "config/workflow.yaml"
+      }
+    }
+  ]
+}

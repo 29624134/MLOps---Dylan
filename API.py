@@ -1,32 +1,41 @@
 """
 API.py
 ═══════════════════════════════════════════════════════════════════════════════
-PHM 2012 RUL Prediction API
+PHM 2012 RUL Prediction API — group-aware edition.
 
 Process lifecycle
 ─────────────────
 The API owns the SCADA simulator and Serving Pipeline subprocesses via the
-ProcessManager singleton. This means:
+ProcessManager singleton.
 
   POST /workflow/trigger
-      → trains model (first run) / extracts features (subsequent runs)
-      → automatically starts scada_simulator.py + run_serving.py for the
-        current live bearing from bearings.json queue
+      → trains all 3 group models in parallel (first run)
+      → auto-starts scada_simulator.py + run_serving.py for each group's
+        current live bearing simultaneously
 
-  POST /bearing/continue  (after fault confirm/deny)
-      → stops old scada + serving processes
-      → advances bearing queue
-      → extracts features for new bearing
-      → starts scada_simulator.py + run_serving.py for new bearing
-      → if confirmed: also starts run_preprod.py in background
+  POST /bearing/confirm-fault
+      → pushes confirmed fault data to FS Mirrored (tagged with group)
+      → starts run_preprod.py --group N for ONLY the affected group
+      → other groups keep serving uninterrupted
+
+  POST /bearing/continue
+      → stops all current processes
+      → restarts SCADA + Serving for all groups with updated bearings
 
   GET /bearing/processes
-      → shows current subprocess status
+      → shows all subprocess statuses (SCADA + one serving per bearing)
+
+Champion files (one per group):
+    model_registry/champion_bearing1.json
+    model_registry/champion_bearing2.json
+    model_registry/champion_bearing3.json
+═══════════════════════════════════════════════════════════════════════════════
 """
 
 import io
 import logging
 import os
+import re
 import sys
 import uuid
 import subprocess
@@ -48,9 +57,20 @@ from utils.workflow_registry import WorkflowRegistry
 
 app = FastAPI(title="PHM 2012 RUL Prediction API", version="1.0.0")
 
-# ── Serving Pipeline router ───────────────────────────────────────────────────
 from serving_pipeline.serving_pipeline_routes import router as serving_router
 app.include_router(serving_router)
+
+MODEL_REGISTRY_DIR = "model_registry"
+
+
+def _group_from_bearing(bearing_name: str) -> Optional[str]:
+    """Infer group ID from bearing name. e.g. 'Bearing2_4' → '2'."""
+    m = re.match(r"Bearing(\d+)_\d+", bearing_name, re.IGNORECASE)
+    return m.group(1) if m else None
+
+
+def _champion_path(group: str) -> str:
+    return os.path.join(MODEL_REGISTRY_DIR, f"champion_bearing{group}.json")
 
 
 # ====================================================================
@@ -61,12 +81,15 @@ class ProcessManager:
     """
     Singleton that owns the SCADA simulator and Serving Pipeline subprocesses.
 
-    Ensures only one pair of processes runs at a time. When a new bearing
-    is started (via /bearing/continue), it stops the old processes first,
-    then starts fresh ones for the new bearing.
+    Group-aware design
+    ──────────────────
+    - One scada_simulator.py handles ALL groups simultaneously (--bearing B1 B2 B3)
+    - One run_serving.py per bearing, each using its group's champion file
+    - One run_preprod.py per fault confirmation (group-scoped, --group N)
 
-    Processes are started with Popen so they run independently of the API
-    but are tracked so they can be stopped cleanly.
+    start_bearing(bearing_names) accepts the current live bearing from each group.
+    stop_all() terminates SCADA + all serving processes.
+    start_preprod(run_id, group) launches group-scoped retraining only.
     """
 
     _instance = None
@@ -74,115 +97,261 @@ class ProcessManager:
     def __new__(cls):
         if cls._instance is None:
             cls._instance = super().__new__(cls)
-            cls._instance._scada_proc   = None
-            cls._instance._serving_proc = None
-            cls._instance._preprod_proc = None
-            cls._instance._current_bearing = None
+            cls._instance._scada_proc       = None
+            cls._instance._serving_procs    = []
+            cls._instance._preprod_procs    = {}   # group → proc (one per group)
+            cls._instance._current_bearings = []
         return cls._instance
 
     # ── Start / Stop ──────────────────────────────────────────────────────────
 
-    def start_bearing(self, bearing_name: str, realtime: bool = False) -> Dict:
+    def start_bearing(
+        self,
+        bearing_names: List[str],
+        realtime: bool = False,
+    ) -> Dict:
         """
-        Stop any existing processes and start fresh scada + serving for bearing_name.
+        Stop existing processes and start fresh SCADA + Serving for the
+        given bearings (one per group, 1–3 total).
+
+        Each bearing gets its own run_serving.py instance. The champion file
+        is inferred from the bearing's group (Bearing1_x → champion_bearing1.json).
 
         Parameters
         ----------
-        bearing_name : str  — e.g. "Bearing1_5"
-        realtime     : bool — if True, scada sleeps 10 s between bursts
-
-        Returns dict with process PIDs.
+        bearing_names : list of str — one live bearing per group (1–3)
+        realtime      : bool — if True, SCADA sleeps burst_period between bursts
         """
-        # Stop existing processes first
+        if isinstance(bearing_names, str):
+            bearing_names = [bearing_names]
+
         self.stop_all()
 
-        logger.info(f"[ProcessManager] Starting SCADA + Serving for {bearing_name}")
+        logger.info(f"[ProcessManager] Starting SCADA + Serving for {bearing_names}")
 
-        # Build command for scada_simulator.py
-        scada_cmd = [
-            sys.executable, "scada_simulator.py",
-            "--bearing", bearing_name,
-        ]
+        env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
+
+        # ── One SCADA simulator for all bearings (lock-step streaming) ────────
+        scada_cmd = [sys.executable, "scada_simulator.py", "--bearing", *bearing_names]
         if realtime:
             scada_cmd.append("--realtime")
 
-        # Build command for run_serving.py
-        serving_cmd = [
-            sys.executable, "run_serving.py",
-            "--bearing", bearing_name,
-        ]
-
-        env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
-
         try:
-            self._scada_proc = subprocess.Popen(
-                scada_cmd,
-                env=env,
-                stdout=None,   # prints directly to API terminal
-                stderr=None,
-            )
-            self._serving_proc = subprocess.Popen(
-                serving_cmd,
-                env=env,
-                stdout=None,   # prints directly to API terminal
-                stderr=None,
-            )
-            self._current_bearing = bearing_name
-
+            self._scada_proc = subprocess.Popen(scada_cmd, env=env)
             logger.info(
                 f"[ProcessManager] SCADA PID={self._scada_proc.pid}  "
-                f"Serving PID={self._serving_proc.pid}"
+                f"bearings={bearing_names}"
             )
-
-            return {
-                "bearing":      bearing_name,
-                "scada_pid":    self._scada_proc.pid,
-                "serving_pid":  self._serving_proc.pid,
-            }
-
         except Exception as e:
-            logger.error(f"[ProcessManager] Failed to start processes: {e}")
+            logger.error(f"[ProcessManager] Failed to start SCADA: {e}")
             self.stop_all()
-            raise RuntimeError(f"Could not start bearing processes: {e}")
+            raise RuntimeError(f"Could not start SCADA process: {e}")
 
-    def start_preprod(self, run_id: str) -> Optional[int]:
-        """
-        Launch run_preprod.py as a background subprocess.
-        Only one preprod process runs at a time — previous one is terminated first.
-        """
-        if self._preprod_proc and self._preprod_proc.poll() is None:
-            logger.info(
-                f"[ProcessManager] Terminating previous preprod "
-                f"(PID={self._preprod_proc.pid})"
+        # ── One run_serving.py per bearing, each pointing at its group champion ─
+        self._serving_procs = []
+        for bearing_name in bearing_names:
+            group = _group_from_bearing(bearing_name)
+            champ = _champion_path(group) if group else os.path.join(
+                MODEL_REGISTRY_DIR, "champion.json"
             )
-            self._preprod_proc.terminate()
+            serving_cmd = [
+                sys.executable, "run_serving.py",
+                "--bearing",  bearing_name,
+                "--champion", champ,
+            ]
+            try:
+                proc = subprocess.Popen(serving_cmd, env=env)
+                self._serving_procs.append((bearing_name, proc))
+                logger.info(
+                    f"[ProcessManager] Serving PID={proc.pid}  "
+                    f"bearing={bearing_name}  champion={champ}"
+                )
+            except Exception as e:
+                logger.error(
+                    f"[ProcessManager] Failed to start serving for {bearing_name}: {e}"
+                )
+                self.stop_all()
+                raise RuntimeError(
+                    f"Could not start serving for {bearing_name}: {e}"
+                )
+
+        self._current_bearings = list(bearing_names)
+
+        return {
+            "bearings":     bearing_names,
+            "scada_pid":    self._scada_proc.pid,
+            "serving_pids": {
+                name: proc.pid for name, proc in self._serving_procs
+            },
+        }
+
+    def start_preprod(self, run_id: str, group: str) -> Optional[int]:
+        """
+        Launch run_preprod.py --group N as a background subprocess.
+
+        Each group has its own independent preprod process slot — confirming
+        Group 2 never interrupts Group 1's retraining, and vice versa.
+        If a previous preprod for the SAME group is still running it is
+        terminated first (e.g. a second fault confirmation on the same group).
+
+        Parameters
+        ----------
+        run_id : str — unique run identifier
+        group  : str — "1", "2", or "3"
+        """
+        # Only terminate the previous process for THIS group
+        existing = self._preprod_procs.get(group)
+        if existing and existing.poll() is None:
+            logger.info(
+                f"[ProcessManager] Terminating previous Group {group} preprod "
+                f"(PID={existing.pid})"
+            )
+            existing.terminate()
 
         env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
         try:
-            self._preprod_proc = subprocess.Popen(
-                [sys.executable, "run_preprod.py", "--run_id", run_id],
+            proc = subprocess.Popen(
+                [
+                    sys.executable, "run_preprod.py",
+                    "--run_id", run_id,
+                    "--group",  group,
+                ],
                 env=env,
-                stdout=None,   # prints directly to API terminal
-                stderr=None,
             )
+            self._preprod_procs[group] = proc
             logger.info(
-                f"[ProcessManager] Pre-Production started "
-                f"(PID={self._preprod_proc.pid}, run_id={run_id})"
+                f"[ProcessManager] Pre-Production started — "
+                f"Group {group}  PID={proc.pid}  run_id={run_id}"
             )
-            return self._preprod_proc.pid
+            return proc.pid
         except Exception as e:
             logger.error(f"[ProcessManager] Failed to start run_preprod.py: {e}")
             return None
 
-    def stop_all(self):
-        """Gracefully terminate scada and serving processes."""
-        for name, proc in [
-            ("SCADA",   self._scada_proc),
-            ("Serving", self._serving_proc),
-        ]:
+    def restart_group(
+        self,
+        group:        str,
+        new_bearing:  str,
+        all_bearings: list,
+        realtime:     bool = False,
+    ) -> Dict:
+        """
+        Restart ONLY the serving process for one group's new bearing,
+        while keeping all other groups' serving processes running.
+
+        Since SCADA streams all bearings in one process, we must:
+          1. Stop the SCADA process (affects all groups temporarily)
+          2. Stop only the old serving process for this group
+          3. Restart SCADA with the full updated bearing list
+          4. Start a new serving process for the new bearing only
+
+        Other groups' serving processes are NOT touched — they idle briefly
+        while SCADA restarts (their Feature Store poll loop just waits),
+        then resume normally once SCADA is back up.
+
+        Parameters
+        ----------
+        group        : str  — group ID being advanced ("1", "2", or "3")
+        new_bearing  : str  — the new bearing name for this group
+        all_bearings : list — full list of current live bearings across ALL groups
+        realtime     : bool — realtime mode for SCADA
+        """
+        logger.info(
+            f"[ProcessManager] Restarting Group {group} → {new_bearing}. "
+            f"Other groups keep serving."
+        )
+
+        env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
+
+        # ── Stop SCADA (needed to update bearing list) ────────────────────────
+        if self._scada_proc and self._scada_proc.poll() is None:
+            logger.info(f"[ProcessManager] Stopping SCADA (PID={self._scada_proc.pid})")
+            self._scada_proc.terminate()
+            try:
+                self._scada_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self._scada_proc.kill()
+        self._scada_proc = None
+
+        # ── Stop only the serving process for this group ──────────────────────
+        remaining = []
+        for bearing_name, proc in self._serving_procs:
+            grp = _group_from_bearing(bearing_name)
+            if grp == group:
+                if proc and proc.poll() is None:
+                    logger.info(
+                        f"[ProcessManager] Stopping Serving [{bearing_name}] "
+                        f"(PID={proc.pid})"
+                    )
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                # Do not re-add this group's old bearing
+            else:
+                remaining.append((bearing_name, proc))  # keep other groups
+
+        self._serving_procs    = remaining
+        self._current_bearings = [b for b in self._current_bearings
+                                  if _group_from_bearing(b) != group]
+
+        # ── Restart SCADA with the full updated bearing list ──────────────────
+        scada_cmd = [sys.executable, "scada_simulator.py",
+                     "--bearing", *all_bearings]
+        if realtime:
+            scada_cmd.append("--realtime")
+
+        try:
+            self._scada_proc = subprocess.Popen(scada_cmd, env=env)
+            logger.info(
+                f"[ProcessManager] SCADA restarted PID={self._scada_proc.pid}  "
+                f"bearings={all_bearings}"
+            )
+        except Exception as e:
+            logger.error(f"[ProcessManager] Failed to restart SCADA: {e}")
+            raise RuntimeError(f"Could not restart SCADA: {e}")
+
+        # ── Start new serving process for the new bearing only ────────────────
+        champ       = _champion_path(group)
+        serving_cmd = [
+            sys.executable, "run_serving.py",
+            "--bearing",  new_bearing,
+            "--champion", champ,
+        ]
+        try:
+            proc = subprocess.Popen(serving_cmd, env=env)
+            self._serving_procs.append((new_bearing, proc))
+            self._current_bearings.append(new_bearing)
+            logger.info(
+                f"[ProcessManager] Serving started PID={proc.pid}  "
+                f"bearing={new_bearing}  champion={champ}"
+            )
+        except Exception as e:
+            logger.error(f"[ProcessManager] Failed to start serving for {new_bearing}: {e}")
+            raise RuntimeError(f"Could not start serving for {new_bearing}: {e}")
+
+        return {
+            "group":         group,
+            "new_bearing":   new_bearing,
+            "scada_pid":     self._scada_proc.pid,
+            "serving_pid":   proc.pid,
+            "all_bearings":  all_bearings,
+        }
+        """Gracefully terminate SCADA and all serving processes."""
+        if self._scada_proc and self._scada_proc.poll() is None:
+            logger.info(f"[ProcessManager] Stopping SCADA (PID={self._scada_proc.pid})")
+            self._scada_proc.terminate()
+            try:
+                self._scada_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self._scada_proc.kill()
+
+        for bearing_name, proc in self._serving_procs:
             if proc and proc.poll() is None:
                 logger.info(
-                    f"[ProcessManager] Stopping {name} (PID={proc.pid})"
+                    f"[ProcessManager] Stopping Serving [{bearing_name}] "
+                    f"(PID={proc.pid})"
                 )
                 proc.terminate()
                 try:
@@ -190,25 +359,57 @@ class ProcessManager:
                 except subprocess.TimeoutExpired:
                     proc.kill()
 
-        self._scada_proc      = None
-        self._serving_proc    = None
-        self._current_bearing = None
+        self._scada_proc       = None
+        self._serving_procs    = []
+        self._current_bearings = []
+        # Note: preprod processes are NOT stopped here — retraining continues
+        # uninterrupted even when SCADA + Serving restarts for a new bearing.
 
-    # ── Status ────────────────────────────────────────────────────────────────
+    def stop_all(self):
+        """Gracefully terminate SCADA and all serving processes."""
+        if self._scada_proc and self._scada_proc.poll() is None:
+            logger.info(f"[ProcessManager] Stopping SCADA (PID={self._scada_proc.pid})")
+            self._scada_proc.terminate()
+            try:
+                self._scada_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self._scada_proc.kill()
+
+        for bearing_name, proc in self._serving_procs:
+            if proc and proc.poll() is None:
+                logger.info(
+                    f"[ProcessManager] Stopping Serving [{bearing_name}] "
+                    f"(PID={proc.pid})"
+                )
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+
+        self._scada_proc       = None
+        self._serving_procs    = []
+        self._current_bearings = []
+        # Note: preprod processes are NOT stopped — retraining continues
+        # uninterrupted even when SCADA + Serving restarts.
 
     def status(self) -> Dict:
-        """Return current process status."""
-        def _proc_status(proc, name):
+        def _ps(proc, name):
             if proc is None:
                 return {"name": name, "running": False, "pid": None}
-            running = proc.poll() is None
-            return {"name": name, "running": running, "pid": proc.pid}
+            return {"name": name, "running": proc.poll() is None, "pid": proc.pid}
 
         return {
-            "current_bearing": self._current_bearing,
-            "scada":           _proc_status(self._scada_proc,   "scada_simulator"),
-            "serving":         _proc_status(self._serving_proc, "run_serving"),
-            "preprod":         _proc_status(self._preprod_proc, "run_preprod"),
+            "current_bearings": self._current_bearings,
+            "scada":            _ps(self._scada_proc, "scada_simulator"),
+            "serving":          {
+                name: _ps(proc, f"run_serving [{name}]")
+                for name, proc in self._serving_procs
+            },
+            "preprod": {
+                group: _ps(proc, f"run_preprod [group {group}]")
+                for group, proc in self._preprod_procs.items()
+            },
         }
 
 
@@ -221,20 +422,16 @@ _process_manager = ProcessManager()
 # ====================================================================
 
 class WorkflowTriggerRequest(BaseModel):
-    workflow_name:    str                      = "rul_prediction"
-    config_overrides: Optional[Dict[str, Any]] = None
-    priority:         str                      = Field(
+    workflow_name:      str                      = "rul_prediction"
+    config_overrides:   Optional[Dict[str, Any]] = None
+    priority:           str                      = Field(
         default="normal", pattern="^(low|normal|high)$"
     )
-    # If True, automatically start SCADA + Serving after workflow completes
     auto_start_serving: bool = Field(
         True,
-        description="Auto-start SCADA simulator and Serving pipeline after workflow"
+        description="Auto-start SCADA + Serving for all group live bearings after training"
     )
-    realtime: bool = Field(
-        False,
-        description="Run SCADA simulator in realtime mode (10 s between bursts)"
-    )
+    realtime: bool = Field(False, description="Run SCADA simulator in realtime mode")
 
 class WorkflowStatusResponse(BaseModel):
     run_id:     str
@@ -255,9 +452,13 @@ class RULPredictionResponse(BaseModel):
     timestamp:         str
 
 class LiveServingRequest(BaseModel):
-    bearing_name: str
-    realtime:     bool          = False
-    max_bursts:   Optional[int] = None
+    bearing_names: List[str] = Field(
+        ...,
+        description="One live bearing per group (1–3 total)",
+        min_items=1,
+        max_items=3,
+    )
+    realtime: bool = False
 
 class RegisterWorkflowRequest(BaseModel):
     workflow_name: str
@@ -268,18 +469,12 @@ class RegisterWorkflowRequest(BaseModel):
     environment:   Optional[Dict[str, str]] = None
     metadata:      Optional[Dict[str, Any]] = None
 
-# ── Bearing lifecycle models ──────────────────────────────────────────────────
-
-# ── Bearing lifecycle models ──────────────────────────────────────────────────
-
-# ── Bearing lifecycle models ──────────────────────────────────────────────────
-
 class FaultConfirmRequest(BaseModel):
-    bearing_name:   str            = Field(..., description="Bearing being confirmed")
-    run_id:         Optional[str]  = Field(None, description="Workflow run_id (optional)")
-    rul_at_failure: float          = Field(0.0, description="Confirmed RUL at failure (seconds)")
-    worker_name:    str            = Field("Unknown", description="Maintenance tech name")
-    note:           str            = Field("", description="Optional note")
+    bearing_name:   str           = Field(..., description="Bearing being confirmed")
+    run_id:         Optional[str] = Field(None)
+    rul_at_failure: float         = Field(0.0, description="Confirmed RUL at failure (s)")
+    worker_name:    str           = Field("Unknown")
+    note:           str           = Field("")
 
 class FaultDenyRequest(BaseModel):
     bearing_name: str = Field(..., json_schema_extra={"example": "Bearing1_5"})
@@ -287,23 +482,13 @@ class FaultDenyRequest(BaseModel):
     note:         str = Field("")
 
 class ContinueRequest(BaseModel):
+    bearing_name:    str  = Field(..., description="The bearing that was just confirmed or denied")
     worker_name:     str  = Field("Unknown")
-    trigger_new_run: bool = Field(
-        True, description="Immediately start extraction + serving for next bearing"
-    )
-    realtime: bool = Field(
-        False, description="Run SCADA simulator in realtime mode for new bearing"
-    )
-
-
-# ── New models for pre-prod trigger and audit flush ───────────────────────────
-
-class PreprodTriggerRequest(BaseModel):
-    workflow_name: str = Field("rul_prediction")
-
+    trigger_new_run: bool = Field(True)
+    realtime:        bool = Field(False)
 
 class AuditFlushRequest(BaseModel):
-    bearing_name: str = Field(..., description="Bearing to flush audit records for")
+    bearing_name: str = Field(...)
     limit:        int = Field(500, ge=1, le=10000)
 
 
@@ -319,17 +504,14 @@ async def trigger_workflow(
     """
     Trigger the full workflow.
 
-    First run:  ingest → extract → train → deploy model
-    Subsequent: extract only (deployed model already exists)
+    First run: trains all 3 group models in parallel, then auto-starts
+    SCADA + Serving for each group's current live bearing.
 
-    After the workflow completes, automatically starts the SCADA simulator
-    and Serving Pipeline for the current live bearing (unless
-    auto_start_serving=False).
+    Subsequent runs: all training skipped (champions exist), serving
+    is started directly.
     """
     run_id = f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
-    background_tasks.add_task(
-        execute_workflow_async, run_id, request
-    )
+    background_tasks.add_task(execute_workflow_async, run_id, request)
     return {"run_id": run_id, "status": "queued"}
 
 
@@ -355,11 +537,8 @@ async def execute_workflow_async(run_id: str, request: WorkflowTriggerRequest):
     """
     Full workflow background task.
 
-    Runs start_workflow() which automatically detects whether a deployed
-    model exists and skips training if so.
-
-    After completion, starts SCADA simulator + Serving Pipeline for the
-    current live bearing automatically (if auto_start_serving=True).
+    Trains all 3 group models in parallel (first run only), then
+    auto-starts SCADA + Serving for all groups' current live bearings.
     """
     try:
         from orchestrator import WorkflowExecutor, BearingRegistry
@@ -369,24 +548,28 @@ async def execute_workflow_async(run_id: str, request: WorkflowTriggerRequest):
             config_overrides = request.config_overrides,
         )
 
-        # ── Auto-start SCADA + Serving after workflow completes ───────────────
         if request.auto_start_serving:
-            reg     = BearingRegistry("config/bearings.json")
-            bearing = reg.current_live_bearing()
-            if bearing:
-                logger.info(
-                    f"[{run_id}] Workflow complete — auto-starting SCADA + "
-                    f"Serving for {bearing['name']}"
-                )
+            reg = BearingRegistry("config/bearings.json")
+            live_bearings = []
+            for group in reg.all_groups():
+                bearing = reg.current_live_bearing(group)
+                if bearing:
+                    live_bearings.append(bearing["name"])
+                    logger.info(
+                        f"[{run_id}] Group {group}: serving {bearing['name']}"
+                    )
+                else:
+                    logger.warning(
+                        f"[{run_id}] Group {group}: queue exhausted — skipping."
+                    )
+
+            if live_bearings:
                 _process_manager.start_bearing(
-                    bearing_name=bearing["name"],
+                    bearing_names=live_bearings,
                     realtime=request.realtime,
                 )
             else:
-                logger.warning(
-                    f"[{run_id}] Workflow complete — no live bearing in queue, "
-                    f"SCADA + Serving not started."
-                )
+                logger.warning(f"[{run_id}] No live bearings found in any group.")
 
     except Exception as e:
         from orchestrator import WorkflowStateManager
@@ -401,39 +584,33 @@ async def execute_workflow_async(run_id: str, request: WorkflowTriggerRequest):
 
 
 # ====================================================================
-# PRE-PRODUCTION RETRAINING  (Dashboard → AutoTrain dashed arrow)
+# PRE-PRODUCTION RETRAINING
 # ====================================================================
 
 @app.post("/preprod/trigger", tags=["Pre-Production"])
-async def trigger_preprod_retraining():
+async def trigger_preprod_retraining(group: str):
     """
-    Dashboard → AutoTrain: manually trigger Pre-Production retraining.
-
-    Starts run_preprod.py in the background. The Serving Pipeline continues
-    uninterrupted — model hot-swap happens automatically if the new model
-    outperforms the current champion.
-
-    This implements the dashed arrow:
-        Dashboard -.Retraining Triggered.-> AutoTrain  (V9 diagram)
+    Manually trigger Pre-Production retraining for a specific group.
+    Only the specified group's model is retrained — other groups keep
+    serving uninterrupted.
     """
+    if group not in ("1", "2", "3"):
+        raise HTTPException(status_code=400, detail="group must be '1', '2', or '3'")
+
     preprod_run_id = (
-        f"preprod_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        f"preprod_g{group}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         f"_{uuid.uuid4().hex[:6]}"
     )
     try:
-        preprod_pid = _process_manager.start_preprod(preprod_run_id)
-        logger.info(
-            f"[preprod/trigger] Manual retraining triggered from Dashboard — "
-            f"run_id={preprod_run_id}  PID={preprod_pid}"
-        )
+        preprod_pid = _process_manager.start_preprod(preprod_run_id, group=group)
         return {
             "status":         "started",
+            "group":          group,
             "preprod_run_id": preprod_run_id,
             "preprod_pid":    preprod_pid,
             "message": (
-                "Pre-Production retraining started in background. "
-                "Serving Pipeline continues uninterrupted. "
-                f"Poll /workflow/{preprod_run_id}/status for progress."
+                f"Group {group} retraining started. "
+                f"Other groups continue serving uninterrupted."
             ),
         }
     except Exception as e:
@@ -441,25 +618,21 @@ async def trigger_preprod_retraining():
 
 
 # ====================================================================
-# PROCESS STATUS ENDPOINT
+# PROCESS STATUS
 # ====================================================================
 
 @app.get("/bearing/processes", tags=["Bearing Lifecycle"])
 def get_process_status():
-    """
-    Return the current status of the SCADA simulator, Serving Pipeline,
-    and Pre-Production subprocesses managed by the API.
-    """
+    """Current status of SCADA, all Serving pipelines, and Pre-Production."""
     return _process_manager.status()
 
 
 # ====================================================================
-# RUL PREDICTION ENDPOINT  (single feature vector, synchronous)
+# RUL PREDICTION (single feature vector, synchronous)
 # ====================================================================
 
 @app.post("/predict/rul", response_model=RULPredictionResponse)
 async def predict_rul(request: RULPredictionRequest):
-    """Predict RUL for a single burst feature vector."""
     try:
         registry    = ModelRegistry()
         model_entry = registry.get_deployed_model("RUL_s")
@@ -467,17 +640,13 @@ async def predict_rul(request: RULPredictionRequest):
             raise HTTPException(status_code=404, detail="No deployed model found.")
 
         from Live_implementation.live_predictor import LivePredictor
-        predictor = LivePredictor.from_path(model_entry["model_path"])
-
-        feature_vec = np.array(
-            list(request.features.values()), dtype=np.float32
-        )
-        rul_s   = float(predictor.predict(feature_vec))
-        rul_min = rul_s / 60.0
+        predictor   = LivePredictor.from_path(model_entry["model_path"])
+        feature_vec = np.array(list(request.features.values()), dtype=np.float32)
+        rul_s       = float(predictor.predict(feature_vec))
 
         return RULPredictionResponse(
             predicted_rul_s=rul_s,
-            predicted_rul_min=rul_min,
+            predicted_rul_min=rul_s / 60.0,
             horizon=10,
             model_version=model_entry["model_id"],
             timestamp=datetime.now().isoformat(),
@@ -598,56 +767,45 @@ async def get_workflow(workflow_id: str):
 @app.get("/bearing/current", operation_id="get_current_bearing",
          tags=["Bearing Lifecycle"])
 def get_current_bearing():
-    """Return the bearing currently at the head of the live queue."""
+    """Return the current live bearing for each group."""
     from orchestrator import BearingRegistry
-    reg     = BearingRegistry("config/bearings.json")
-    bearing = reg.current_live_bearing()
-    if not bearing:
-        return {"current_bearing": None, "queue_exhausted": True}
-    return {
-        "current_bearing": bearing,
-        "queue_index":     reg.current_live_index,
-        "queue_length":    len(reg.live_queue),
-        "remaining":       len(reg.live_queue) - reg.current_live_index,
-    }
+    reg = BearingRegistry("config/bearings.json")
+    result = {}
+    for group in reg.all_groups():
+        b = reg.current_live_bearing(group)
+        result[f"group_{group}"] = b["name"] if b else None
+    return result
 
 
 @app.get("/bearing/queue", operation_id="get_bearing_queue",
          tags=["Bearing Lifecycle"])
 def get_bearing_queue():
-    """Show the full live bearing queue and current position."""
+    """Show all group queues and their current positions."""
     from orchestrator import BearingRegistry
     reg = BearingRegistry("config/bearings.json")
-    queue_detail = []
-    for i, name in enumerate(reg.live_queue):
-        bearing = reg.get_bearing(name)
-        queue_detail.append({
-            "index":      i,
-            "name":       name,
-            "status":     bearing.get("status", "unknown") if bearing else "not found",
-            "is_current": i == reg.current_live_index,
-        })
-    return {
-        "queue":         queue_detail,
-        "current_index": reg.current_live_index,
-        "queue_length":  len(reg.live_queue),
-    }
+    result = {}
+    for group in reg.all_groups():
+        grp_cfg = reg.groups[group]
+        queue   = grp_cfg.get("live_bearing_queue", [])
+        idx     = grp_cfg.get("current_live_index", 0)
+        result[f"group_{group}"] = {
+            "queue":         queue,
+            "current_index": idx,
+            "current":       queue[idx] if idx < len(queue) else None,
+            "remaining":     len(queue) - idx,
+        }
+    return result
 
 
 @app.post("/bearing/reset-queue", operation_id="reset_bearing_queue",
           tags=["Bearing Lifecycle"])
 def reset_bearing_queue():
     """
-    Reset the live bearing queue back to the first bearing.
-    Sets current_live_index to 0 and resets all live bearing statuses
-    back to 'available'. Also stops any running processes.
-    Does not delete any files from disk.
+    Reset all group queues back to index 0.
+    Stops all running processes. Resets all live bearing statuses to 'available'.
     """
     from orchestrator import BearingRegistry
-
-    # Stop running processes before reset
     _process_manager.stop_all()
-
     reg = BearingRegistry("config/bearings.json")
 
     reset_bearings = []
@@ -656,18 +814,13 @@ def reset_bearing_queue():
             reg.set_status(b["name"], "available")
             reset_bearings.append(b["name"])
 
-    reg.current_live_index = 0
+    for group in reg.all_groups():
+        reg.groups[group]["current_live_index"] = 0
     reg._save()
 
-    first = reg.current_live_bearing()
-    logger.info(
-        f"[reset-queue] Queue reset to index 0. "
-        f"Bearings reset to available: {reset_bearings}"
-    )
+    logger.info(f"[reset-queue] All group queues reset. Bearings reset: {reset_bearings}")
     return {
         "status":         "reset",
-        "current_index":  0,
-        "first_bearing":  first["name"] if first else None,
         "bearings_reset": reset_bearings,
     }
 
@@ -679,13 +832,12 @@ def confirm_fault(request: FaultConfirmRequest):
     Maintenance tech confirms a fault.
 
     1. Re-labels features.csv with confirmed RUL values.
-    2. Pushes labelled data to MongoDB 'confirmed_faults' (Feature Store Mirrored).
+    2. Pushes labelled data to MongoDB feature_store_mirrored (tagged with group).
     3. Sets bearing status → 'confirmed'.
-    4. Immediately starts run_preprod.py retraining in the background.
-       Serving pipeline continues uninterrupted — hot-swap happens automatically
-       when retraining completes and new model is better.
+    4. Starts run_preprod.py --group N for ONLY the affected group.
+       Other groups' models and serving pipelines are completely unaffected.
 
-    Call POST /bearing/continue afterwards to advance to the next bearing.
+    Call POST /bearing/continue afterwards to advance this group's queue.
     """
     from orchestrator import WorkflowExecutor
     try:
@@ -696,27 +848,36 @@ def confirm_fault(request: FaultConfirmRequest):
             rul_at_failure = request.rul_at_failure,
         )
 
-        # Start retraining immediately — no need to wait for Continue
-        preprod_run_id = f"preprod_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
-        preprod_pid    = _process_manager.start_preprod(preprod_run_id)
+        group = result.get("group")
+        if not group:
+            raise ValueError(
+                f"Could not determine group for bearing {request.bearing_name}"
+            )
+
+        preprod_run_id = (
+            f"preprod_g{group}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            f"_{uuid.uuid4().hex[:6]}"
+        )
+        preprod_pid = _process_manager.start_preprod(preprod_run_id, group=group)
         logger.info(
-            f"[confirm-fault] Fault confirmed for {request.bearing_name} — "
-            f"Pre-Production retraining started immediately "
-            f"(PID={preprod_pid}, run_id={preprod_run_id})"
+            f"[confirm-fault] {request.bearing_name} confirmed (Group {group}) — "
+            f"retraining started (PID={preprod_pid}, run_id={preprod_run_id})"
         )
 
         return {
             "status":          "confirmed",
             "bearing":         request.bearing_name,
+            "group":           group,
             "worker":          request.worker_name,
             "confirmed_at":    datetime.now().isoformat(),
             "store_result":    result,
             "preprod_run_id":  preprod_run_id,
             "preprod_pid":     preprod_pid,
-            "message":         (
-                f"Fault confirmed. Confirmed fault data pushed to FS Mirrored. "
-                f"Retraining started in background (run_id={preprod_run_id}). "
-                f"Serving pipeline continues — model will hot-swap if new model is better."
+            "message": (
+                f"Fault confirmed. Group {group} data pushed to FS Mirrored. "
+                f"Group {group} retraining started (run_id={preprod_run_id}). "
+                f"Other groups continue serving uninterrupted. "
+                f"Model will hot-swap if new model is better."
             ),
         }
     except FileNotFoundError as e:
@@ -730,7 +891,7 @@ def confirm_fault(request: FaultConfirmRequest):
 def deny_fault(request: FaultDenyRequest):
     """
     Maintenance tech denies the fault (false positive).
-    Sets bearing status → 'denied'. Features NOT pushed to Feature Store.
+    Sets bearing status → 'denied'. No retraining triggered.
     Call POST /bearing/continue to advance the queue.
     """
     from orchestrator import BearingRegistry
@@ -745,6 +906,7 @@ def deny_fault(request: FaultDenyRequest):
     return {
         "status":    "denied",
         "bearing":   request.bearing_name,
+        "group":     bearing.get("group"),
         "worker":    request.worker_name,
         "denied_at": datetime.now().isoformat(),
     }
@@ -759,108 +921,143 @@ def continue_to_next_bearing(
     """
     Tech clicks 'Continue' after confirming or denying a fault.
 
-    1. Stops current SCADA simulator + Serving Pipeline processes.
-    2. Advances the live bearing queue to the next bearing.
-    3. Fires a background task that extracts features for the new bearing
-       then starts fresh SCADA + Serving processes for it.
-
-    Note: retraining is triggered immediately on fault confirmation
-    (POST /bearing/confirm-fault), not here.
+    1. Determines which group the bearing belongs to.
+    2. Advances ONLY that group's queue index.
+    3. Restarts ONLY that group's serving process + SCADA with updated list.
+       All other groups' serving processes keep running uninterrupted.
     """
     from orchestrator import BearingRegistry
 
-    # Stop current processes before advancing
-    _process_manager.stop_all()
+    reg   = BearingRegistry("config/bearings.json")
+    group = reg.group_of(request.bearing_name)
 
-    reg    = BearingRegistry("config/bearings.json")
-    next_b = reg.advance_live_bearing()
+    if not group:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot determine group for bearing '{request.bearing_name}'."
+        )
 
-    if not next_b:
-        return {
-            "status":       "queue_exhausted",
-            "next_bearing": None,
-            "message":      "All live bearings have been processed.",
-        }
+    # Advance only this group's queue
+    next_b = reg.advance_live_bearing(group)
+    logger.info(
+        f"[continue] Group {group} advanced — "
+        f"next bearing: {next_b['name'] if next_b else 'queue exhausted'}"
+    )
 
     run_id = None
-    if request.trigger_new_run:
+    if request.trigger_new_run and next_b:
         run_id = (
             f"bearing_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
             f"_{uuid.uuid4().hex[:6]}"
         )
         background_tasks.add_task(
-            _run_bearing_workflow_bg,
+            _restart_group_bg,
             run_id,
+            group,
             next_b["name"],
             request.realtime,
         )
+    elif not next_b:
+        # Queue exhausted for this group — just stop its processes
+        background_tasks.add_task(
+            _stop_group_bg, group
+        )
 
     return {
-        "status":       "advanced",
-        "next_bearing": next_b,
-        "run_id":       run_id,
+        "status":         "continued",
+        "group_advanced": group,
+        "next_bearing":   next_b["name"] if next_b else None,
+        "run_id":         run_id,
         "message": (
-            f"Now serving {next_b['name']}. "
-            + (f"Background run {run_id} started." if run_id else "")
+            f"Group {group} advanced to "
+            f"{'queue exhausted' if not next_b else next_b['name']}. "
+            f"Other groups continue uninterrupted."
+            + (f" Background run {run_id} started." if run_id else "")
         ),
     }
 
 
-async def _run_bearing_workflow_bg(
-    run_id:       str,
-    bearing_name: str,
-    realtime:     bool,
+async def _restart_group_bg(
+    run_id:      str,
+    group:       str,
+    new_bearing: str,
+    realtime:    bool,
 ):
     """
-    Background task triggered by POST /bearing/continue.
-
-    1. Extracts features for the new bearing
-    2. Starts SCADA simulator + Serving Pipeline subprocesses
-
-    Note: retraining (run_preprod.py) is triggered immediately on
-    POST /bearing/confirm-fault, not here.
+    Restart only one group's serving process + SCADA.
+    Other groups keep running untouched.
     """
-    from orchestrator import WorkflowExecutor, WorkflowStateManager, BearingRegistry
+    from orchestrator import BearingRegistry
+    reg = BearingRegistry("config/bearings.json")
 
-    state_mgr = WorkflowStateManager()
-    state_mgr.init_state(run_id, "bearing_continue")
+    # Build the full updated bearing list across all groups
+    all_bearings = []
+    for g in reg.all_groups():
+        b = reg.current_live_bearing(g)
+        if b:
+            all_bearings.append(b["name"])
 
     try:
-        executor = WorkflowExecutor()
-        reg      = BearingRegistry("config/bearings.json")
-        bearing  = reg.get_bearing(bearing_name)
-
-        if not bearing:
-            state_mgr.mark_workflow_failed(run_id, f"Bearing '{bearing_name}' not found.")
-            return
-
-        # 1. Extract features for new bearing
-        logger.info(f"[{run_id}] Extracting features for {bearing_name}...")
-        executor._run_extraction(run_id, bearing)
-
-        # 2. Start SCADA simulator + Serving Pipeline
-        logger.info(f"[{run_id}] Starting SCADA + Serving for {bearing_name}...")
-        pids = _process_manager.start_bearing(
-            bearing_name=bearing_name,
-            realtime=realtime,
+        result = _process_manager.restart_group(
+            group        = group,
+            new_bearing  = new_bearing,
+            all_bearings = all_bearings,
+            realtime     = realtime,
         )
         logger.info(
-            f"[{run_id}] Processes started: "
-            f"SCADA PID={pids['scada_pid']}  "
-            f"Serving PID={pids['serving_pid']}"
+            f"[{run_id}] Group {group} restarted → {new_bearing}. "
+            f"SCADA now serving: {all_bearings}"
         )
-
-        state_mgr.mark_workflow_complete(run_id)
-        logger.info(f"[{run_id}] Bearing continuation complete.")
-
     except Exception as e:
-        state_mgr.mark_workflow_failed(run_id, traceback.format_exc())
-        logger.error(f"[{run_id}] Bearing continuation FAILED: {e}", exc_info=True)
-        raise
+        logger.error(f"[{run_id}] Failed to restart Group {group}: {e}", exc_info=True)
+
+
+async def _stop_group_bg(group: str):
+    """Stop only the serving process for an exhausted group."""
+    remaining_serving = []
+    for bearing_name, proc in _process_manager._serving_procs:
+        if _group_from_bearing(bearing_name) == group:
+            if proc and proc.poll() is None:
+                proc.terminate()
+                logger.info(
+                    f"[ProcessManager] Group {group} queue exhausted — "
+                    f"serving stopped for {bearing_name}."
+                )
+        else:
+            remaining_serving.append((bearing_name, proc))
+    _process_manager._serving_procs    = remaining_serving
+    _process_manager._current_bearings = [
+        b for b in _process_manager._current_bearings
+        if _group_from_bearing(b) != group
+    ]
+
+
+async def _run_all_groups_bg(run_id: str, realtime: bool):
+    """Collect current live bearing from each group and restart everything.
+    Used only on initial startup / full reset."""
+    from orchestrator import BearingRegistry
+    reg = BearingRegistry("config/bearings.json")
+    live_bearings = []
+    for group in reg.all_groups():
+        b = reg.current_live_bearing(group)
+        if b:
+            live_bearings.append(b["name"])
+
+    if live_bearings:
+        try:
+            _process_manager.start_bearing(
+                bearing_names=live_bearings,
+                realtime=realtime,
+            )
+            logger.info(f"[{run_id}] Started serving for {live_bearings}")
+        except Exception as e:
+            logger.error(f"[{run_id}] Failed to start serving: {e}", exc_info=True)
+    else:
+        logger.info(f"[{run_id}] All group queues exhausted.")
 
 
 # ====================================================================
-# LIVE SERVING (legacy direct endpoint — kept for backward compat)
+# LIVE SERVING — manual start for 1–3 bearings
 # ====================================================================
 
 @app.post("/bearing/serve", tags=["Bearing Lifecycle"])
@@ -869,48 +1066,39 @@ async def start_live_serving(
     background_tasks: BackgroundTasks,
 ):
     """
-    Manually start SCADA + Serving for a named bearing.
-    Useful for testing without going through the full workflow trigger.
+    Manually start SCADA + Serving for 1–3 bearings (one per group).
+    Each bearing automatically uses its group-specific champion file.
     """
     run_id = f"live_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
     background_tasks.add_task(
-        _start_serving_bg, run_id, request.bearing_name, request.realtime
+        _start_serving_bg, run_id, request.bearing_names, request.realtime
     )
     return {
-        "run_id":  run_id,
-        "status":  "started",
-        "bearing": request.bearing_name,
+        "run_id":   run_id,
+        "status":   "started",
+        "bearings": request.bearing_names,
         "message": (
-            f"SCADA simulator and Serving Pipeline starting for "
-            f"{request.bearing_name}. Check /bearing/processes for status."
+            f"SCADA + Serving starting for {request.bearing_names}. "
+            f"Check /bearing/processes for status."
         ),
     }
 
 
-async def _start_serving_bg(run_id: str, bearing_name: str, realtime: bool):
+async def _start_serving_bg(run_id: str, bearing_names: List[str], realtime: bool):
     try:
-        _process_manager.start_bearing(
-            bearing_name=bearing_name,
-            realtime=realtime,
-        )
-        logger.info(f"[{run_id}] SCADA + Serving started for {bearing_name}")
+        _process_manager.start_bearing(bearing_names=bearing_names, realtime=realtime)
+        logger.info(f"[{run_id}] SCADA + Serving started for {bearing_names}")
     except Exception as e:
         logger.error(f"[{run_id}] Failed to start serving: {e}", exc_info=True)
 
 
 # ====================================================================
-# AUDIT SERVICE — batch flush (AuditSvc → External Data Destination)
+# AUDIT SERVICE
 # ====================================================================
 
 @app.post("/audit/flush", tags=["Audit & Export"])
 def flush_audit_records(request: AuditFlushRequest):
-    """
-    AuditSvc → External: batch-flush Serving History records to the
-    external CSV data destination for a specific bearing.
-
-    Useful when the pipeline was running without Export Service enabled,
-    or to re-export historical data from the dashboard.
-    """
+    """Batch-flush Serving History records to the external CSV destination."""
     try:
         from utils.audit_service import AuditService
         auditor  = AuditService()
@@ -929,15 +1117,11 @@ def flush_audit_records(request: AuditFlushRequest):
 
 
 # ====================================================================
-# EXPORT SERVICE — path info (ExportSvc → External Data Destination)
+# EXPORT SERVICE
 # ====================================================================
 
 @app.get("/export/paths", tags=["Audit & Export"])
 def get_export_paths():
-    """
-    Return the configured external data destination paths for the Export Service.
-    Shown in the Dashboard → Retraining & Export Control page.
-    """
     try:
         from utils.export_service import get_exporter
         exporter = get_exporter()

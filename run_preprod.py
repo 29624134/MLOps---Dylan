@@ -1,41 +1,45 @@
 """
 run_preprod.py
 ═══════════════════════════════════════════════════════════════════════════════
-Pre-Production Entry Point — runs independently of Serving.
+Pre-Production Entry Point — group-scoped retraining.
 
-This script is triggered AFTER a maintenance worker confirms or denies a fault
-on the dashboard. It:
+Triggered AFTER a maintenance worker confirms a fault on the dashboard.
+Retrains ONLY the model for the bearing group that had the fault confirmed.
+Other groups' models and serving pipelines are completely unaffected.
 
-1. Reads confirmed/labelled fault data from Feature Store Mirrored
-   (MongoDB 'confirmed_faults' collection)
-2. Runs automated model retraining on FS Mirrored data
-3. Compares new model metrics (MAE etc.) against the current champion
-4. If new model is better → writes model_registry/champion.json atomically
-   → run_serving.py detects this and hot-swaps the model between bursts
-5. If new model is not better → logs result, current champion retained
+Flow
+────
+1. Validate confirmed fault data exists in FS Mirrored for this group
+2. Retrain the group-specific model via WorkflowExecutor.run_training_only(group)
+3. Compare new model vs the group's current champion
+4. If better → write group champion file atomically
+   → run_serving.py for that group detects the change and hot-swaps the model
+5. If not better → leave as PENDING for manual review
 
-The Serving Pipeline continues uninterrupted during this entire process.
-Training runs on FS Mirrored data only — the live FS is never touched.
+Champion files (one per group):
+    model_registry/champion_bearing1.json  ← Group 1
+    model_registry/champion_bearing2.json  ← Group 2
+    model_registry/champion_bearing3.json  ← Group 3
 
 Architecture:
-    [Dashboard: confirm fault] --> [FS Mirrored: confirmed_faults]
-                                             |
-                                      [run_preprod.py]
-                                             |
-                               [ModelRegistry + champion.json]
-                                             |
-                                    [run_serving.py detects]
+    [Dashboard: confirm fault on Bearing1_5]
+             → group = "1"
+             → [run_preprod.py --group 1]
+             → [retrain Group 1 model only]
+             → [champion_bearing1.json updated]
+             → [run_serving.py for Bearing1_x detects change → hot-swap]
+    Group 2 and Group 3 serving: completely uninterrupted ✓
 
 Usage
 ─────
-    # Triggered automatically by the dashboard after fault confirm:
-    python run_preprod.py --run_id <run_id>
+    # Triggered automatically by the API after fault confirm:
+    python run_preprod.py --run_id <run_id> --group 1
 
-    # Manual trigger (e.g. after manually adding confirmed data):
-    python run_preprod.py
+    # Manual trigger:
+    python run_preprod.py --group 2
 
     # Dry run (compare only, do not promote):
-    python run_preprod.py --dry_run
+    python run_preprod.py --group 1 --dry_run
 ═══════════════════════════════════════════════════════════════════════════════
 """
 
@@ -58,28 +62,38 @@ logging.basicConfig(
 logger = logging.getLogger("run_preprod")
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-DEFAULT_MONGO_URI = "mongodb://localhost:27017"
-DEFAULT_DB_NAME   = "phm_mlops"
-CHAMPION_PATH     = os.path.join("model_registry", "champion.json")
-COMPARISON_METRIC = "mae_s"   # lower is better
+DEFAULT_MONGO_URI  = "mongodb://localhost:27017"
+DEFAULT_DB_NAME    = "phm_mlops"
+MODEL_REGISTRY_DIR = "model_registry"
+COMPARISON_METRIC  = "mae_s"   # lower is better
+
+
+def _champion_path(group: str) -> str:
+    """Return the champion file path for a given group."""
+    return os.path.join(MODEL_REGISTRY_DIR, f"champion_bearing{group}.json")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Champion pointer management
 # ─────────────────────────────────────────────────────────────────────────────
 
-def write_champion(model_id: str, model_path: str, metrics: dict) -> None:
+def write_champion(
+    group: str, model_id: str, model_path: str, metrics: dict
+) -> None:
     """
-    Atomically write the champion pointer file.
+    Atomically write the group-specific champion pointer file.
 
     run_serving.py watches this file for changes between bursts and reloads
     the model when it detects a new champion (hot-swap).
 
     Uses write-then-rename for atomicity — no partial reads possible.
     """
-    os.makedirs(os.path.dirname(CHAMPION_PATH), exist_ok=True)
-    tmp_path = CHAMPION_PATH + ".tmp"
+    path     = _champion_path(group)
+    tmp_path = path + ".tmp"
+    os.makedirs(MODEL_REGISTRY_DIR, exist_ok=True)
+
     champion = {
+        "group":       group,
         "model_id":    model_id,
         "model_path":  model_path,
         "metrics":     metrics,
@@ -87,16 +101,17 @@ def write_champion(model_id: str, model_path: str, metrics: dict) -> None:
     }
     with open(tmp_path, "w") as f:
         json.dump(champion, f, indent=2)
-    os.replace(tmp_path, CHAMPION_PATH)   # atomic on POSIX
-    logger.info(f"[Champion] champion.json written → {model_id}")
+    os.replace(tmp_path, path)   # atomic on POSIX
+    logger.info(f"[Champion] champion_bearing{group}.json written → {model_id}")
 
 
-def read_champion() -> Optional[dict]:
-    """Return the current champion dict or None if no champion exists."""
-    if not os.path.exists(CHAMPION_PATH):
+def read_champion(group: str) -> Optional[dict]:
+    """Return the current champion dict for a group, or None if it doesn't exist."""
+    path = _champion_path(group)
+    if not os.path.exists(path):
         return None
     try:
-        with open(CHAMPION_PATH) as f:
+        with open(path) as f:
             return json.load(f)
     except Exception:
         return None
@@ -111,10 +126,7 @@ def is_new_model_better(
     champion_metrics: dict,
     metric:           str = COMPARISON_METRIC,
 ) -> bool:
-    """
-    Returns True if the new model is better than the current champion.
-    Lower is better for MAE/RMSE metrics.
-    """
+    """Returns True if the new model is better. Lower is better for MAE/RMSE."""
     new_score      = new_metrics.get(metric)
     champion_score = champion_metrics.get(metric) if champion_metrics else None
 
@@ -137,142 +149,92 @@ def is_new_model_better(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_preprod(
-    run_id:   Optional[str],
+    group:     str,
+    run_id:    Optional[str],
     mongo_uri: str,
     db_name:   str,
     dry_run:   bool,
-):
+) -> bool:
     """
-    Full pre-production flow:
-      1. Validate confirmed fault data exists in FS Mirrored
-      2. Run retraining via WorkflowExecutor (trains on confirmed_faults + train set)
-      3. Compare new model vs current champion
-      4. Promote if better (write champion.json)
+    Full pre-production flow for a single bearing group.
+
+    Parameters
+    ----------
+    group     : str  — "1", "2", or "3"
+    run_id    : str  — unique identifier (auto-generated if None)
+    mongo_uri : str  — MongoDB connection string
+    db_name   : str  — database name
+    dry_run   : bool — compare only, do not write champion file
     """
-    run_id = run_id or f"preprod_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    run_id = run_id or f"preprod_g{group}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
     logger.info("=" * 60)
-    logger.info("  PHM MLOps — Pre-Production (Retraining)")
+    logger.info(f"  PHM MLOps — Pre-Production Retraining (Group {group})")
     logger.info("=" * 60)
-    logger.info(f"  Run ID   : {run_id}")
-    logger.info(f"  MongoDB  : {mongo_uri} / {db_name}")
-    logger.info(f"  Dry run  : {dry_run}")
+    logger.info(f"  Run ID        : {run_id}")
+    logger.info(f"  Group         : {group}")
+    logger.info(f"  Champion file : {_champion_path(group)}")
+    logger.info(f"  MongoDB       : {mongo_uri} / {db_name}")
+    logger.info(f"  Dry run       : {dry_run}")
     logger.info("=" * 60)
 
-    # ── Step 1: Verify new confirmed fault data exists and hasn't been used ──────
-    logger.info("\n[Phase 1] Verifying new confirmed fault data in FS Mirrored...")
+    # ── Step 1: Verify confirmed fault data exists for this group ─────────────
+    logger.info(f"\n[Phase 1] Checking confirmed fault data for Group {group}...")
     try:
         from pymongo import MongoClient
-        client        = MongoClient(mongo_uri, serverSelectionTimeoutMS=5000)
-        db            = client[db_name]
-        confirmed_col = db["feature_store_mirrored"]
-        preprod_col   = db["preprod_runs"]   # tracks which data was used in each run
+        from utils.db_collections import COL_FEATURE_STORE_MIRRORED
 
-        # 1a. Poll until confirmed fault data arrives in MongoDB.
-        #     run_preprod.py starts almost immediately after confirm is pressed,
-        #     but confirm_fault_and_push_to_store() may still be writing to MongoDB.
-        #     We retry for up to DATA_WAIT_TIMEOUT_S seconds before giving up.
-        DATA_WAIT_TIMEOUT_S = 60   # max seconds to wait for data to appear
-        DATA_POLL_INTERVAL  = 2    # seconds between polls
-        waited              = 0
-        n_confirmed         = 0
+        client = MongoClient(mongo_uri, serverSelectionTimeoutMS=5000)
+        db     = client[db_name]
+        col    = db[COL_FEATURE_STORE_MIRRORED]
 
-        logger.info(
-            f"  Waiting for confirmed fault data to arrive in FS Mirrored "
-            f"(timeout={DATA_WAIT_TIMEOUT_S}s, polling every {DATA_POLL_INTERVAL}s)..."
-        )
-        while waited < DATA_WAIT_TIMEOUT_S:
-            n_confirmed = confirmed_col.count_documents({})
-            if n_confirmed > 0:
+        # Load bearing registry to find confirmed bearings in this group
+        from orchestrator import BearingRegistry
+        reg = BearingRegistry("config/bearings.json")
+
+        confirmed_in_group = [
+            b["name"] for b in reg.live_bearings_in_group(group)
+            if b.get("status") == "confirmed"
+        ]
+
+        if not confirmed_in_group:
+            logger.warning(
+                f"  No confirmed bearings found for Group {group} in bearings.json. "
+                f"Retraining will use base train set only."
+            )
+        else:
+            for bname in confirmed_in_group:
+                count = col.count_documents({"dataset_id": bname})
                 logger.info(
-                    f"  ✓ Data arrived after {waited}s — "
-                    f"{n_confirmed} confirmed fault record(s) found."
+                    f"  [{bname}] {count} confirmed fault documents in FS Mirrored"
                 )
-                break
-            logger.info(
-                f"  No data yet — retrying in {DATA_POLL_INTERVAL}s "
-                f"({waited}/{DATA_WAIT_TIMEOUT_S}s elapsed)..."
-            )
-            time.sleep(DATA_POLL_INTERVAL)
-            waited += DATA_POLL_INTERVAL
 
-        if n_confirmed == 0:
-            logger.warning(
-                f"  No confirmed fault data found after {DATA_WAIT_TIMEOUT_S}s. "
-                f"confirm_fault_and_push_to_store() may have failed. "
-                f"Aborting retraining."
-            )
-            return False
-
-        # 1b. Get the distinct bearing names that have confirmed fault data
-        confirmed_bearings = confirmed_col.distinct("dataset_id")
-        logger.info(
-            f"  Found {n_confirmed} confirmed fault records across "
-            f"{len(confirmed_bearings)} bearing(s): {confirmed_bearings}"
-        )
-
-        # 1c. Check which bearings were already used in a previous preprod run
-        already_used = set()
-        for bearing in confirmed_bearings:
-            used = preprod_col.find_one({"bearing_name": bearing, "used": True})
-            if used:
-                already_used.add(bearing)
-
-        new_bearings = [b for b in confirmed_bearings if b not in already_used]
-
-        if not new_bearings:
-            logger.warning(
-                f"  All confirmed fault data has already been used in a previous "
-                f"retraining run: {list(already_used)}. "
-                f"No new data to train on — aborting retraining."
-            )
-            return False
-
-        logger.info(
-            f"  ✓ New confirmed fault data found for: {new_bearings}\n"
-            f"  Already used in previous runs: {list(already_used)}\n"
-            f"  Proceeding with retraining."
-        )
-
-        # 1d. Mark these bearings as used so we don't retrain on them again
-        # (This is written now so even if training fails we don't double-train
-        #  on the same data. If you want to retry failed runs, delete these records.)
-        if not dry_run:
-            for bearing in new_bearings:
-                preprod_col.update_one(
-                    {"bearing_name": bearing},
-                    {"$set": {
-                        "bearing_name": bearing,
-                        "used":         True,
-                        "run_id":       run_id,
-                        "marked_at":    datetime.now(timezone.utc).isoformat(),
-                    }},
-                    upsert=True,
-                )
-            logger.info(
-                f"  Marked {len(new_bearings)} bearing(s) as used in "
-                f"'preprod_runs' collection."
-            )
+        client.close()
 
     except Exception as e:
         logger.error(f"Cannot connect to MongoDB or check confirmed faults: {e}")
         return False
 
-    # ── Step 2: Run retraining ────────────────────────────────────────────────
-    logger.info("\n[Phase 2] Starting automated model retraining...")
-    logger.info("  Training on: confirmed_faults (FS Mirrored) + train-role bearings")
-    logger.info("  NOTE: Live Feature Store is NOT touched — serving continues ✓")
+    # ── Step 2: Run group-scoped retraining ───────────────────────────────────
+    logger.info(f"\n[Phase 2] Retraining Group {group} model...")
+    logger.info(f"  Training data: factory_features (Group {group}) + confirmed faults (Group {group})")
+    logger.info(f"  Other groups: UNAFFECTED — their serving continues ✓")
 
     try:
         from orchestrator import WorkflowExecutor
         executor = WorkflowExecutor()
-        executor.run_training_only(run_id=run_id, mongo_uri=mongo_uri, db_name=db_name)
+        executor.run_training_only(
+            run_id=run_id,
+            group=group,
+            mongo_uri=mongo_uri,
+            db_name=db_name,
+        )
     except Exception as e:
         logger.error(f"Retraining failed: {e}", exc_info=True)
         return False
 
-    # ── Step 3: Get new model metrics from registry ───────────────────────────
-    logger.info("\n[Phase 3] Comparing new model vs current champion...")
+    # ── Step 3: Get new model metrics ─────────────────────────────────────────
+    logger.info(f"\n[Phase 3] Comparing new Group {group} model vs current champion...")
     try:
         from utils.model_registry import ModelRegistry
         registry = ModelRegistry()
@@ -280,11 +242,10 @@ def run_preprod(
         if not pending_models:
             logger.error(
                 f"No pending models found for run_id={run_id}. "
-                "Did training complete successfully?"
+                f"Did training complete successfully?"
             )
             return False
 
-        # Pick best pending model by metric
         best_new = min(
             pending_models,
             key=lambda m: m.get("metrics", {}).get(COMPARISON_METRIC, float("inf"))
@@ -292,60 +253,56 @@ def run_preprod(
         new_metrics  = best_new.get("metrics", {})
         new_model_id = best_new["model_id"]
         new_path     = best_new["model_path"]
-        logger.info(f"  Best new model: {new_model_id}")
-        logger.info(f"  Metrics: {new_metrics}")
+        logger.info(f"  Best new model : {new_model_id}")
+        logger.info(f"  Metrics        : {new_metrics}")
 
     except Exception as e:
         logger.error(f"Model registry error: {e}", exc_info=True)
         return False
 
     # ── Step 4: Compare and promote ───────────────────────────────────────────
-    current_champion = read_champion()
+    current_champion = read_champion(group)
     champion_metrics = current_champion.get("metrics", {}) if current_champion else {}
 
     if is_new_model_better(new_metrics, champion_metrics, COMPARISON_METRIC):
         logger.info(
-            f"\n  ✅ New model is BETTER — promoting to champion.\n"
+            f"\n  ✅ New model is BETTER — promoting to Group {group} champion.\n"
             f"  Model ID : {new_model_id}\n"
             f"  {COMPARISON_METRIC}: {new_metrics.get(COMPARISON_METRIC):.2f} "
             f"(was: {champion_metrics.get(COMPARISON_METRIC, 'N/A')})"
         )
 
         if not dry_run:
-            # Approve + deploy in Model Registry
             registry.approve_model(new_model_id, approved_by="preprod_auto")
             registry.deploy_model(new_model_id)
 
-            # Write champion.json — run_serving.py will detect this and hot-swap
+            # Write group-specific champion file
             write_champion(
+                group=group,
                 model_id=new_model_id,
                 model_path=new_path,
                 metrics=new_metrics,
             )
             logger.info(
-                "  champion.json updated → run_serving.py will hot-swap "
-                "on next burst boundary ✓"
+                f"  champion_bearing{group}.json updated → "
+                f"run_serving.py (Group {group}) will hot-swap on next burst ✓"
             )
         else:
-            logger.info("  [DRY RUN] Promotion skipped — champion.json NOT written.")
+            logger.info(f"  [DRY RUN] Promotion skipped — champion_bearing{group}.json NOT written.")
 
     else:
         logger.info(
-            f"\n  ℹ️  New model is NOT better — keeping current champion.\n"
+            f"\n  ℹ️  New model is NOT better — keeping current Group {group} champion.\n"
             f"  New {COMPARISON_METRIC}      : {new_metrics.get(COMPARISON_METRIC)}\n"
             f"  Champion {COMPARISON_METRIC} : {champion_metrics.get(COMPARISON_METRIC)}"
         )
-        # Leave new model as PENDING for manual review
-        logger.info(
-            f"  New model {new_model_id} left as PENDING for manual review."
-        )
+        logger.info(f"  New model {new_model_id} left as PENDING for manual review.")
 
-    logger.info("\n[Pre-Production complete]")
+    logger.info(f"\n[Pre-Production complete — Group {group}]")
     logger.info(
-        "  The Serving Pipeline will automatically pick up the new champion\n"
-        "  on the next burst cycle — no restart required.\n"
-        "  When SCADA starts sending data again, run_serving.py will\n"
-        "  resume predictions with the latest champion model."
+        f"  Group {group} Serving Pipeline will pick up the new champion\n"
+        f"  on the next burst boundary — no restart required.\n"
+        f"  Groups 1, 2, 3 (minus Group {group}) were never interrupted."
     )
     return True
 
@@ -356,20 +313,37 @@ def run_preprod(
 
 def _parse_args():
     parser = argparse.ArgumentParser(
-        description="Pre-Production — retrains and promotes model after fault confirmation.",
+        description="Pre-Production — retrains the model for a specific bearing group.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Retrain Group 1 model after fault confirmed on Bearing1_5:
+  python run_preprod.py --group 1 --run_id preprod_xyz
+
+  # Retrain Group 2 model:
+  python run_preprod.py --group 2
+
+  # Dry run — compare only, do not write champion file:
+  python run_preprod.py --group 3 --dry_run
+        """,
+    )
+    parser.add_argument(
+        "--group", type=str, required=True, choices=["1", "2", "3"],
+        help="Bearing group to retrain (1, 2, or 3)"
     )
     parser.add_argument("--run_id",    type=str, default=None,
                         help="Run ID (auto-generated if not provided)")
     parser.add_argument("--mongo_uri", type=str, default=DEFAULT_MONGO_URI)
     parser.add_argument("--db_name",   type=str, default=DEFAULT_DB_NAME)
     parser.add_argument("--dry_run",   action="store_true", default=False,
-                        help="Compare models but do NOT write champion.json")
+                        help="Compare models but do NOT write champion file")
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = _parse_args()
     success = run_preprod(
+        group=args.group,
         run_id=args.run_id,
         mongo_uri=args.mongo_uri,
         db_name=args.db_name,
