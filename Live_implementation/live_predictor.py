@@ -158,8 +158,8 @@ class LivePredictor:
         # Try to use RULNetModel from the project; fall back to a raw nn.Module
         # so that tests (and environments without the full project tree) still work.
         try:
-            from models.rul_net_model import RULNetModel
-            model = RULNetModel(**hp)
+            from models.mlp_model import MLPModel
+            model = MLPModel(**hp)
             model.model = model._build_net(input_dim)
             model.model.load_state_dict(state)
             model.model.eval()

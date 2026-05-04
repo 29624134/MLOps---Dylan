@@ -36,7 +36,7 @@ from typing import Dict, Any, List, Optional, Tuple
 from sklearn.preprocessing import StandardScaler
 
 from utils.model_registry import ModelRegistry
-from models.rul_net_model import RULNetModel
+from models.mlp_model import MLPModel
 
 logger = logging.getLogger(__name__)
 
@@ -257,14 +257,14 @@ class RULTrainerPHM:
 
         return X_train, y_train_scaled, X_val, y_val, scaler
 
-    def train(self, X_train, y_train, X_val, y_val) -> RULNetModel:
-        """Train model and return trained RULNetModel instance."""
-        self.logger.info(f"Training RULNetModel with params: {self.model_params}")
-        model = RULNetModel(**self.model_params)
+    def train(self, X_train, y_train, X_val, y_val) -> MLPModel:
+        """Train model and return trained MLPModel instance."""
+        self.logger.info(f"Training MLPModel with params: {self.model_params}")
+        model = MLPModel(**self.model_params)
         model.train(X_train, y_train, X_val, y_val)
         return model
 
-    def evaluate(self, model: RULNetModel, scaler: StandardScaler) -> Dict[str, Any]:
+    def evaluate(self, model: MLPModel, scaler: StandardScaler) -> Dict[str, Any]:
         """
         Evaluate on test bearings. Returns per-bearing results and mean metrics.
 
@@ -400,7 +400,7 @@ class RULTrainerPHM:
             "summary_rows": summary_rows,
         }
 
-    def save_model(self, model: RULNetModel, scaler: StandardScaler) -> str:
+    def save_model(self, model: MLPModel, scaler: StandardScaler) -> str:
         """
         Save model checkpoint (includes scaler) to the global model store.
         Returns saved path.
@@ -425,7 +425,7 @@ class RULTrainerPHM:
     def register_model(
         self,
         run_id:     str,
-        model:      RULNetModel,
+        model:      MLPModel,
         model_path: str,
         metrics:    Dict,
     ) -> str:
