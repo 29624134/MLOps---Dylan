@@ -1,113 +1,154 @@
 {
   "base_path": "D:/Data + Models/Data/IEEE Data Full",
-  "live_bearing_queue": [
-    "Bearing1_2",
-    "Bearing1_3",
-    "Bearing1_4",
-    "Bearing1_5",
-    "Bearing1_7"
-  ],
-  "current_live_index": 5,
+  "groups": {
+    "1": {
+      "live_bearing_queue": [
+        "Bearing1_2",
+        "Bearing1_3",
+        "Bearing1_4",
+        "Bearing1_5",
+        "Bearing1_7"
+      ],
+      "current_live_index": 0,
+      "champion_file": "model_registry/champion_bearing1.json"
+    },
+    "2": {
+      "live_bearing_queue": [
+        "Bearing2_2",
+        "Bearing2_4",
+        "Bearing2_5",
+        "Bearing2_6",
+        "Bearing2_7"
+      ],
+      "current_live_index": 0,
+      "champion_file": "model_registry/champion_bearing2.json"
+    },
+    "3": {
+      "live_bearing_queue": [
+        "Bearing3_2",
+        "Bearing3_3"
+      ],
+      "current_live_index": 0,
+      "champion_file": "model_registry/champion_bearing3.json"
+    }
+  },
   "bearings": [
     {
       "name": "Bearing1_1",
       "role": "train",
+      "group": "1",
       "condition": 1,
       "status": "available"
     },
     {
       "name": "Bearing1_2",
       "role": "live",
+      "group": "1",
       "condition": 1,
-      "status": "confirmed"
+      "status": "available"
     },
     {
       "name": "Bearing1_3",
       "role": "live",
+      "group": "1",
       "condition": 1,
-      "status": "confirmed"
+      "status": "available"
     },
     {
       "name": "Bearing1_4",
       "role": "live",
+      "group": "1",
       "condition": 1,
-      "status": "confirmed"
+      "status": "available"
     },
     {
       "name": "Bearing1_5",
       "role": "live",
+      "group": "1",
       "condition": 1,
-      "status": "confirmed"
+      "status": "available"
     },
     {
       "name": "Bearing1_6",
       "role": "val",
+      "group": "1",
       "condition": 1,
       "status": "available"
     },
     {
       "name": "Bearing1_7",
       "role": "live",
+      "group": "1",
       "condition": 1,
-      "status": "confirmed"
+      "status": "available"
     },
     {
       "name": "Bearing2_1",
-      "role": "live",
+      "role": "train",
+      "group": "2",
       "condition": 2,
       "status": "available"
     },
     {
       "name": "Bearing2_2",
       "role": "live",
+      "group": "2",
       "condition": 2,
       "status": "available"
     },
     {
       "name": "Bearing2_3",
       "role": "val",
+      "group": "2",
       "condition": 2,
       "status": "available"
     },
     {
       "name": "Bearing2_4",
       "role": "live",
+      "group": "2",
       "condition": 2,
       "status": "available"
     },
     {
       "name": "Bearing2_5",
       "role": "live",
+      "group": "2",
       "condition": 2,
       "status": "available"
     },
     {
       "name": "Bearing2_6",
       "role": "live",
+      "group": "2",
       "condition": 2,
       "status": "available"
     },
     {
       "name": "Bearing2_7",
       "role": "live",
+      "group": "2",
       "condition": 2,
       "status": "available"
     },
     {
       "name": "Bearing3_1",
-      "role": "live",
+      "role": "train",
+      "group": "3",
       "condition": 3,
       "status": "available"
     },
     {
       "name": "Bearing3_2",
       "role": "live",
+      "group": "3",
       "condition": 3,
       "status": "available"
     },
     {
       "name": "Bearing3_3",
       "role": "live",
+      "group": "3",
       "condition": 3,
       "status": "available"
     }
