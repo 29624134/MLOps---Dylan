@@ -23,7 +23,7 @@ class _RULDataset(Dataset):
         return self.X[idx], self.y[idx:idx + self.horizon]
 
 
-class RULNetModel:
+class MLPModel:
     """
     Multi-layer perceptron for multi-step RUL prediction.
     Accepts a config-style dict of hyperparameters on construction.
@@ -70,7 +70,7 @@ class RULNetModel:
               X_train: np.ndarray,
               y_train: np.ndarray,
               X_val: np.ndarray,
-              y_val: np.ndarray) -> "RULNetModel":
+              y_val: np.ndarray) -> "MLPModel":
         p = self._params()
         torch.manual_seed(p["seed"])
         np.random.seed(p["seed"])
@@ -169,7 +169,7 @@ class RULNetModel:
         return filepath
 
     @classmethod
-    def load(cls, filepath: str) -> "RULNetModel":
+    def load(cls, filepath: str) -> "MLPModel":
         import io, joblib
         checkpoint = torch.load(filepath, map_location="cpu")
         instance   = cls(**checkpoint.get("hyperparameters", {}))
