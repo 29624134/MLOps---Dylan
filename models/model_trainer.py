@@ -6,6 +6,15 @@ Unified trainer for PHM 2012 RUL models.
 Pipeline:
     load_data() -> train() -> evaluate() -> save_model() -> register_model() -> run(run_id)
 
+Model type routing
+──────────────────
+The trainer reads 'model_type' from its config dict and dispatches to either:
+    "MLP"      → MLPModel    (default, Group 1 and Group 3)
+    "CNN_LSTM" → CNNLSTMModel (Group 2)
+
+This is controlled by workflow.yaml so no code changes are needed to switch
+a group's model — just update the group_model_overrides section in the yaml.
+
 Data sources
 ────────────
 Primary  : DataFrames loaded from MongoDB factory_features by the orchestrator
@@ -16,6 +25,17 @@ Primary  : DataFrames loaded from MongoDB factory_features by the orchestrator
 Fallback : CSV file paths via train_files / val_files / test_files — kept
            for backward compatibility with external scripts (IEEE original
            code, standalone notebooks) that still run directly from disk.
+
+CNN-LSTM sequence preparation
+──────────────────────────────
+For CNN_LSTM, load_data() returns per-bearing (X, y, rul_max, condition)
+tuples rather than a single concatenated array. The trainer then calls
+_prepare_sequence_data() to build the sliding-window (seq_len, n_features)
+tensors and per-bearing normalised RUL targets required by CNNLSTMModel.train().
+
+The condition integer (1/2/3) is derived from the bearing group field in
+bearings.json, which the orchestrator passes via the 'bearing_conditions' key
+in the training config. If not provided, condition defaults to 1.
 
 Metrics computed and stored in ModelRegistry
 ────────────────────────────────────────────
@@ -32,18 +52,16 @@ import numpy as np
 import pandas as pd
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Optional, Tuple, Union
 from sklearn.preprocessing import StandardScaler
 
 from utils.model_registry import ModelRegistry
 from models.mlp_model import MLPModel
+from models.cnn_lstm_model import CNNLSTMModel
 
 logger = logging.getLogger(__name__)
 
 # GT RULs — used for point-in-time evaluation at last recorded burst.
-# For train/val bearings these are derived from the failure point in the
-# feature data.  For test bearings these are known from when the recording
-# was stopped.
 ACTUAL_RUL_S = {
     "Bearing1_3": 5730,  "Bearing1_4":  339,  "Bearing1_5": 1610,
     "Bearing1_6": 1460,  "Bearing1_7": 7570,  "Bearing2_3": 7530,
@@ -53,6 +71,15 @@ ACTUAL_RUL_S = {
 
 TARGET    = "RUL_s"
 DROP_COLS = ["file_id", "burst_idx", "time_s", TARGET]
+
+# Bearing → load condition mapping (matches CNN-LSTM.py original)
+BEARING_CONDITION = {
+    "Bearing1_1": 1, "Bearing1_2": 1, "Bearing1_3": 1,
+    "Bearing1_4": 1, "Bearing1_5": 1, "Bearing1_6": 1, "Bearing1_7": 1,
+    "Bearing2_1": 2, "Bearing2_2": 2, "Bearing2_3": 2,
+    "Bearing2_4": 2, "Bearing2_5": 2, "Bearing2_6": 2, "Bearing2_7": 2,
+    "Bearing3_1": 3, "Bearing3_2": 3, "Bearing3_3": 3,
+}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -65,15 +92,19 @@ class RULTrainerPHM:
 
     Config keys — MongoDB path (preferred, used by orchestrator)
     ─────────────────────────────────────────────────────────────
-    train_dataframes : list[pd.DataFrame]         — training bearing DataFrames
-    val_dataframes   : list[pd.DataFrame]         — validation bearing DataFrames
-    test_dataframes  : list[tuple[str, pd.DataFrame]] — (bearing_name, df) pairs
-    output_location  : str
-    window_size      : int
-    rul_scale        : float
-    model_params     : dict
-    state_location   : str   (optional)
-    log_path         : str   (optional)
+    train_dataframes    : list[pd.DataFrame]              — training bearing DataFrames
+    val_dataframes      : list[pd.DataFrame]              — validation bearing DataFrames
+    test_dataframes     : list[tuple[str, pd.DataFrame]]  — (bearing_name, df) pairs
+    bearing_conditions  : dict[str, int]                  — bearing_name → condition (1/2/3)
+                          Used by CNN-LSTM to build condition tensors.
+                          If not provided, defaults to BEARING_CONDITION lookup.
+    output_location     : str
+    window_size         : int
+    rul_scale           : float
+    model_type          : str   — "MLP" (default) or "CNN_LSTM"
+    model_params        : dict
+    state_location      : str   (optional)
+    log_path            : str   (optional)
 
     Config keys — CSV fallback (external scripts / backward compatibility)
     ──────────────────────────────────────────────────────────────────────
@@ -84,12 +115,12 @@ class RULTrainerPHM:
 
     def __init__(self, config: dict):
         # ── MongoDB DataFrame path ────────────────────────────────────────────
-        # list[pd.DataFrame] for train/val; list[(name, df)] for test
-        self.train_dataframes = config.get("train_dataframes", [])
-        self.val_dataframes   = config.get("val_dataframes",   [])
-        self.test_dataframes  = config.get("test_dataframes",  [])  # list[(str, df)]
+        self.train_dataframes   = config.get("train_dataframes",   [])
+        self.val_dataframes     = config.get("val_dataframes",     [])
+        self.test_dataframes    = config.get("test_dataframes",    [])  # list[(str, df)]
+        self.bearing_conditions = config.get("bearing_conditions", {})  # name → int
 
-        # ── Legacy CSV path (external scripts / backward compat) ──────────────
+        # ── Legacy CSV path ───────────────────────────────────────────────────
         self.train_files = config.get("train_files", [])
         self.val_files   = config.get("val_files",   [])
         self.test_files  = config.get("test_files",  [])
@@ -97,17 +128,35 @@ class RULTrainerPHM:
         self.output_location = config.get("output_location", "workflow_data/models")
         self.window_size     = config.get("window_size", 40)
         self.rul_scale       = config.get("rul_scale", 30000.0)
+        self.model_type      = config.get("model_type", "MLP").upper().strip()
         self.model_params    = config.get("model_params", {})
         self.state_location  = config.get("state_location")
         self.log_path        = config.get("log_path")
 
-        # Inject rul_scale into model_params so the model knows how to unscale
+        # Inject rul_scale so the model knows how to unscale predictions
         if "rul_scale" not in self.model_params:
             self.model_params["rul_scale"] = self.rul_scale
 
+        # For CNN-LSTM, also inject seq_len to match window_size
+        if self.model_type == "CNN_LSTM" and "seq_len" not in self.model_params:
+            self.model_params["seq_len"] = self.window_size
+
         self.logger = logging.getLogger(__name__)
+        self.logger.info(
+            f"[RULTrainerPHM] model_type='{self.model_type}'  "
+            f"window_size={self.window_size}  rul_scale={self.rul_scale}"
+        )
 
     # ── Internal helpers ──────────────────────────────────────────────────────
+
+    def _condition_for_bearing(self, bearing_name: str) -> int:
+        """
+        Return the condition integer (1/2/3) for a bearing.
+        Priority: bearing_conditions config dict → BEARING_CONDITION lookup → 1.
+        """
+        if bearing_name in self.bearing_conditions:
+            return int(self.bearing_conditions[bearing_name])
+        return BEARING_CONDITION.get(bearing_name, 1)
 
     def _add_rolling_features(self, df: pd.DataFrame) -> Optional[pd.DataFrame]:
         """Add rolling mean/std/slope features matching the serving pipeline."""
@@ -117,20 +166,21 @@ class RULTrainerPHM:
             self.logger.warning(f"  No '{TARGET}' column — skipping DataFrame.")
             return None
 
-        # Drop all non-numeric columns before rolling.
-        # MongoDB documents carry extra string fields (dataset_id, version, etc.)
-        # that must be removed before any rolling operation is attempted.
         numeric_cols = df.select_dtypes(include="number").columns.tolist()
-        keep_cols    = list(dict.fromkeys(numeric_cols + [c for c in DROP_COLS if c in df.columns]))
+        keep_cols    = list(dict.fromkeys(
+            numeric_cols + [c for c in DROP_COLS if c in df.columns]
+        ))
         df = df[keep_cols].copy()
-
         df = df.dropna(subset=[TARGET]).reset_index(drop=True)
+
         if len(df) < self.window_size:
             return None
 
-        # Only roll over numeric feature columns (exclude DROP_COLS)
-        base_cols = [c for c in df.columns if c not in DROP_COLS and pd.api.types.is_numeric_dtype(df[c])]
-        new_cols  = {}
+        base_cols = [
+            c for c in df.columns
+            if c not in DROP_COLS and pd.api.types.is_numeric_dtype(df[c])
+        ]
+        new_cols = {}
         for col in base_cols:
             new_cols[f"{col}_mean"]  = df[col].rolling(self.window_size).mean()
             new_cols[f"{col}_std"]   = df[col].rolling(self.window_size).std()
@@ -141,8 +191,7 @@ class RULTrainerPHM:
         return df.dropna().reset_index(drop=True)
 
     def _load_bearing(self, path: str) -> Optional[pd.DataFrame]:
-        """Load a bearing features.csv from disk and add rolling features.
-        Used only by the CSV fallback path."""
+        """Load a bearing features.csv from disk and add rolling features (CSV path)."""
         if not os.path.exists(path):
             self.logger.warning(f"  File not found: {path}")
             return None
@@ -169,20 +218,81 @@ class RULTrainerPHM:
                 return part
         return Path(path).stem
 
+    # ── CNN-LSTM sequence preparation ─────────────────────────────────────────
+
+    def _prepare_sequence_data(
+        self,
+        bearing_datasets: List[Tuple[str, np.ndarray, np.ndarray]],
+        scaler: StandardScaler,
+        horizon: int,
+        seq_len: int,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Build sliding-window sequence arrays for CNN-LSTM training.
+
+        For each bearing, this method:
+          1. Scales features with the fitted scaler.
+          2. Normalises RUL per-bearing to [0, 1] (avoids short-life bearings
+             being drowned by long-life ones during training).
+          3. Slides a (seq_len, n_features) window with step=1 across the
+             bearing, producing one training sample per position.
+          4. Records the condition integer (1/2/3) for each window.
+
+        Parameters
+        ──────────
+        bearing_datasets : list of (bearing_name, X_raw, y_raw_seconds)
+        scaler           : fitted StandardScaler
+        horizon          : number of future steps to predict
+        seq_len          : length of each input sequence window
+
+        Returns
+        ───────
+        X_seq        : (total_windows, seq_len, n_features)
+        y_seq        : (total_windows,) — normalised RUL [0, 1]
+        conditions   : (total_windows,) — int array of condition codes 1/2/3
+        """
+        all_X, all_y, all_cond = [], [], []
+
+        for bearing_name, X_raw, y_raw in bearing_datasets:
+            X_scaled = scaler.transform(X_raw)
+            rul_max  = float(y_raw.max()) if y_raw.max() > 0 else self.rul_scale
+            y_norm   = y_raw / rul_max
+            cond     = self._condition_for_bearing(bearing_name)
+            n_windows = len(X_scaled) - seq_len - horizon + 1
+
+            for i in range(max(n_windows, 0)):
+                all_X.append(X_scaled[i : i + seq_len])         # (seq_len, n_features)
+                all_y.append(y_norm[i + seq_len])                # scalar (step-0 RUL)
+                all_cond.append(cond)
+
+        if not all_X:
+            raise RuntimeError(
+                "No sequence windows could be built — check that bearings have "
+                f"at least seq_len+horizon={seq_len + horizon} rows."
+            )
+
+        return (
+            np.array(all_X,    dtype=np.float32),   # (N, seq_len, n_features)
+            np.array(all_y,    dtype=np.float32),   # (N,)
+            np.array(all_cond, dtype=np.int64),     # (N,)
+        )
+
     # ── Pipeline steps ────────────────────────────────────────────────────────
 
     def load_data(self) -> tuple:
         """
         Load and prepare training and validation data.
 
-        Uses MongoDB DataFrames if available (orchestrator path), otherwise
-        falls back to reading from CSV files (external scripts path).
+        For MLP:
+            Returns X_train, y_train_scaled, X_val, y_val, scaler
+            where X arrays are (n_rows, n_features) flat feature vectors.
 
-        Returns
-        -------
-        X_train, y_train_scaled, X_val, y_val, scaler
+        For CNN-LSTM:
+            Returns bearing_datasets_train, bearing_datasets_val, scaler, feature_cols
+            where each bearing_dataset is a list of (bearing_name, X_raw, y_raw).
+            The trainer's train() method calls _prepare_sequence_data() next.
         """
-        # ── MongoDB DataFrame path (preferred) ────────────────────────────────
+        # ── Load raw DataFrames ───────────────────────────────────────────────
         if self.train_dataframes:
             self.logger.info(
                 f"Loading data from {len(self.train_dataframes)} train DataFrame(s) "
@@ -193,28 +303,15 @@ class RULTrainerPHM:
                 result = self._add_rolling_features(df.copy())
                 if result is not None and len(result) > 0:
                     train_dfs.append(result)
-                else:
-                    self.logger.warning(
-                        f"  A train DataFrame was skipped "
-                        f"(too short or missing '{TARGET}' column)."
-                    )
-
             val_dfs = []
             for df in self.val_dataframes:
                 result = self._add_rolling_features(df.copy())
                 if result is not None and len(result) > 0:
                     val_dfs.append(result)
-                else:
-                    self.logger.warning(
-                        f"  A val DataFrame was skipped "
-                        f"(too short or missing '{TARGET}' column)."
-                    )
-
-        # ── CSV fallback path (external scripts / backward compat) ────────────
         else:
             self.logger.info(
                 f"Loading data from {len(self.train_files)} train CSV(s) "
-                f"and {len(self.val_files)} val CSV(s) [CSV fallback path]."
+                f"[CSV fallback path]."
             )
             train_dfs = [
                 df for f in self.train_files
@@ -230,20 +327,28 @@ class RULTrainerPHM:
         if not val_dfs:
             raise RuntimeError("No validation data could be loaded.")
 
+        # ── Build scaler from all training features ───────────────────────────
         train_combined = pd.concat(train_dfs, axis=0).reset_index(drop=True)
         val_combined   = pd.concat(val_dfs,   axis=0).reset_index(drop=True)
 
+        drop         = [c for c in DROP_COLS if c in train_combined.columns]
+        feature_cols = [c for c in train_combined.columns if c not in drop]
+
+        X_all_train = train_combined[feature_cols].values.astype(np.float32)
+        scaler      = StandardScaler()
+        scaler.fit(X_all_train)
+
+        if self.model_type == "CNN_LSTM":
+            # Return per-bearing tuples for sequence preparation
+            return self._load_data_cnn_lstm(train_dfs, val_dfs, feature_cols, scaler)
+
+        # ── MLP path — return flat arrays ────────────────────────────────────
         X_train, y_train = self._get_xy(train_combined)
         X_val,   y_val   = self._get_xy(val_combined)
 
-        # Scale train target only
         y_train_scaled = y_train / self.rul_scale
-
-        scaler       = StandardScaler()
-        drop         = [c for c in DROP_COLS if c in train_combined.columns]
-        feature_cols = [c for c in train_combined.columns if c not in drop]
-        X_train      = scaler.fit_transform(pd.DataFrame(X_train, columns=feature_cols))
-        X_val        = scaler.transform(pd.DataFrame(X_val, columns=feature_cols))
+        X_train        = scaler.transform(pd.DataFrame(X_train, columns=feature_cols))
+        X_val          = scaler.transform(pd.DataFrame(X_val,   columns=feature_cols))
 
         self.logger.info(f"Training features ({len(feature_cols)}): {feature_cols}")
         self.logger.info(f"Train: {X_train.shape} | Val: {X_val.shape}")
@@ -254,17 +359,128 @@ class RULTrainerPHM:
         self.logger.info(
             f"RUL_s val range: {y_val.min():.0f} s -> {y_val.max():.0f} s"
         )
-
         return X_train, y_train_scaled, X_val, y_val, scaler
 
-    def train(self, X_train, y_train, X_val, y_val) -> MLPModel:
-        """Train model and return trained MLPModel instance."""
+    def _load_data_cnn_lstm(
+        self,
+        train_dfs: List[pd.DataFrame],
+        val_dfs:   List[pd.DataFrame],
+        feature_cols: List[str],
+        scaler: StandardScaler,
+    ) -> tuple:
+        """
+        Build per-bearing (name, X_raw, y_raw) tuples for CNN-LSTM preparation.
+        The bearing name is used to look up the condition integer.
+        """
+        def _extract_bearing_datasets(dfs):
+            datasets = []
+            for df in dfs:
+                drop = [c for c in DROP_COLS if c in df.columns]
+                X    = df[feature_cols].values.astype(np.float32)
+                y    = df[TARGET].values.astype(np.float32)
+
+                # Try to recover bearing name from a 'dataset_id' column
+                # (present in MongoDB DataFrames) or default to "unknown"
+                if "dataset_id" in df.columns:
+                    bname = str(df["dataset_id"].iloc[0])
+                elif "file_id" in df.columns:
+                    bname = str(df["file_id"].iloc[0])
+                else:
+                    bname = "unknown"
+
+                datasets.append((bname, X, y))
+            return datasets
+
+        train_datasets = _extract_bearing_datasets(train_dfs)
+        val_datasets   = _extract_bearing_datasets(val_dfs)
+
+        self.logger.info(
+            f"[CNN-LSTM] Built {len(train_datasets)} train bearings, "
+            f"{len(val_datasets)} val bearings."
+        )
+        return train_datasets, val_datasets, scaler, feature_cols
+
+    def train(self, *args) -> Union[MLPModel, CNNLSTMModel]:
+        """
+        Train the appropriate model based on self.model_type.
+
+        MLP path:
+            train(X_train, y_train, X_val, y_val) → MLPModel
+
+        CNN-LSTM path:
+            train(bearing_datasets_train, bearing_datasets_val, scaler, feature_cols)
+            → CNNLSTMModel
+            (scaler and feature_cols are needed here to build the sequences)
+        """
+        if self.model_type == "CNN_LSTM":
+            return self._train_cnn_lstm(*args)
+        else:
+            return self._train_mlp(*args)
+
+    def _train_mlp(self, X_train, y_train, X_val, y_val) -> MLPModel:
+        """Train and return an MLPModel."""
         self.logger.info(f"Training MLPModel with params: {self.model_params}")
         model = MLPModel(**self.model_params)
         model.train(X_train, y_train, X_val, y_val)
         return model
 
-    def evaluate(self, model: MLPModel, scaler: StandardScaler) -> Dict[str, Any]:
+    def _train_cnn_lstm(
+        self,
+        bearing_datasets_train: List[Tuple[str, np.ndarray, np.ndarray]],
+        bearing_datasets_val:   List[Tuple[str, np.ndarray, np.ndarray]],
+        scaler:       StandardScaler,
+        feature_cols: List[str],
+    ) -> CNNLSTMModel:
+        """Train and return a CNNLSTMModel."""
+        self.logger.info(f"Training CNNLSTMModel with params: {self.model_params}")
+
+        p       = {**{"horizon": 10, "seq_len": self.window_size}, **self.model_params}
+        horizon = p["horizon"]
+        seq_len = p["seq_len"]
+
+        # Build sliding-window sequences — per-bearing normalisation + conditions
+        X_train_seq, y_train_seq, cond_train = self._prepare_sequence_data(
+            bearing_datasets_train, scaler, horizon, seq_len
+        )
+
+        # For validation we use the same sequence builder.
+        # Validation loss is computed on normalised values (CNNLSTMModel handles this).
+        X_val_seq, y_val_seq, cond_val = self._prepare_sequence_data(
+            bearing_datasets_val, scaler, horizon, seq_len
+        )
+
+        # y_val for CNNLSTMModel.train() should be raw seconds (for loss logging).
+        # We pass the normalised y_val and let the model handle it.
+        # Reconstruct raw-seconds val y for the evaluate() call later.
+        # The normalised val y is fine for val-loss monitoring inside the model.
+        y_val_raw = np.array([
+            y_raw[seq_len + i]
+            for bname, X_raw, y_raw in bearing_datasets_val
+            for i in range(max(len(X_raw) - seq_len - horizon + 1, 0))
+        ], dtype=np.float32)
+
+        self.logger.info(
+            f"[CNN-LSTM] Sequence shapes: X_train={X_train_seq.shape} "
+            f"X_val={X_val_seq.shape} | conditions unique={np.unique(cond_train)}"
+        )
+
+        model = CNNLSTMModel(**self.model_params)
+        model.train(
+            X_train       = X_train_seq,
+            y_train       = y_train_seq,
+            X_val         = X_val_seq,
+            y_val         = y_val_raw,
+            conditions_train = cond_train,
+            conditions_val   = cond_val,
+        )
+        model.scaler = scaler
+        return model
+
+    def evaluate(
+        self,
+        model: Union[MLPModel, CNNLSTMModel],
+        scaler: StandardScaler,
+    ) -> Dict[str, Any]:
         """
         Evaluate on test bearings. Returns per-bearing results and mean metrics.
 
@@ -273,59 +489,49 @@ class RULTrainerPHM:
             rmse_s    — sqrt(mean(errors^2)) across all test bearings
             mape      — mean absolute percentage error
 
-        Uses test_dataframes if available (MongoDB path), falls back to
-        test_files CSV paths, then falls back to val data if neither is set.
+        Routes to _evaluate_mlp or _evaluate_cnn_lstm based on model type.
         """
-        # ── Resolve evaluation items: list of (bearing_name, df) ─────────────
+        if isinstance(model, CNNLSTMModel):
+            return self._evaluate_cnn_lstm(model, scaler)
+        return self._evaluate_mlp(model, scaler)
+
+    def _resolve_eval_items(self) -> List[Tuple[str, Optional[pd.DataFrame]]]:
+        """Resolve the list of (bearing_name, df) pairs to evaluate on."""
         if self.test_dataframes:
-            # MongoDB path: list of (name, df) tuples
             self.logger.info(
                 f"Evaluating on {len(self.test_dataframes)} test DataFrame(s) [MongoDB path]."
             )
-            eval_items: List[Tuple[str, Optional[pd.DataFrame]]] = [
+            return [
                 (name, self._add_rolling_features(df.copy()))
                 for name, df in self.test_dataframes
             ]
         elif self.test_files:
-            # CSV fallback path
             self.logger.info(
                 f"Evaluating on {len(self.test_files)} test CSV(s) [CSV fallback path]."
             )
-            eval_items = [
+            return [
                 (self._parse_bearing_name(f), self._load_bearing(f))
                 for f in self.test_files
             ]
         elif self.val_dataframes:
-            # No test set — fall back to val DataFrames
-            self.logger.info(
-                "No test data configured — falling back to val DataFrames for evaluation."
-            )
-            eval_items = [
+            self.logger.info("No test data — falling back to val DataFrames for evaluation.")
+            return [
                 (f"val_{i}", self._add_rolling_features(df.copy()))
                 for i, df in enumerate(self.val_dataframes)
             ]
         else:
-            # No test set — fall back to val CSVs
-            self.logger.info(
-                "No test files configured — falling back to val bearings for evaluation."
-            )
-            eval_items = [
+            self.logger.info("No test files — falling back to val bearings for evaluation.")
+            return [
                 (self._parse_bearing_name(f), self._load_bearing(f))
                 for f in self.val_files
             ]
 
+    def _evaluate_mlp(self, model: MLPModel, scaler: StandardScaler) -> Dict[str, Any]:
+        """Evaluate MLPModel on test bearings."""
+        eval_items = self._resolve_eval_items()
+
         if not eval_items:
-            self.logger.warning(
-                "No evaluation data available — all metrics will be None. "
-                "Check that test data is set in bearings config and features exist."
-            )
-            return {
-                "mae_s":        None,
-                "rmse_s":       None,
-                "mape":         None,
-                "mean_abs_pct": None,
-                "summary_rows": [],
-            }
+            return {"mae_s": None, "rmse_s": None, "mape": None, "mean_abs_pct": None, "summary_rows": []}
 
         summary_rows = []
         for bearing_name, df_test in eval_items:
@@ -333,40 +539,99 @@ class RULTrainerPHM:
                 self.logger.warning(f"  [{bearing_name}] Could not load — skipping.")
                 continue
 
-            X_test, y_test = self._get_xy(df_test)
-            X_test         = scaler.transform(
-                pd.DataFrame(X_test, columns=scaler.feature_names_in_)
-            )
-            preds = model.predict(X_test)   # (n_windows, horizon), raw seconds
+            drop     = [c for c in DROP_COLS if c in df_test.columns]
+            X_test   = df_test.drop(columns=drop).values
+            y_test   = df_test[TARGET].values
+            X_scaled = scaler.transform(X_test)
 
-            pred_rul_s = float(np.clip(preds[-1, 0], 0, None))
-            gt_rul_s   = ACTUAL_RUL_S.get(bearing_name)
+            preds = model.predict(X_scaled)
+            if len(preds) == 0:
+                self.logger.warning(f"  [{bearing_name}] Too few rows to predict — skipping.")
+                continue
 
-            if gt_rul_s is None:
-                # If not in ACTUAL_RUL_S, derive from last row of feature data
-                gt_rul_s = float(df_test[TARGET].iloc[-1])
-                self.logger.info(
-                    f"  {bearing_name}: GT RUL derived from last feature row "
-                    f"= {gt_rul_s:.0f} s"
-                )
-
-            error_s   = pred_rul_s - gt_rul_s
-            abs_err_s = abs(error_s)
-            abs_pct   = abs_err_s / gt_rul_s * 100 if gt_rul_s > 0 else 0.0
+            final_pred  = float(preds[-1, 0]) * model._params().get("rul_scale", self.rul_scale)
+            gt_rul      = ACTUAL_RUL_S.get(bearing_name, float(y_test[-1]))
+            error_s     = final_pred - gt_rul
+            abs_err_s   = abs(error_s)
+            abs_pct_err = abs_err_s / gt_rul * 100.0 if gt_rul != 0 else 0.0
 
             summary_rows.append({
                 "bearing":     bearing_name,
-                "gt_rul_s":    gt_rul_s,
-                "pred_rul_s":  pred_rul_s,
+                "pred_rul_s":  final_pred,
+                "gt_rul_s":    gt_rul,
                 "error_s":     error_s,
                 "abs_err_s":   abs_err_s,
-                "abs_pct_err": abs_pct,
-                "timestamp":   datetime.now().isoformat(),
+                "abs_pct_err": abs_pct_err,
             })
+            self.logger.info(
+                f"  [{bearing_name}] pred={final_pred:.0f}s  gt={gt_rul:.0f}s  "
+                f"err={abs_err_s:.0f}s ({abs_pct_err:.1f}%)"
+            )
 
+        return self._aggregate_metrics(summary_rows)
+
+    def _evaluate_cnn_lstm(self, model: CNNLSTMModel, scaler: StandardScaler) -> Dict[str, Any]:
+        """Evaluate CNNLSTMModel on test bearings."""
+        eval_items = self._resolve_eval_items()
+
+        if not eval_items:
+            return {"mae_s": None, "rmse_s": None, "mape": None, "mean_abs_pct": None, "summary_rows": []}
+
+        p       = model._params()
+        horizon = p["horizon"]
+        seq_len = p["seq_len"]
+        rul_scale = p["rul_scale"]
+
+        summary_rows = []
+        for bearing_name, df_test in eval_items:
+            if df_test is None or len(df_test) == 0:
+                self.logger.warning(f"  [{bearing_name}] Could not load — skipping.")
+                continue
+
+            drop     = [c for c in DROP_COLS if c in df_test.columns]
+            X_test   = df_test.drop(columns=drop).values.astype(np.float32)
+            y_test   = df_test[TARGET].values.astype(np.float32)
+            X_scaled = scaler.transform(X_test)
+
+            cond        = self._condition_for_bearing(bearing_name)
+            n_windows   = len(X_scaled) - seq_len - horizon + 1
+            conditions  = np.full(n_windows, cond, dtype=np.int64)
+
+            preds = model.predict(X_scaled, conditions)
+            if len(preds) == 0:
+                self.logger.warning(f"  [{bearing_name}] Too few rows to predict — skipping.")
+                continue
+
+            # preds is (n_windows, horizon) — step-0 is already in raw seconds
+            # (CNNLSTMModel.predict() multiplies by rul_scale internally).
+            # However for per-bearing normalisation the scale differs.
+            # We use the model's built-in rul_scale as the common output scale.
+            final_pred  = float(preds[-1, 0])
+            gt_rul      = ACTUAL_RUL_S.get(bearing_name, float(y_test[-1]))
+            error_s     = final_pred - gt_rul
+            abs_err_s   = abs(error_s)
+            abs_pct_err = abs_err_s / gt_rul * 100.0 if gt_rul != 0 else 0.0
+
+            summary_rows.append({
+                "bearing":     bearing_name,
+                "pred_rul_s":  final_pred,
+                "gt_rul_s":    gt_rul,
+                "error_s":     error_s,
+                "abs_err_s":   abs_err_s,
+                "abs_pct_err": abs_pct_err,
+            })
+            self.logger.info(
+                f"  [{bearing_name}] pred={final_pred:.0f}s  gt={gt_rul:.0f}s  "
+                f"err={abs_err_s:.0f}s ({abs_pct_err:.1f}%)"
+            )
+
+        return self._aggregate_metrics(summary_rows)
+
+    def _aggregate_metrics(self, summary_rows: List[dict]) -> Dict[str, Any]:
+        """Aggregate per-bearing rows into overall metrics."""
         if not summary_rows:
             self.logger.warning(
-                "No test bearings evaluated — all metrics will be None. "
+                "No evaluation data available — all metrics will be None. "
                 "Check that test data is configured and features exist."
             )
             return {
@@ -391,24 +656,21 @@ class RULTrainerPHM:
             f"  RMSE : {rmse_s:.0f} s ({rmse_s/60:.1f} min)\n"
             f"  MAPE : {mape:.1f}%\n"
         )
-
         return {
             "mae_s":        mae_s,
             "rmse_s":       rmse_s,
             "mape":         mape,
-            "mean_abs_pct": mape,   # backward compatibility alias
+            "mean_abs_pct": mape,
             "summary_rows": summary_rows,
         }
 
-    def save_model(self, model: MLPModel, scaler: StandardScaler) -> str:
-        """
-        Save model checkpoint (includes scaler) to the global model store.
-        Returns saved path.
-        """
+    def save_model(self, model: Union[MLPModel, CNNLSTMModel], scaler: StandardScaler) -> str:
+        """Save model checkpoint (includes scaler). Returns saved path."""
         model_dir  = os.path.join("model_registry", "models")
         os.makedirs(model_dir, exist_ok=True)
         timestamp  = datetime.now().strftime("%Y%m%d_%H%M%S")
-        model_path = os.path.join(model_dir, f"rul_model_{timestamp}.pt")
+        model_type_tag = self.model_type.lower()
+        model_path = os.path.join(model_dir, f"rul_model_{model_type_tag}_{timestamp}.pt")
         model.scaler = scaler
         model.save(model_path)
         self.logger.info(f"Model saved to {model_path}")
@@ -425,17 +687,13 @@ class RULTrainerPHM:
     def register_model(
         self,
         run_id:     str,
-        model:      MLPModel,
+        model:      Union[MLPModel, CNNLSTMModel],
         model_path: str,
         metrics:    Dict,
     ) -> str:
-        """
-        Register trained model in ModelRegistry with all 4 metrics.
-        Returns model_id.
-        """
+        """Register trained model in ModelRegistry. Returns model_id."""
         registry = ModelRegistry()
 
-        # Report the actual data source in training_data_info
         if self.train_dataframes:
             source_desc = f"{len(self.train_dataframes)} bearing(s) from MongoDB factory_features"
             num_train   = len(self.train_dataframes)
@@ -453,6 +711,7 @@ class RULTrainerPHM:
             "num_test_files":  num_test,
             "window_size":     self.window_size,
             "source":          source_desc,
+            "model_type":      self.model_type,
         }
 
         model_id = registry.register_model(
@@ -469,6 +728,7 @@ class RULTrainerPHM:
             metadata           = {
                 "run_id":          run_id,
                 "hyperparameters": self.model_params,
+                "model_type":      self.model_type,
             },
         )
 
@@ -482,29 +742,46 @@ class RULTrainerPHM:
         Execute the full training pipeline.
         Returns dict with model_id, model_path, results_csv, and all metrics.
         """
-        try:
-            X_train, y_train, X_val, y_val, scaler = self.load_data()
-            model       = self.train(X_train, y_train, X_val, y_val)
-            metrics     = self.evaluate(model, scaler)
-            model_path  = self.save_model(model, scaler)
-            results_csv = self.save_results(metrics)
-            model_id    = self.register_model(run_id, model, model_path, metrics)
+        self.logger.info(
+            f"[{run_id}] Starting {self.model_type} training pipeline."
+        )
 
-            if self.state_location:
-                os.makedirs(os.path.dirname(self.state_location), exist_ok=True)
-                with open(self.state_location, "w") as f:
-                    f.write("complete")
+        if self.model_type == "CNN_LSTM":
+            return self._run_cnn_lstm(run_id)
+        return self._run_mlp(run_id)
 
-            return {
-                "model_id":     model_id,
-                "model_path":   model_path,
-                "results_csv":  results_csv,
-                "mae_s":        metrics["mae_s"],
-                "rmse_s":       metrics["rmse_s"],
-                "mape":         metrics["mape"],
-                "mean_abs_pct": metrics["mean_abs_pct"],
-            }
+    def _run_mlp(self, run_id: str) -> Dict[str, Any]:
+        """MLP training pipeline."""
+        X_train, y_train, X_val, y_val, scaler = self.load_data()
+        model   = self.train(X_train, y_train, X_val, y_val)
+        metrics = self.evaluate(model, scaler)
 
-        except Exception as e:
-            self.logger.error(f"Training failed: {e}", exc_info=True)
-            raise
+        model_path  = self.save_model(model, scaler)
+        results_csv = self.save_results(metrics)
+        model_id    = self.register_model(run_id, model, model_path, metrics)
+
+        self.logger.info(f"[{run_id}] MLPModel training complete — model_id={model_id}")
+        return {
+            "model_id":    model_id,
+            "model_path":  model_path,
+            "results_csv": results_csv,
+            **metrics,
+        }
+
+    def _run_cnn_lstm(self, run_id: str) -> Dict[str, Any]:
+        """CNN-LSTM training pipeline."""
+        train_datasets, val_datasets, scaler, feature_cols = self.load_data()
+        model   = self.train(train_datasets, val_datasets, scaler, feature_cols)
+        metrics = self.evaluate(model, scaler)
+
+        model_path  = self.save_model(model, scaler)
+        results_csv = self.save_results(metrics)
+        model_id    = self.register_model(run_id, model, model_path, metrics)
+
+        self.logger.info(f"[{run_id}] CNNLSTMModel training complete — model_id={model_id}")
+        return {
+            "model_id":    model_id,
+            "model_path":  model_path,
+            "results_csv": results_csv,
+            **metrics,
+        }

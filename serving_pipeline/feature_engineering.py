@@ -28,6 +28,13 @@ process_burst_precomputed() — SCADA simulator path: receives the 18-feature
 The quality labels do NOT remove or impute values — they annotate them so
 downstream stages (Inference, PM) can handle them gracefully.
 
+CNN-LSTM support
+────────────────
+get_window_matrix() exposes the raw (window_size, 19) base-feature matrix
+stored in self._window. The Inference stage calls this for CNN-LSTM models
+instead of using the flat 76-dim feature_vector, because the CNN-LSTM
+requires the temporal sequence of raw per-burst features as its input.
+
 Usage (standard)
 ────────────────
     from serving_pipeline.feature_engineering import ServingFeatureEngineer
@@ -50,6 +57,11 @@ Usage (SCADA simulator / pre-computed)
         burst_idx            = 42,
         precomputed_features = {"h_max": ..., "h_rms": ..., ...},  # 18 values
     )
+
+Usage (CNN-LSTM sequence input)
+────────────────────────────────
+    mat = fe.get_window_matrix()   # np.ndarray (window_size, 19), or None if not ready
+    # Pass mat to LivePredictor for CNN-LSTM forward pass
 """
 
 import logging
@@ -291,6 +303,36 @@ class ServingFeatureEngineer:
         )
 
         return self._push_base_row(burst_idx, base_row, precomputed_features)
+
+    def get_window_matrix(self) -> Optional[np.ndarray]:
+        """
+        Return the raw (window_size, 19) base-feature matrix for CNN-LSTM inference.
+
+        The CNN-LSTM model requires the temporal sequence of per-burst base
+        features as its input — NOT the flat 76-dim aggregated vector used by
+        the MLP.  This matrix is the exact internal state that _build_rolling_vector()
+        already uses to compute the rolling stats.
+
+        The 19 columns are: h_max, h_min, h_mean, h_sd, h_rms, h_skew, h_kurt,
+        h_crest, h_form, v_max, v_min, v_mean, v_sd, v_rms, v_skew, v_kurt,
+        v_crest, v_form, RUL_norm (= 0.0 at live inference time).
+
+        Returns
+        ───────
+        np.ndarray of shape (window_size, 19), dtype float32
+            Ready to be scaled and fed to CNNLSTMNet.forward() after adding a
+            batch dimension: mat[np.newaxis]  →  (1, window_size, 19).
+        None
+            If the window has not yet been filled (fewer than window_size bursts).
+        """
+        if len(self._window) < self._window_size:
+            return None
+        return np.array(self._window, dtype=np.float32)  # (window_size, 19)
+
+    @property
+    def base_feature_names(self) -> List[str]:
+        """The 19 column names of the matrix returned by get_window_matrix()."""
+        return list(_ROLLING_COLS)
 
     def reset(self) -> None:
         """Clear the rolling window and history (call between bearings)."""

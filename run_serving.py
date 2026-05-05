@@ -32,6 +32,14 @@ This script:
 7. Watches the group champion file for changes → hot-swaps model between bursts
 8. Detects session-end sentinel and idles until next SCADA session
 
+Behaviour on CRITICAL status
+─────────────────────────────
+When RUL drops below the critical threshold the pipeline logs a prominent
+warning and continues predicting every subsequent burst. Serving only stops
+on a session-end sentinel (all SCADA data consumed) or Ctrl+C. The
+maintenance decision (confirm / deny fault) is made by the human operator
+via the Fault Review dashboard — NOT by this script.
+
 Usage
 ─────
     # Champion inferred from bearing name (preferred):
@@ -116,41 +124,35 @@ def _derive_features(scada_stats: dict) -> dict:
     SCADA sends (10):   {prefix}_max, min, mean, sd, rms   (per axis)
     System derives (8): {prefix}_skew, kurt, crest, form   (per axis)
 
-    Crest and form are computed from the received rms/mean values.
-    Skew and kurt are set to 0.0 (neutral approximation — training default).
-
-    Returns the complete 18-feature dict ready for the pipeline.
+    Correct formulae:
+        crest = max / rms   (peak-to-RMS ratio)
+        form  = rms / mean  (form factor)
+    Skew and kurt cannot be derived from simple stats — set to 0.0.
     """
-    features = dict(scada_stats)
-
+    features = dict(scada_stats)   # copy the 10 SCADA stats
     for prefix in ("h", "v"):
-        rms  = scada_stats.get(f"{prefix}_rms",  0.0)
-        mean = scada_stats.get(f"{prefix}_mean", 0.0)
-        mx   = scada_stats.get(f"{prefix}_max",  0.0)
-
+        mx   = features.get(f"{prefix}_max", 0.0)
+        rms  = features.get(f"{prefix}_rms",  0.0)
+        mean = features.get(f"{prefix}_mean", 0.0)
+        features[f"{prefix}_crest"] = mx  / rms  if rms  != 0 else 0.0
+        features[f"{prefix}_form"]  = rms / mean if mean != 0 else 0.0
         features[f"{prefix}_skew"]  = 0.0
         features[f"{prefix}_kurt"]  = 0.0
-        features[f"{prefix}_crest"] = mx / rms   if rms  > 1e-9 else 0.0
-        features[f"{prefix}_form"]  = rms / mean if abs(mean) > 1e-9 else 0.0
-
-    return features   # 18 values total
+    return features   # 18 values
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Champion pointer watcher — per-group hot-swap
+# Champion watcher — detects model hot-swap between bursts
 # ─────────────────────────────────────────────────────────────────────────────
 
 class ChampionWatcher:
     """
-    Watches a group-specific champion JSON file for changes between bursts.
+    Watches the group-specific champion JSON file for changes.
+    When a new champion is promoted (mtime changes), returns the new record
+    so the serving loop can trigger a model reload.
 
-    When run_preprod.py promotes a new model for this group it atomically
-    writes the group champion file. This watcher detects the change and
-    signals the pipeline to reload — only for this group's serving process.
-
-    IMPORTANT: initialise_baseline() must be called after the first burst
-    arrives from SCADA — not on startup. This prevents detecting the existing
-    file from a previous session as a "new" champion.
+    Baseline is set after the first burst arrives — not at startup — to
+    avoid false positives from files written by a concurrent training thread.
     """
 
     def __init__(self, champion_path: str):
@@ -160,23 +162,10 @@ class ChampionWatcher:
         self._initialised = False
 
     def initialise_baseline(self):
-        """
-        Record the current champion file state as the baseline.
-        Call once after the first burst arrives.
-        """
-        if self._initialised:
-            return
+        """Call after the first burst arrives to arm the hot-swap detector."""
         if os.path.exists(self._path):
-            try:
-                self._last_mtime = os.path.getmtime(self._path)
-                self._last_model = self._read()
-                logger.info(
-                    f"[ChampionWatcher] Baseline set ({self._path}) — "
-                    f"current champion: "
-                    f"{self._last_model.get('model_id') if self._last_model else 'none'}"
-                )
-            except OSError:
-                pass
+            self._last_mtime = os.path.getmtime(self._path)
+            self._last_model = self._read()
         self._initialised = True
 
     def _read(self) -> Optional[dict]:
@@ -188,7 +177,7 @@ class ChampionWatcher:
 
     def check_for_new_champion(self) -> Optional[dict]:
         """
-        Return new champion dict if the file changed since baseline, else None.
+        Return the new champion record if the file has changed since last check.
         Call this between bursts — never mid-prediction.
         Only active after initialise_baseline() has been called.
         """
@@ -264,34 +253,29 @@ class LiveFeatureStoreReader:
         Return the next unconsumed burst for this bearing (lowest burst_idx),
         or None if nothing is available. Excludes session-end sentinels.
         """
-        return self._col.find_one(
+        from pymongo import ASCENDING
+        doc = self._col.find_one(
             {
                 "bearing_name": bearing_name,
                 "consumed":     False,
                 "session_end":  {"$exists": False},
             },
-            sort=[("burst_idx", 1)],
+            sort=[("burst_idx", ASCENDING)],
         )
+        return doc
 
-    def mark_consumed(self, doc_id, derived_features: dict = None) -> None:
-        """
-        Mark burst as consumed and write the full 18-feature dict flat
-        on the document in a single update. This replaces the previous
-        two-step approach (mark_consumed + write_derived_features).
-        """
-        update = {
-            "consumed":    True,
-            "consumed_at": datetime.now(timezone.utc).isoformat(),
-        }
+    def mark_consumed(self, doc_id, derived_features: dict = None):
+        """Mark a burst document as consumed. Optionally store derived features."""
+        update = {"$set": {"consumed": True, "consumed_at": datetime.now(timezone.utc).isoformat()}}
         if derived_features:
-            update.update(derived_features)   # write 18 features flat
-        self._col.update_one({"_id": doc_id}, {"$set": update})
+            update["$set"]["derived_features"] = derived_features
+        self._col.update_one({"_id": doc_id}, update)
 
     def check_session_end(self, bearing_name: str) -> bool:
-        return self._col.find_one({
-            "bearing_name": bearing_name,
-            "session_end":  True,
-        }) is not None
+        """Return True if a session-end sentinel exists for this bearing."""
+        return self._col.count_documents(
+            {"bearing_name": bearing_name, "session_end": True}
+        ) > 0
 
     def write_monitoring_metrics(
         self,
@@ -301,8 +285,8 @@ class LiveFeatureStoreReader:
         monitoring_out: dict,
         pm_out:         dict,
         inference_out:  dict,
-    ) -> None:
-        """Write monitoring metrics back to the Feature Store (Point 3)."""
+    ):
+        """Write monitoring metrics back to the Feature Store for this burst."""
         metrics = {
             "run_id":         run_id,
             "recorded_at":    datetime.now(timezone.utc).isoformat(),
@@ -401,14 +385,14 @@ def run_serving(
         "mongo_uri":     mongo_uri,
         "db_name":       db_name,
         "window_size":   window_size,
-        "champion_path": champion_path,   # pipeline loads this group's model
+        "champion_path": champion_path,
     })
 
     # ── Telemetry writer ──────────────────────────────────────────────────────
     from utils.serving_history import ServingTelemetry
     telemetry = ServingTelemetry(mongo_uri=mongo_uri, db_name=db_name)
 
-    # ── Champion watcher — watches the GROUP-SPECIFIC champion file ───────────
+    # ── Champion watcher ──────────────────────────────────────────────────────
     # Baseline is NOT set here — set after the first burst arrives.
     # This prevents detecting the existing file from a previous session.
     champion_watcher = ChampionWatcher(champion_path)
@@ -452,6 +436,8 @@ def run_serving(
                 time.sleep(poll_interval)
                 continue
 
+            idle_logged = False
+
             # ── First burst received — set champion baseline now ──────────────
             if not first_burst_seen:
                 champion_watcher.initialise_baseline()
@@ -469,38 +455,37 @@ def run_serving(
                     f"{new_champion.get('model_id')} "
                     f"(promoted {new_champion.get('promoted_at', '?')})"
                 )
-                pipeline._inference.reload_model()
-                logger.info(f"[HotSwap] [{bearing_name}] Model reloaded ✓")
+                pipeline.reload_model()
 
-            idle_logged = False
-            burst_idx   = burst_doc["burst_idx"]
-
-            # Read the 10 SCADA stats flat from the document
-            scada_fields = (
+            # ── Extract burst data ────────────────────────────────────────────
+            # SCADA writes the 10 stats flat on the document (not nested).
+            burst_idx   = burst_doc.get("burst_idx", 0)
+            _SCADA_KEYS = (
                 "h_max", "h_min", "h_mean", "h_sd", "h_rms",
                 "v_max", "v_min", "v_mean", "v_sd", "v_rms",
             )
-            scada_stats = {k: burst_doc[k] for k in scada_fields if k in burst_doc}
+            scada_stats = {k: burst_doc[k] for k in _SCADA_KEYS if k in burst_doc}
+            features    = _derive_features(scada_stats)
 
-            # ── Derive full 18-feature dict ───────────────────────────────────
-            features = _derive_features(scada_stats)
-
-            # ── Run the 4-stage pipeline ──────────────────────────────────────
-            h_signal = np.array([features.get("h_rms", 0.0)], dtype=np.float32)
-            v_signal = np.array([features.get("v_rms", 0.0)], dtype=np.float32)
-
-            t_start = time.time()
-            result  = pipeline.run_burst(
+            # ── Run 4-stage serving pipeline ──────────────────────────────────
+            # h_signal/v_signal are required by the pipeline signature but ignored
+            # when precomputed_features is provided — SCADA already extracted them.
+            t_start    = time.perf_counter()
+            result     = pipeline.run_burst(
                 run_id               = run_id,
                 bearing_name         = bearing_name,
                 burst_idx            = burst_idx,
-                h_signal             = h_signal,
-                v_signal             = v_signal,
+                h_signal             = np.array([0.0], dtype=np.float32),
+                v_signal             = np.array([0.0], dtype=np.float32),
                 precomputed_features = features,
             )
-            latency_ms = (time.time() - t_start) * 1000.0
+            latency_ms = (time.perf_counter() - t_start) * 1000
 
-            # ── Mark burst consumed + write full 18 features in one update ───
+            # ── Mark burst consumed — store the 18 base features ────────────
+            # The Feature Store holds raw sensor data only (18 base features).
+            # The trainer's _add_rolling_features() computes the rolling stats
+            # (mean/std/slope) to produce the full 76-dim vector at training
+            # time — exactly as it does for train/val bearings.
             fs_reader.mark_consumed(burst_doc["_id"], derived_features=features)
 
             pm         = result.get("pm")         or {}
@@ -509,7 +494,7 @@ def run_serving(
             ok         = result.get("ok",    False)
             ready      = result.get("ready", False)
 
-            # ── Write monitoring metrics back to Feature Store (Point 3) ──────
+            # ── Write monitoring metrics back to Feature Store ─────────────────
             if ok and ready:
                 fs_reader.write_monitoring_metrics(
                     bearing_name   = bearing_name,
@@ -560,14 +545,17 @@ def run_serving(
                 )
 
                 if pm.get("status") == "critical":
+                    # Log a prominent warning but DO NOT stop serving.
+                    # The maintenance decision is made by the human operator
+                    # via the Fault Review dashboard. Serving continues until
+                    # the SCADA session ends or the operator intervenes.
                     logger.warning(
                         f"\n{'!'*60}\n"
-                        f"  CRITICAL RUL THRESHOLD REACHED for {bearing_name}!\n"
-                        f"  RUL = {pm.get('rul_min', '?')} min\n"
-                        f"  Stopping serving — awaiting maintenance worker action.\n"
+                        f"  CRITICAL RUL ALERT for {bearing_name}!\n"
+                        f"  RUL = {pm.get('rul_min', '?'):.3f} min\n"
+                        f"  Continuing predictions — awaiting operator action.\n"
                         f"{'!'*60}"
                     )
-                    break
 
             elif not ready:
                 logger.debug(
