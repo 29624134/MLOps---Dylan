@@ -15,6 +15,19 @@ Each group trains its own model and writes its own champion file:
     model_registry/champion_bearing2.json
     model_registry/champion_bearing3.json
 
+Model type per group
+────────────────────
+Each group's model architecture is controlled by workflow.yaml under
+group_model_overrides:
+    "1": model_type: "MLP"
+    "2": model_type: "CNN_LSTM"
+    "3": model_type: "MLP"
+
+The orchestrator reads this in _inject_group_model_config() and injects
+the correct model_type and model_params into the training config before
+passing it to RULTrainerPHM. No code changes are needed to switch a
+group's architecture — only workflow.yaml needs editing.
+
 start_workflow() behaviour
 ──────────────────────────
 FIRST RUN (no champion files exist for any group):
@@ -107,9 +120,6 @@ class BearingRegistry:
         self.base_path = data["base_path"]
         self.bearings  = data["bearings"]
         self.groups    = data.get("groups", {})
-
-        # Backward compat: if old flat queue exists alongside new groups, ignore it
-        # The new structure keeps everything inside self.groups
 
     def _save(self):
         with open(self.config_path, "r") as f:
@@ -219,7 +229,8 @@ class BearingRegistry:
         for b in self.bearings:
             exists = "exists" if os.path.isdir(self.source_path(b)) else "NO FOLDER"
             logger.info(
-                f"  {b['name']:<14} group={b.get('group','?')} role={b['role']:<6} "
+                f"  {b['name']:<14} group={b.get('group','?')} "
+                f"role={b['role']:<6} "
                 f"status={b.get('status','?'):<12} [{exists}]"
             )
         logger.info(f"  Status counts: {dict(counts)}")
@@ -342,6 +353,73 @@ class WorkflowExecutor:
         )
 
     # ─────────────────────────────────────────────────────────────────────────
+    # PRIVATE: Model config injection
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _inject_group_model_config(self, config: Dict, group: str) -> Dict:
+        """
+        Read group_model_overrides from the workflow definition and inject
+        the correct model_type and model_params into the training config
+        for this group.
+
+        Priority order:
+            1. group_model_overrides[group].model_type  (from workflow.yaml)
+            2. config["model_type"]                     (training step default)
+            3. "MLP"                                    (hard fallback)
+
+        When model_type is "CNN_LSTM", the cnn_lstm_params block from the
+        training step config is used in place of model_params so the
+        CNN-LSTM gets its own hyperparameters without affecting MLP groups.
+
+        Parameters
+        ----------
+        config : dict — resolved training step config (already has model_params)
+        group  : str  — "1", "2", or "3"
+
+        Returns
+        -------
+        dict — config with model_type and model_params correctly set for the group
+        """
+        overrides      = self.workflow_def.get("group_model_overrides", {})
+        group_override = overrides.get(str(group), {})
+
+        # Determine model type for this group
+        model_type = (
+            group_override.get("model_type")
+            or config.get("model_type", "MLP")
+        ).upper().strip()
+
+        config["model_type"] = model_type
+
+        if model_type == "CNN_LSTM":
+            # Use the dedicated cnn_lstm_params block if present in the
+            # training step config, otherwise fall back to model_params.
+            # This keeps MLP groups completely unaffected.
+            cnn_lstm_params = config.get("cnn_lstm_params", {})
+            if cnn_lstm_params:
+                config["model_params"] = cnn_lstm_params
+                logger.info(
+                    f"[Group {group}] model_type=CNN_LSTM — "
+                    f"using cnn_lstm_params: {cnn_lstm_params}"
+                )
+            else:
+                logger.warning(
+                    f"[Group {group}] model_type=CNN_LSTM but no cnn_lstm_params "
+                    f"found in training config — falling back to model_params."
+                )
+        else:
+            logger.info(
+                f"[Group {group}] model_type={model_type} — "
+                f"using model_params: {config.get('model_params', {})}"
+            )
+
+        # Always remove cnn_lstm_params from the dict passed to RULTrainerPHM
+        # so it doesn't confuse the trainer with unexpected keys.
+        config.pop("cnn_lstm_params", None)
+
+        return config
+
+    # ─────────────────────────────────────────────────────────────────────────
     # PUBLIC: Full workflow — trains all 3 groups in parallel on first run
     # ─────────────────────────────────────────────────────────────────────────
 
@@ -367,55 +445,55 @@ class WorkflowExecutor:
         self.state_manager.init_state(run_id, workflow_name)
 
         try:
-            groups_needing_training = []
-            for group in self.registry.all_groups():
-                champion_path = self.registry.champion_path(group)
-                if not os.path.exists(champion_path):
-                    groups_needing_training.append(group)
-                else:
-                    logger.info(
-                        f"[{run_id}] Group {group}: champion already exists "
-                        f"({champion_path}) — skipping training."
-                    )
+            all_groups = self.registry.all_groups()
 
-            if not groups_needing_training:
+            # Determine which groups still need training
+            groups_to_train = [
+                g for g in all_groups
+                if not os.path.exists(self.registry.champion_path(g))
+            ]
+
+            if not groups_to_train:
                 logger.info(
-                    f"[{run_id}] All group champions exist — skipping training. "
-                    f"Serving is handled by run_serving.py."
+                    f"[{run_id}] All champion files already exist — "
+                    f"skipping training. "
+                    f"Serving Pipeline is handled by run_serving.py."
                 )
                 self.state_manager.mark_workflow_complete(run_id)
                 return run_id
 
             logger.info(
-                f"[{run_id}] Training groups in parallel: {groups_needing_training}"
+                f"[{run_id}] Training groups in parallel: {groups_to_train}"
             )
 
-            # Train all groups that need it concurrently
+            # Print model assignment for clarity
+            overrides = self.workflow_def.get("group_model_overrides", {})
+            for g in groups_to_train:
+                model_type = overrides.get(g, {}).get("model_type", "MLP")
+                logger.info(f"[{run_id}] Group {g} → model_type={model_type}")
+
+            # Launch one thread per group
             errors: Dict[str, str] = {}
-            threads = []
-            for group in groups_needing_training:
-                t = threading.Thread(
+            threads = [
+                threading.Thread(
                     target=self._train_group_thread,
-                    args=(run_id, group, errors),
-                    name=f"train-group-{group}",
+                    args=(run_id, g, errors),
                     daemon=True,
                 )
-                threads.append(t)
+                for g in groups_to_train
+            ]
+            for t in threads:
                 t.start()
-
             for t in threads:
                 t.join()
 
             if errors:
-                error_summary = "; ".join(
-                    f"Group {g}: {e}" for g, e in errors.items()
-                )
-                self.state_manager.mark_workflow_failed(run_id, error_summary)
-                raise RuntimeError(f"Training failed for groups: {error_summary}")
+                err_msg = "; ".join(f"Group {g}: {e}" for g, e in errors.items())
+                raise RuntimeError(f"One or more groups failed: {err_msg}")
 
             self.state_manager.mark_workflow_complete(run_id)
             logger.info(
-                f"[{run_id}] All groups trained successfully. "
+                f"[{run_id}] All groups trained. "
                 f"Serving Pipeline is handled by run_serving.py."
             )
 
@@ -465,6 +543,9 @@ class WorkflowExecutor:
         registry.compare_and_promote() to decide whether to write the
         group champion file.
 
+        The model architecture used is the same as the initial training for
+        this group — determined by group_model_overrides in workflow.yaml.
+
         Parameters
         ----------
         run_id    : str — unique identifier for this training run
@@ -472,33 +553,17 @@ class WorkflowExecutor:
         mongo_uri : str — MongoDB connection string
         db_name   : str — MongoDB database name
         """
+        overrides  = self.workflow_def.get("group_model_overrides", {})
+        model_type = overrides.get(str(group), {}).get("model_type", "MLP")
+
         logger.info(f"[{run_id}] Pre-Production retraining — Group {group}.")
+        logger.info(f"[{run_id}] model_type={model_type} (from workflow.yaml group_model_overrides).")
         logger.info(f"[{run_id}] Data: factory_features + feature_store_mirrored (Group {group} only).")
         logger.info(f"[{run_id}] Other groups are UNAFFECTED — their serving continues.")
 
-        self.state_manager.init_state(run_id, f"preprod_group{group}")
-
-        try:
-            logger.info(f"[{run_id}] Phase 1: Validation (Group {group})")
-            self._run_validation(run_id, group=group)
-
-            logger.info(f"[{run_id}] Phase 2: Training (Group {group})")
-            self._run_training(run_id, group=group)
-
-            self.state_manager.mark_workflow_complete(run_id)
-            logger.info(
-                f"[{run_id}] Pre-Production retraining complete for Group {group}. "
-                f"New model registered as PENDING — run_preprod.py will "
-                f"compare and promote via registry.compare_and_promote()."
-            )
-
-        except Exception as e:
-            self.state_manager.mark_workflow_failed(run_id, traceback.format_exc())
-            logger.error(
-                f"[{run_id}] Pre-Production FAILED (Group {group}): {e}", exc_info=True
-            )
-            raise
-
+        self.state_manager.init_state(run_id, f"preprod_group_{group}")
+        self._run_training(run_id, group=group)
+        self.state_manager.mark_workflow_complete(run_id)
         return run_id
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -508,21 +573,177 @@ class WorkflowExecutor:
     def confirm_fault_and_push_to_store(
         self,
         bearing_name:   str,
-        run_id:         str,
+        run_id:         Optional[str] = None,
         rul_at_failure: float = 0.0,
     ) -> Dict:
         """
-        Called from the API after a maintenance worker confirms a fault.
+        Re-label features for a confirmed fault bearing and push to MongoDB.
 
-        1. Determines which group this bearing belongs to
-        2. Reads the bearing's features.csv
-        3. Re-labels RUL from the confirmed failure point
-        4. Pushes labelled data to MongoDB feature_store_mirrored
-           (tagged with the bearing's group for scoped retraining)
-        5. Sets bearing status to 'confirmed'
+        The group is derived automatically from the bearing's "group" field
+        in bearings.json. Only this group's feature_store_mirrored collection
+        is updated — other groups are completely unaffected.
+        """
+        bearing = self.registry.get_bearing(bearing_name)
+        if not bearing:
+            raise FileNotFoundError(
+                f"Bearing '{bearing_name}' not found in registry."
+            )
 
-        The group tag in MongoDB means run_training_only(group) will only
-        pick up confirmed data from the relevant group, keeping groups isolated.
+        group = bearing.get("group")
+        if not group:
+            raise ValueError(
+                f"Bearing '{bearing_name}' has no 'group' field in bearings.json."
+            )
+
+        run_id = run_id or f"confirm_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        logger.info(
+            f"[{bearing_name}] Confirming fault — Group {group}, "
+            f"RUL at failure={rul_at_failure:.0f}s"
+        )
+
+        mongo_cfg = self._mongo_config()
+        if mongo_cfg.get("enabled"):
+            from pymongo import MongoClient
+            from utils.db_collections import COL_FEATURE_STORE, COL_FEATURE_STORE_MIRRORED
+
+            source_path  = self.registry.source_path(bearing)
+            features_csv = os.path.join(source_path, "features.csv")
+
+            # ── Load features: disk first, MongoDB feature_store fallback ─────
+            # Train/val bearings have features.csv on disk.
+            # Live bearings were served via SCADA — their bursts live flat in
+            # the MongoDB feature_store collection (written by scada_simulator).
+            if os.path.exists(features_csv):
+                logger.info(f"[{bearing_name}] Reading features from {features_csv}")
+                df = pd.read_csv(features_csv)
+            else:
+                logger.info(
+                    f"[{bearing_name}] features.csv not on disk — "
+                    f"reading live SCADA bursts from MongoDB feature_store."
+                )
+                client_fs = MongoClient(mongo_cfg["uri"], serverSelectionTimeoutMS=5000)
+                try:
+                    col_fs = client_fs[mongo_cfg["db_name"]][COL_FEATURE_STORE]
+                    docs   = list(col_fs.find(
+                        {"bearing_name": bearing_name, "session_end": {"$exists": False}},
+                        sort=[("burst_idx", 1)],
+                    ))
+                finally:
+                    client_fs.close()
+
+                if not docs:
+                    raise FileNotFoundError(
+                        f"No features.csv on disk and no SCADA bursts in "
+                        f"MongoDB feature_store for '{bearing_name}'. "
+                        f"Ensure the bearing was served before confirming the fault."
+                    )
+
+                # SCADA writes 10 stats flat on the document.
+                # run_serving.py derives and writes the remaining 8 base features
+                # (skew/kurt/crest/form per axis) into derived_features.
+                # We reconstruct the 18 base features here — the trainer's
+                # _add_rolling_features() will compute the rolling stats (76-dim)
+                # exactly as it does for train/val bearings. This keeps the
+                # Feature Store lean (raw sensor data only) and lets the trainer
+                # handle all feature engineering consistently.
+                _EXCLUDE = {
+                    "_id", "bearing_name", "sent_at", "consumed", "consumed_at",
+                    "session_end", "derived_features",
+                    # Monitoring/inference fields written by write_monitoring_metrics
+                    "run_id", "recorded_at", "type", "drift_detected",
+                    "drift_features", "anomaly_flag", "baseline_ready", "stats",
+                    "pm_status", "rul_s", "rul_min", "alert", "model_version",
+                    "data_quality",
+                }
+                # The 18 base feature columns the trainer expects
+                _BASE_COLS = {
+                    "h_max", "h_min", "h_mean", "h_sd", "h_rms",
+                    "h_skew", "h_kurt", "h_crest", "h_form",
+                    "v_max", "v_min", "v_mean", "v_sd", "v_rms",
+                    "v_skew", "v_kurt", "v_crest", "v_form",
+                }
+
+                rows = []
+                for doc in docs:
+                    row = {
+                        "burst_idx": doc.get("burst_idx", 0),
+                        "time_s":    doc.get("time_s", 0.0),
+                    }
+                    # Merge flat SCADA fields (10 stats)
+                    row.update({k: v for k, v in doc.items() if k not in _EXCLUDE})
+                    # Merge derived features (8 additional: skew/kurt/crest/form)
+                    derived = doc.get("derived_features") or {}
+                    # Only take the 18 base columns from derived — ignore rolling stats
+                    row.update({k: v for k, v in derived.items() if k in _BASE_COLS})
+                    rows.append(row)
+
+                df = pd.DataFrame(rows)
+                # Drop any columns that are not the 18 base features + identifiers
+                _keep = {"burst_idx", "time_s"} | _BASE_COLS
+                df    = df[[c for c in df.columns if c in _keep]]
+                logger.info(
+                    f"[{bearing_name}] Reconstructed {len(df)} bursts "
+                    f"({len(df.columns)} cols) from MongoDB feature_store. "
+                    f"Trainer will compute rolling features."
+                )
+
+            # ── Re-label RUL ──────────────────────────────────────────────────
+            last_time      = float(df["time_s"].max()) if "time_s" in df.columns else 0.0
+            df["RUL_s"]    = (last_time - df["time_s"]).clip(lower=rul_at_failure)
+            df["RUL_norm"] = df["RUL_s"] / last_time if last_time > 0 else 0.0
+
+            # ── Push to feature_store_mirrored ────────────────────────────────
+            client = MongoClient(mongo_cfg["uri"], serverSelectionTimeoutMS=5000)
+            db     = client[mongo_cfg["db_name"]]
+            col    = db[COL_FEATURE_STORE_MIRRORED]
+
+            records = df.to_dict("records")
+            for r in records:
+                r["dataset_id"] = bearing_name
+                r["metadata"]   = {
+                    "group":          group,
+                    "confirmed_at":   datetime.now().isoformat(),
+                    "rul_at_failure": rul_at_failure,
+                }
+
+            col.delete_many({"dataset_id": bearing_name})
+            col.insert_many(records)
+            client.close()
+
+            logger.info(
+                f"[{bearing_name}] Pushed {len(records)} confirmed-fault rows "
+                f"to feature_store_mirrored (Group {group})."
+            )
+            result = {
+                "pushed_rows": len(records),
+                "collection":  COL_FEATURE_STORE_MIRRORED,
+            }
+        else:
+            result = {"skipped": "MongoDB not enabled"}
+
+        self.registry.set_status(bearing_name, "confirmed")
+        logger.info(
+            f"[{bearing_name}] Status → confirmed. "
+            f"Group {group} retraining can now be triggered via run_preprod.py."
+        )
+        return {**result, "group": group, "bearing": bearing_name}
+
+    def deny_fault_and_push_to_store(
+        self,
+        bearing_name: str,
+        run_id:       Optional[str] = None,
+    ) -> Dict:
+        """
+        Push denied bearing data to feature_store_mirrored labelled as no-fault.
+
+        Even though the tech denied a fault, the bearing operational data is
+        still valuable training data — it represents healthy bearing operation.
+        We push it with fault_confirmed=False and RUL_s kept constant and high
+        (equal to the full recording length for every burst), meaning the model
+        learns these feature values correspond to a healthy bearing with a long RUL.
+
+        No retraining is triggered — the data is available for the next
+        scheduled preprod run alongside any confirmed fault data.
         """
         bearing = self.registry.get_bearing(bearing_name)
         if not bearing:
@@ -534,103 +755,106 @@ class WorkflowExecutor:
                 f"Bearing '{bearing_name}' has no 'group' field in bearings.json."
             )
 
-        source_folder = self.registry.source_path(bearing)
-        features_path = os.path.join(source_folder, "features.csv")
-
-        if os.path.exists(features_path):
-            # Train/val bearing — features.csv exists on disk
-            df = pd.read_csv(features_path)
-        else:
-            # Live bearing — features were streamed via SCADA and live in
-            # the feature_store collection in MongoDB, not on disk.
-            # Reconstruct a features DataFrame from the SCADA burst documents.
-            logger.info(
-                f"[{bearing_name}] features.csv not on disk — "
-                f"reading live SCADA bursts from MongoDB feature_store."
-            )
-            mongo_cfg = self._mongo_config()
-            if not mongo_cfg.get("enabled"):
-                raise FileNotFoundError(
-                    f"No features.csv for {bearing_name} at {features_path} "
-                    f"and MongoDB is not enabled — cannot reconstruct features."
-                )
-            from pymongo import MongoClient
-            from utils.db_collections import COL_FEATURE_STORE
-            client = MongoClient(mongo_cfg["uri"], serverSelectionTimeoutMS=5000)
-            try:
-                col  = client[mongo_cfg["db_name"]][COL_FEATURE_STORE]
-                docs = list(col.find(
-                    {"bearing_name": bearing_name, "session_end": {"$exists": False}},
-                    sort=[("burst_idx", 1)],
-                ))
-            finally:
-                client.close()
-
-            if not docs:
-                raise FileNotFoundError(
-                    f"No features.csv on disk and no SCADA bursts found in "
-                    f"MongoDB feature_store for {bearing_name}. "
-                    f"Ensure the bearing was served before confirming."
-                )
-
-            # Features are stored flat on the document (18 values written by
-            # run_serving.py when marking consumed). Exclude MongoDB/metadata
-            # fields to get only the feature columns.
-            _exclude = {
-                "_id", "bearing_name", "burst_idx", "time_s", "sent_at",
-                "consumed", "consumed_at", "session_end",
-            }
-            rows = []
-            for doc in docs:
-                row = {"burst_idx": doc["burst_idx"], "time_s": doc["time_s"]}
-                row.update({k: v for k, v in doc.items() if k not in _exclude})
-                rows.append(row)
-            df = pd.DataFrame(rows)
-            logger.info(
-                f"[{bearing_name}] Reconstructed {len(df)} bursts "
-                f"from MongoDB feature_store."
-            )
-        failure_s      = float(df["time_s"].max())
-        df["RUL_s"]    = (failure_s - df["time_s"]).clip(lower=0.0)
-        df["RUL_norm"] = df["RUL_s"] / failure_s if failure_s > 0 else 0.0
-
-        confirmed_path = os.path.join(source_folder, "features_confirmed.csv")
-        df.to_csv(confirmed_path, index=False)
+        run_id = run_id or f"deny_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        logger.info(
+            f"[{bearing_name}] Denying fault — Group {group}. "
+            f"Pushing no-fault data to feature_store_mirrored."
+        )
 
         mongo_cfg = self._mongo_config()
         if mongo_cfg.get("enabled"):
-            from utils.MongoDB import FeatureStore
-            from utils.db_collections import COL_FEATURE_STORE_MIRRORED
-            store = FeatureStore({
-                "mongo_uri":       mongo_cfg["uri"],
-                "db_name":         mongo_cfg["db_name"],
-                "collection_name": COL_FEATURE_STORE_MIRRORED,
-                "dataset_id":      bearing_name,
-                "version":         run_id,
-                "df_path":         confirmed_path,
-                "metadata": {
-                    "bearing_name":   bearing_name,
-                    "group":          group,
-                    "role":           bearing["role"],
-                    "run_id":         run_id,
-                    "confirmed":      True,
-                    "rul_at_failure": rul_at_failure,
-                    "confirmed_at":   datetime.now().isoformat(),
-                },
-            })
-            result = store.run()
+            from pymongo import MongoClient
+            from utils.db_collections import COL_FEATURE_STORE, COL_FEATURE_STORE_MIRRORED
+
+            source_path  = self.registry.source_path(bearing)
+            features_csv = os.path.join(source_path, "features.csv")
+
+            # Load features — same disk-first / MongoDB fallback as confirm
+            if os.path.exists(features_csv):
+                df = pd.read_csv(features_csv)
+            else:
+                client_fs = MongoClient(mongo_cfg["uri"], serverSelectionTimeoutMS=5000)
+                try:
+                    col_fs = client_fs[mongo_cfg["db_name"]][COL_FEATURE_STORE]
+                    docs   = list(col_fs.find(
+                        {"bearing_name": bearing_name, "session_end": {"$exists": False}},
+                        sort=[("burst_idx", 1)],
+                    ))
+                finally:
+                    client_fs.close()
+
+                if not docs:
+                    raise FileNotFoundError(
+                        f"No features.csv on disk and no SCADA bursts in "
+                        f"MongoDB feature_store for '{bearing_name}'."
+                    )
+
+                _EXCLUDE = {
+                    "_id", "bearing_name", "sent_at", "consumed", "consumed_at",
+                    "session_end", "derived_features",
+                    "run_id", "recorded_at", "type", "drift_detected",
+                    "drift_features", "anomaly_flag", "baseline_ready", "stats",
+                    "pm_status", "rul_s", "rul_min", "alert", "model_version",
+                    "data_quality",
+                }
+                _BASE_COLS = {
+                    "h_max", "h_min", "h_mean", "h_sd", "h_rms",
+                    "h_skew", "h_kurt", "h_crest", "h_form",
+                    "v_max", "v_min", "v_mean", "v_sd", "v_rms",
+                    "v_skew", "v_kurt", "v_crest", "v_form",
+                }
+                rows = []
+                for doc in docs:
+                    row = {
+                        "burst_idx": doc.get("burst_idx", 0),
+                        "time_s":    doc.get("time_s", 0.0),
+                    }
+                    row.update({k: v for k, v in doc.items() if k not in _EXCLUDE})
+                    derived = doc.get("derived_features") or {}
+                    row.update({k: v for k, v in derived.items() if k in _BASE_COLS})
+                    rows.append(row)
+                df = pd.DataFrame(rows)
+
+            # Label as no-fault: RUL_s stays constant and high (no degradation)
+            last_time      = float(df["time_s"].max()) if "time_s" in df.columns else 1.0
+            df["RUL_s"]    = last_time  # constant — healthy throughout
+            df["RUL_norm"] = 1.0        # fully healthy
+
+            # Push to feature_store_mirrored with no-fault label
+            client = MongoClient(mongo_cfg["uri"], serverSelectionTimeoutMS=5000)
+            db     = client[mongo_cfg["db_name"]]
+            col    = db[COL_FEATURE_STORE_MIRRORED]
+
+            records = df.to_dict("records")
+            for r in records:
+                r["dataset_id"]      = bearing_name
+                r["fault_confirmed"] = False
+                r["metadata"]        = {
+                    "group":           group,
+                    "fault_confirmed": False,
+                    "denied_at":       datetime.now().isoformat(),
+                    "label":           "no_fault",
+                }
+
+            col.delete_many({"dataset_id": bearing_name})
+            col.insert_many(records)
+            client.close()
+
             logger.info(
-                f"[{bearing_name}] Confirmed fault features pushed to "
-                f"MongoDB feature_store_mirrored (Group {group})."
+                f"[{bearing_name}] Pushed {len(records)} no-fault rows "
+                f"to feature_store_mirrored (Group {group}, fault_confirmed=False)."
             )
+            result = {
+                "pushed_rows":     len(records),
+                "collection":      COL_FEATURE_STORE_MIRRORED,
+                "fault_confirmed": False,
+                "label":           "no_fault",
+            }
         else:
             result = {"skipped": "MongoDB not enabled"}
 
-        self.registry.set_status(bearing_name, "confirmed")
-        logger.info(
-            f"[{bearing_name}] Status → confirmed. "
-            f"Group {group} retraining can now be triggered via run_preprod.py."
-        )
+        self.registry.set_status(bearing_name, "denied")
+        logger.info(f"[{bearing_name}] Status → denied. No-fault data stored.")
         return {**result, "group": group, "bearing": bearing_name}
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -648,7 +872,7 @@ class WorkflowExecutor:
         # 1. Validate
         self._run_validation(run_id, group=group)
 
-        # 2. Train
+        # 2. Train (model type injected per group_model_overrides)
         self._run_training(run_id, group=group)
 
         # 3. Select & write group champion
@@ -695,7 +919,7 @@ class WorkflowExecutor:
         self._execute(run_id, step_id, "validation", config, _validate)
 
     # ─────────────────────────────────────────────────────────────────────────
-    # PRIVATE: Training (group-scoped)
+    # PRIVATE: Training (group-scoped) — model type injected here
     # ─────────────────────────────────────────────────────────────────────────
 
     def _confirmed_fault_dataframes(self, group: str = None) -> List[pd.DataFrame]:
@@ -716,11 +940,6 @@ class WorkflowExecutor:
             db     = client[mongo_cfg["db_name"]]
             col    = db[COL_FEATURE_STORE_MIRRORED]
 
-            # Filter by group if specified — this is the key isolation mechanism
-            query_filter = {}
-            if group:
-                query_filter["metadata.group"] = group
-
             bearings_to_check = (
                 self.registry.live_bearings_in_group(group)
                 if group else self.registry.live_bearings()
@@ -729,23 +948,25 @@ class WorkflowExecutor:
             for b in bearings_to_check:
                 if b.get("status") != "confirmed":
                     continue
-                docs = list(col.find({"dataset_id": b["name"]}))
+                # Exclude no-fault (denied) records — fault_confirmed=False
+                # means the tech denied the fault. Absent field = confirmed data
+                # (written before the fault_confirmed field was introduced).
+                docs = list(col.find({
+                    "dataset_id":     b["name"],
+                    "fault_confirmed": {"$ne": False},
+                }))
                 if not docs:
                     logger.warning(
-                        f"  [{b['name']}] Status 'confirmed' but no docs in "
-                        f"feature_store_mirrored — skipping."
+                        f"  [{b['name']}] Status 'confirmed' but no confirmed-fault "
+                        f"docs in feature_store_mirrored — skipping."
                     )
                     continue
                 df = pd.DataFrame(docs).drop(
                     columns=["_id", "version", "metadata"], errors="ignore"
                 )
 
-                # Keep only the columns that match features.csv schema.
-                # The flat MongoDB documents contain extra fields
-                # (bearing_name, sent_at, consumed, consumed_at etc.) that
-                # must be excluded before passing to the trainer — otherwise
-                # _add_rolling_features() produces more columns than val data,
-                # causing the scaler shape mismatch.
+                # Keep only feature schema columns — extra MongoDB fields
+                # (dataset_id, sent_at, consumed etc.) cause scaler shape mismatch
                 _FEATURE_COLS = [
                     "file_id", "burst_idx", "time_s",
                     "h_max", "h_min", "h_mean", "h_sd", "h_rms",
@@ -777,6 +998,11 @@ class WorkflowExecutor:
         If group is specified, only loads bearings from that group — this is
         what keeps each group's model trained on its own operating condition data.
 
+        The model architecture (MLP or CNN_LSTM) is determined by
+        _inject_group_model_config() which reads group_model_overrides from
+        workflow.yaml. This is the only place in the codebase where the
+        per-group model type decision is made.
+
         Data sources
         ────────────
         Train : factory_features (train-role bearings for this group)
@@ -787,6 +1013,15 @@ class WorkflowExecutor:
         step    = self._training_step()
         config  = self.contract_manager.resolve_config(step["config"], run_id)
         step_id = f"training_g{group}" if group else "training"
+
+        # ── INJECT GROUP MODEL CONFIG ─────────────────────────────────────────
+        # This is the key change: before doing anything else, override the
+        # model_type and model_params in config based on which group we are
+        # training. Group 1 → MLP, Group 2 → CNN_LSTM, Group 3 → MLP
+        # (or whatever is configured in workflow.yaml group_model_overrides).
+        if group:
+            config = self._inject_group_model_config(config, group)
+        # ─────────────────────────────────────────────────────────────────────
 
         mongo_cfg = self._mongo_config()
         if not mongo_cfg.get("enabled"):
@@ -820,8 +1055,7 @@ class WorkflowExecutor:
         )
 
         # Val bearings are shared across ALL groups — every group validates
-        # against the full set of val bearings regardless of which group
-        # those bearings belong to.
+        # against the full set of val bearings regardless of group.
         val_bearings = self.registry.val_bearings()
         all_for_test = (
             self.registry.bearings_in_group(group)
@@ -965,117 +1199,100 @@ class WorkflowExecutor:
         self, run_id: str, metric: str = "mae_s", champion_path: str = None
     ) -> Dict:
         """
-        Compare the best new model from this run against the current champion
-        and promote if better.
+        Compare the best pending model from this run against THIS GROUP'S
+        champion file only. Never consults the global deployed model in the
+        registry — that would cause cross-group contamination where Group 1's
+        MLP gets compared against Group 2's CNN_LSTM.
 
-        When champion_path is provided (group-specific training), comparison
-        is done against that group's own champion file — NOT the shared
-        deployed model in the registry. This avoids the race condition where
-        3 parallel group training threads overwrite each other's promotion.
+        Each group has its own champion file:
+            model_registry/champion_bearing1.json  <- Group 1
+            model_registry/champion_bearing2.json  <- Group 2
+            model_registry/champion_bearing3.json  <- Group 3
 
-        When champion_path is None (single-group or legacy path), falls back
-        to the standard compare_and_promote() behaviour.
+        Comparison is done by reading that file. If the new model is better
+        (or no file exists yet) it is approved+deployed in the registry for
+        audit trail purposes and the champion file is written atomically.
         """
-        import json, os
-        from datetime import datetime, timezone
         from utils.model_registry import ModelRegistry
 
-        registry = ModelRegistry()
+        registry       = ModelRegistry()
+        pending_models = registry.list_models(run_id=run_id, status="pending")
 
-        if not champion_path:
-            # Legacy / single-group path — use registry's built-in comparison
-            result = registry.compare_and_promote(run_id=run_id, metric=metric)
-            logger.info(
-                f"[{run_id}] Model selection: promoted={result['promoted']}  "
-                f"model_id={result['model_id']}  reason={result['reason']}"
-            )
-            return result
+        if not pending_models:
+            raise RuntimeError(f"No pending models found for run_id={run_id}.")
 
-        # ── Group-specific path — compare against this group's champion file ──
-        pending = registry.list_models(run_id=run_id, status="pending")
-        if not pending:
-            msg = f"No pending models for run_id='{run_id}'."
-            logger.warning(f"[{run_id}] {msg}")
-            return {"promoted": False, "model_id": None, "reason": msg}
+        def _score(m):
+            v = m.get("metrics", {}).get(metric)
+            return v if v is not None else float("inf")
 
-        # Pick best pending model by metric (lower is better)
-        best       = min(
-            pending,
-            key=lambda m: m.get("metrics", {}).get(metric, float("inf"))
-        )
-        new_score   = best.get("metrics", {}).get(metric)
-        new_metrics = best.get("metrics", {})
+        best        = min(pending_models, key=_score)
         model_id    = best["model_id"]
-        model_path  = best["model_path"]
+        new_score   = _score(best)
+        new_metrics = best.get("metrics", {})
 
-        # Read this group's current champion (not the shared registry deployed model)
+        logger.info(f"[{run_id}] Best new model: {model_id} ({metric}={new_score:.2f})")
+
+        # Read THIS group's existing champion score from its file only
         old_score   = None
         old_metrics = {}
-        if os.path.exists(champion_path):
+        if champion_path and os.path.exists(champion_path):
             try:
                 with open(champion_path) as f:
-                    current = json.load(f)
-                old_score   = current.get("metrics", {}).get(metric)
-                old_metrics = current.get("metrics", {})
-            except Exception:
-                pass
+                    existing  = json.load(f)
+                old_score   = existing.get("metrics", {}).get(metric)
+                old_metrics = existing.get("metrics", {})
+                logger.info(
+                    f"[{run_id}] Existing group champion: "
+                    f"{existing.get('model_id')} ({metric}={old_score})"
+                )
+            except Exception as e:
+                logger.warning(f"[{run_id}] Could not read {champion_path}: {e} — no existing champion.")
 
-        # Decision
+        # Decision — group-isolated comparison only
         if old_score is None:
-            reason  = "No existing group champion — promoting new model."
+            reason  = "No existing group champion — promoting new model unconditionally."
             promote = True
-        elif new_score is None:
-            reason  = f"New model has no '{metric}' — left as PENDING."
-            promote = False
         elif new_score < old_score:
-            reason  = f"New model BETTER: {metric} {old_score:.2f} → {new_score:.2f}."
+            reason  = f"New model BETTER for this group: {metric} {old_score:.2f} → {new_score:.2f}."
             promote = True
         else:
-            reason  = f"New model NOT better: {new_score:.2f} >= {old_score:.2f}."
+            reason  = f"New model NOT better for this group: {new_score:.2f} >= {old_score:.2f}. Retaining existing."
             promote = False
 
-        logger.info(f"[{run_id}] Group champion comparison: {reason}")
+        logger.info(f"[{run_id}] Group champion decision: {reason}")
 
         if promote:
-            # Approve + deploy in registry (for audit trail)
+            # Approve + deploy in registry for audit trail
             registry.approve_model(model_id, approved_by="auto_group_promote")
             registry.deploy_model(model_id)
 
-            # Write group-specific champion file atomically
-            champion = {
-                "model_id":    model_id,
-                "model_path":  model_path,
-                "metrics":     new_metrics,
-                "promoted_at": datetime.now(timezone.utc).isoformat(),
-            }
-            os.makedirs(os.path.dirname(champion_path), exist_ok=True)
-            tmp = champion_path + ".tmp"
-            with open(tmp, "w") as f:
-                json.dump(champion, f, indent=2)
-            os.replace(tmp, champion_path)
-            logger.info(
-                f"[{run_id}] Group champion written → {champion_path} ({model_id})"
-            )
+            # Write group champion file atomically
+            if champion_path:
+                record = {
+                    "model_id":    model_id,
+                    "model_path":  best.get("model_path"),
+                    "model_type":  best.get("model_type", "MLP"),
+                    "metrics":     new_metrics,
+                    "promoted_at": datetime.now().isoformat(),
+                }
+                os.makedirs(os.path.dirname(champion_path), exist_ok=True)
+                tmp = champion_path + ".tmp"
+                with open(tmp, "w") as f:
+                    json.dump(record, f, indent=2)
+                os.replace(tmp, champion_path)
+                logger.info(f"[{run_id}] Group champion written → {champion_path}")
 
-        return {
-            "promoted":    promote,
-            "model_id":    model_id,
-            "new_score":   new_score,
-            "old_score":   old_score,
-            "new_metrics": new_metrics,
-            "old_metrics": old_metrics,
-            "reason":      reason,
-        }
+        return {"model_id": model_id, "promoted": promote, "new_score": new_score, "old_score": old_score, "reason": reason}
 
     # ─────────────────────────────────────────────────────────────────────────
-    # PRIVATE: Workflow step templates (read from workflow.yaml)
+    # PRIVATE: Step helpers
     # ─────────────────────────────────────────────────────────────────────────
 
     def _get_step(self, step_type: str) -> Dict:
         for step in self.workflow_def.get("steps", []):
-            if step["type"] == step_type:
+            if step.get("type") == step_type:
                 return step
-        raise KeyError(f"No step of type '{step_type}' in workflow definition.")
+        raise KeyError(f"No step of type '{step_type}' found in workflow definition.")
 
     def _validation_step(self) -> Dict:
         return self._get_step("validation")

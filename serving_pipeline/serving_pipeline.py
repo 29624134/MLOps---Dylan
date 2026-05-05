@@ -185,13 +185,13 @@ class ServingPipeline:
     # ── Public API ────────────────────────────────────────────────────────────
 
     def run_burst(
-        self,
-        run_id:               str,
-        bearing_name:         str,
-        burst_idx:            int,
-        h_signal:             np.ndarray,
-        v_signal:             np.ndarray,
-        precomputed_features: Optional[Dict[str, float]] = None,
+            self,
+            run_id: str,
+            bearing_name: str,
+            burst_idx: int,
+            h_signal: Optional[np.ndarray] = None,  # optional
+            v_signal: Optional[np.ndarray] = None,  # optional
+            precomputed_features: Optional[Dict[str, float]] = None,
     ) -> Dict[str, Any]:
         """
         Run one burst through the full 4-stage pipeline.

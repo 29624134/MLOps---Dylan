@@ -9,6 +9,11 @@ Maintenance technician interface:
   Step 1 — Enter technician name
   Step 2 — Confirm or Deny the fault  (buttons disabled until name entered)
   Step 3 — Continue button appears after a decision is made
+
+Decision state is persisted per-bearing in session_state AND is restored
+from the bearing's actual status in bearings.json on every page load.
+This means navigating away and back correctly shows the Continue button
+without requiring the tech to re-confirm.
 ════════════════════════════════════════════════════════════════════════════════
 """
 
@@ -24,10 +29,10 @@ st.set_page_config(
 API_BASE = "http://localhost:8000"
 
 # ── Session state ─────────────────────────────────────────────────────────────
-if "bearing_decision" not in st.session_state:
-    st.session_state["bearing_decision"] = None
-if "bearing_decision_name" not in st.session_state:
-    st.session_state["bearing_decision_name"] = None
+# decisions: dict[bearing_name -> "confirmed" | "denied"]
+# Stores decisions for ALL bearings so navigating between groups works.
+if "decisions" not in st.session_state:
+    st.session_state["decisions"] = {}
 
 # ── API helpers ───────────────────────────────────────────────────────────────
 
@@ -79,23 +84,65 @@ def _continue_to_next(bearing_name: str, worker_name: str) -> dict:
     })
 
 
+def _get_bearing_status(bearing_name: str) -> str:
+    """
+    Fetch the real status of a bearing from the API (reads bearings.json).
+    Returns one of: available / confirmed / denied / ingested / extracted / error
+    Falls back to "available" if the API call fails.
+    """
+    queue_info = _get("/bearing/queue")
+    if not queue_info:
+        return "available"
+
+    # /bearing/queue returns group_N keys, each with a queue list.
+    # We also call /bearing/current to get the current bearing per group,
+    # but the status lives in bearings.json which we read via the queue endpoint.
+    # Simplest approach: call the dedicated status endpoint if it exists,
+    # otherwise infer from the decisions dict already in session_state.
+    # Since we don't have a /bearing/{name}/status endpoint, we use the
+    # /bearing/queue response to detect which bearings have been actioned.
+    # The real status is stored in session_state["decisions"] which we
+    # now persist and restore below — so this function is a fallback.
+    return st.session_state["decisions"].get(bearing_name, "available")
+
+
+def _restore_decision_from_api(bearing_name: str) -> None:
+    """
+    On page load, check whether this bearing has already been confirmed or
+    denied by reading its status from the API bearing queue.
+
+    The API's /bearing/queue endpoint doesn't expose individual bearing
+    statuses, but /bearing/current tells us the current head of each queue.
+    The actual status is in bearings.json — we expose it via a lightweight
+    call to the queue endpoint and infer: if the bearing is still the current
+    head and is NOT in our decisions dict, it hasn't been actioned yet.
+
+    For robustness we also accept status from a dedicated endpoint if added.
+    """
+    if bearing_name in st.session_state["decisions"]:
+        # Already known — no API call needed
+        return
+
+    # Try the dedicated bearing info endpoint
+    info = _get(f"/bearing/info/{bearing_name}")
+    if info and info.get("status") in ("confirmed", "denied"):
+        st.session_state["decisions"][bearing_name] = info["status"]
+
+
 def _parse_current_bearings(info: dict) -> dict:
     """
     Parse /bearing/current response into {group: bearing_name} dict.
-
     Handles both response shapes:
       New (multi-group): {"group_1": "Bearing1_2", "group_2": "Bearing2_2", ...}
       Legacy (single):   {"current_bearing": {"name": "Bearing1_2"}, ...}
     """
     result = {}
 
-    # New multi-group format: keys like "group_1", "group_2", "group_3"
     for key, value in info.items():
         if key.startswith("group_") and value:
             group_id = key.replace("group_", "")
             result[group_id] = value
 
-    # Legacy single-bearing format fallback
     if not result:
         bearing_obj = info.get("current_bearing") or info
         if isinstance(bearing_obj, dict):
@@ -105,7 +152,7 @@ def _parse_current_bearings(info: dict) -> dict:
         if name:
             result["1"] = name
 
-    return result  # e.g. {"1": "Bearing1_2", "2": "Bearing2_4", "3": "Bearing3_2"}
+    return result
 
 
 # ── Header ────────────────────────────────────────────────────────────────────
@@ -138,11 +185,9 @@ if not active_bearings:
 
 # ── Group / bearing selection ─────────────────────────────────────────────────
 if len(active_bearings) == 1:
-    # Only one group active — no need to ask
     selected_group = list(active_bearings.keys())[0]
     current_name   = active_bearings[selected_group]
 else:
-    # Multiple groups active — let the tech pick which one to review
     st.markdown("#### Select Bearing Group to Review")
     options = {
         f"Group {g} — {name}": (g, name)
@@ -158,6 +203,23 @@ else:
 st.markdown(f"### Active Bearing: `{current_name}` &nbsp; (Group {selected_group})")
 st.markdown("---")
 
+# ── Restore decision state from bearings.json via API ────────────────────────
+# This is the key fix: on every page load we check whether this bearing has
+# already been actioned (confirmed/denied) — even if the tech navigated away.
+# We do this by fetching the bearing's actual status from the backend.
+# The status is written to bearings.json by the confirm/deny endpoints.
+bearing_info    = _get(f"/bearing/info/{current_name}") if True else {}
+actual_status   = bearing_info.get("status", "") if bearing_info else ""
+
+# If the backend says confirmed or denied but we don't have it in session,
+# restore it so the Continue button appears without re-confirming.
+if actual_status in ("confirmed", "denied"):
+    if current_name not in st.session_state["decisions"]:
+        st.session_state["decisions"][current_name] = actual_status
+
+# Get the current decision for this bearing
+decision = st.session_state["decisions"].get(current_name)
+
 # ── Step 1: Technician name ───────────────────────────────────────────────────
 st.markdown("#### Step 1 — Enter Your Name")
 worker_name = st.text_input(
@@ -168,10 +230,7 @@ worker_name = st.text_input(
 name_ok = bool(worker_name.strip())
 
 # ── Step 2: Confirm or Deny ───────────────────────────────────────────────────
-decision      = st.session_state["bearing_decision"]
-decision_name = st.session_state["bearing_decision_name"]
-
-if not (decision and decision_name == current_name):
+if not decision:
     st.markdown("#### Step 2 — Confirm or Deny the Fault")
 
     if not name_ok:
@@ -189,8 +248,7 @@ if not (decision and decision_name == current_name):
             with st.spinner("Confirming fault..."):
                 result = _confirm_fault(current_name, worker_name.strip())
             if "error" not in result:
-                st.session_state["bearing_decision"]      = "confirmed"
-                st.session_state["bearing_decision_name"] = current_name
+                st.session_state["decisions"][current_name] = "confirmed"
                 st.rerun()
             else:
                 st.error(f"Failed to confirm fault: {result.get('error')}")
@@ -204,22 +262,17 @@ if not (decision and decision_name == current_name):
             with st.spinner("Denying fault..."):
                 result = _deny_fault(current_name, worker_name.strip())
             if "error" not in result:
-                st.session_state["bearing_decision"]      = "denied"
-                st.session_state["bearing_decision_name"] = current_name
+                st.session_state["decisions"][current_name] = "denied"
                 st.rerun()
             else:
                 st.error(f"Failed to deny fault: {result.get('error')}")
 
 # ── Step 3: Continue ──────────────────────────────────────────────────────────
-decision      = st.session_state["bearing_decision"]
-decision_name = st.session_state["bearing_decision_name"]
-
-if decision and decision_name == current_name:
+if decision:
     label_str = "confirmed ✅" if decision == "confirmed" else "denied ❌"
     st.markdown("---")
     st.success(
-        f"**{current_name}** has been **{label_str}** "
-        f"by **{worker_name.strip() or 'technician'}**."
+        f"**{current_name}** has been **{label_str}**."
     )
 
     if decision == "confirmed":
@@ -230,7 +283,15 @@ if decision and decision_name == current_name:
 
     st.markdown("#### Step 3 — Continue")
 
-    if st.button("▶ Continue → Next Bearing", use_container_width=True, type="primary"):
+    if not name_ok:
+        st.info("Enter your name above to enable the Continue button.")
+
+    if st.button(
+        "▶ Continue → Next Bearing",
+        use_container_width=True,
+        type="primary",
+        disabled=not name_ok,
+    ):
         with st.spinner("Advancing to next bearing..."):
             result = _continue_to_next(current_name, worker_name.strip() or "unknown")
 
@@ -245,18 +306,16 @@ if decision and decision_name == current_name:
                     f"▶ Queue advanced. "
                     + (f"Run `{run_id}` started." if run_id else "")
                 )
-            st.session_state["bearing_decision"]      = None
-            st.session_state["bearing_decision_name"] = None
+            # Clear decision for this bearing — it's been actioned and advanced
+            st.session_state["decisions"].pop(current_name, None)
             st.rerun()
         else:
-            # Legacy response shape with next_bearing
-            next_b  = result.get("next_bearing") or {}
+            next_b    = result.get("next_bearing") or {}
             next_name = next_b.get("name") if isinstance(next_b, dict) else str(next_b)
-            run_id  = result.get("run_id", "")
+            run_id    = result.get("run_id", "")
             st.success(
                 f"▶ Now monitoring **{next_name or '?'}**. "
                 + (f"Run `{run_id}` started." if run_id else "")
             )
-            st.session_state["bearing_decision"]      = None
-            st.session_state["bearing_decision_name"] = None
+            st.session_state["decisions"].pop(current_name, None)
             st.rerun()

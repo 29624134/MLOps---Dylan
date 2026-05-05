@@ -796,6 +796,29 @@ def get_bearing_queue():
         }
     return result
 
+@app.get("/bearing/info/{bearing_name}", operation_id="get_bearing_info",
+         tags=["Bearing Lifecycle"])
+def get_bearing_info(bearing_name: str):
+    """
+    Return the current status and metadata for a single bearing.
+    Used by the Fault Review dashboard to restore decision state on page load
+    — if status is 'confirmed' or 'denied', the Continue button is shown
+    without requiring the tech to re-confirm after navigating away.
+    """
+    from orchestrator import BearingRegistry
+    reg     = BearingRegistry("config/bearings.json")
+    bearing = reg.get_bearing(bearing_name)
+    if not bearing:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Bearing '{bearing_name}' not found in registry."
+        )
+    return {
+        "name":   bearing["name"],
+        "group":  bearing.get("group"),
+        "role":   bearing.get("role"),
+        "status": bearing.get("status", "available"),
+    }
 
 @app.post("/bearing/reset-queue", operation_id="reset_bearing_queue",
           tags=["Bearing Lifecycle"])
@@ -891,25 +914,40 @@ def confirm_fault(request: FaultConfirmRequest):
 def deny_fault(request: FaultDenyRequest):
     """
     Maintenance tech denies the fault (false positive).
-    Sets bearing status → 'denied'. No retraining triggered.
-    Call POST /bearing/continue to advance the queue.
+
+    The bearing data is NOT discarded — it is pushed to feature_store_mirrored
+    labelled as no-fault (fault_confirmed=False, RUL_s kept constant and high).
+    This gives the model healthy negative-class examples for future retraining.
+
+    No retraining is triggered immediately. The data is available on the next
+    scheduled preprod run.
+
+    Call POST /bearing/continue afterwards to advance the queue.
     """
-    from orchestrator import BearingRegistry
-    reg     = BearingRegistry("config/bearings.json")
-    bearing = reg.get_bearing(request.bearing_name)
-    if not bearing:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Bearing '{request.bearing_name}' not found."
+    from orchestrator import WorkflowExecutor
+    try:
+        executor = WorkflowExecutor()
+        result = executor.deny_fault_and_push_to_store(
+            bearing_name=request.bearing_name,
+            run_id=request.run_id if hasattr(request, "run_id") else None,
         )
-    reg.set_status(request.bearing_name, "denied")
-    return {
-        "status":    "denied",
-        "bearing":   request.bearing_name,
-        "group":     bearing.get("group"),
-        "worker":    request.worker_name,
-        "denied_at": datetime.now().isoformat(),
-    }
+        return {
+            "status": "denied",
+            "bearing": request.bearing_name,
+            "group": result.get("group"),
+            "worker": request.worker_name,
+            "denied_at": datetime.now().isoformat(),
+            "store_result": result,
+            "message": (
+                f"Fault denied. No-fault data for {request.bearing_name} "
+                f"pushed to feature_store_mirrored (fault_confirmed=False). "
+                f"Data will be used as negative-class examples in next retraining."
+            ),
+        }
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/bearing/continue", operation_id="continue_to_next_bearing",

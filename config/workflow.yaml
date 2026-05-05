@@ -17,6 +17,29 @@ workflows:
       uri: "mongodb://localhost:27017"
       db_name: "phm_mlops"
 
+    # ---------------------------------------------------------------
+    # GROUP MODEL OVERRIDES
+    # Controls which model architecture each bearing group trains.
+    #
+    # Supported model_type values:
+    #   "MLP"      — Multi-Layer Perceptron (default)
+    #   "CNN_LSTM" — 1D CNN → LSTM → Attention with condition embedding
+    #
+    # The model_type here overrides the model_type in the training step
+    # config for that specific group. Groups not listed here fall back
+    # to the model_type defined in the training step config below.
+    #
+    # To change a group's model: edit model_type here only.
+    # No Python code changes are needed.
+    # ---------------------------------------------------------------
+    group_model_overrides:
+      "1":
+        model_type: "MLP"
+      "2":
+        model_type: "CNN_LSTM"
+      "3":
+        model_type: "MLP"
+
     steps:
 
       # ---------------------------------------------------------------
@@ -68,6 +91,21 @@ workflows:
       # ---------------------------------------------------------------
       # TRAINING
       # File lists are built dynamically from bearing registry roles.
+      #
+      # model_type sets the DEFAULT model for any group not listed in
+      # group_model_overrides above. In the current setup this acts as
+      # the fallback only — all three groups are explicitly configured.
+      #
+      # MLP model_params (used by Group 1 and Group 3):
+      #   hidden_units, dropout, epochs, lr, batch_size, patience, seed
+      #
+      # CNN-LSTM model_params (used by Group 2):
+      #   cnn_channels, cnn_kernel, cnn_pool, lstm_hidden, lstm_layers,
+      #   fc_hidden, condition_emb_dim, dropout, epochs, lr, batch_size,
+      #   patience, seed
+      #   seq_len is auto-set from window_size if not specified here.
+      #
+      # Both model types share: horizon, rul_scale (injected automatically).
       # ---------------------------------------------------------------
       - id: training
         type: training
@@ -78,6 +116,9 @@ workflows:
           log_path: "workflow_data/{run_id}/logs/training.log"
           window_size: 40
           rul_scale: 30000.0
+          # Default model type — overridden per group by group_model_overrides
+          model_type: "MLP"
+          # MLP params (Groups 1 and 3)
           model_params:
             horizon: 10
             hidden_units: [128, 64]
@@ -86,6 +127,23 @@ workflows:
             lr: 0.0001
             batch_size: 32
             patience: 30
+            seed: 42
+          # CNN-LSTM params (Group 2)
+          # These are merged in by the orchestrator when model_type = "CNN_LSTM"
+          cnn_lstm_params:
+            horizon: 10
+            cnn_channels: [64, 128]
+            cnn_kernel: 3
+            cnn_pool: 2
+            lstm_hidden: 128
+            lstm_layers: 2
+            fc_hidden: 64
+            condition_emb_dim: 8
+            dropout: 0.2
+            epochs: 300
+            lr: 0.001
+            batch_size: 32
+            patience: 60
             seed: 42
 
       # ---------------------------------------------------------------
@@ -142,10 +200,10 @@ workflows:
         depends_on: ["live_serving"]
         config:
           window_size: 40
-          burst_period: 10.0
-          realtime: false
           critical_threshold_s: 3600
           warning_threshold_s: 14400
-          baseline_path: "model_registry/monitoring_baseline.json"
+          baseline_path: "workflow_data/monitoring_baseline.json"
           state_location: "workflow_data/{run_id}/state/serving_pipeline.flag"
           log_path: "workflow_data/{run_id}/logs/serving_pipeline.log"
+          enable_serving_history: true
+          enable_json_export: false
