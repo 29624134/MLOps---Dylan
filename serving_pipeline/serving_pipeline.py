@@ -28,6 +28,13 @@ Design notes
   directly and skips re-extraction from raw signals.
 - reload_model() is public — called by run_serving.py on hot-swap detection.
 
+CNN-LSTM support
+────────────────
+Stage 2 (Inference) is given the ServingFeatureEngineer instance and the
+bearing_name so it can call fe.get_window_matrix() and derive the condition
+embedding when the deployed model is a CNN-LSTM. These extra kwargs are
+ignored for MLP models, so the call site is identical for both.
+
 ServingHistory now writes to RUL_predictions (COL_RUL_PREDICTIONS).
 Indexes are created automatically in ServingHistory.__init__ — do NOT call
 ensure_indexes() here.
@@ -151,7 +158,7 @@ class ServingPipeline:
         self._exporter = None
         if cfg.get("enable_export_service", True):
             try:
-                from export_service.export_service import ExportService
+                from utils.export_service import ExportService
                 self._exporter = ExportService({
                     "output_dir":       cfg.get("export_output_dir", "export_output"),
                     "enable_rul_csv":   True,
@@ -343,7 +350,14 @@ class ServingPipeline:
             }
 
         # ── Stage 2: Inference ────────────────────────────────────────────────
-        infer_out = self._inference.run(fe_out)
+        # Pass fe_engineer + bearing_name so CNN-LSTM models can call
+        # fe.get_window_matrix() and derive the condition embedding.
+        # Both kwargs are ignored when the deployed model is an MLP.
+        infer_out = self._inference.run(
+            fe_out,
+            fe_engineer  = self._fe,
+            bearing_name = bearing_name,
+        )
 
         # ── Stage 3: Predictive Maintenance ───────────────────────────────────
         pm_out = self._pm.run(infer_out)
