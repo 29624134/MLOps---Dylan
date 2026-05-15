@@ -34,7 +34,7 @@ workflows:
     # ---------------------------------------------------------------
     group_model_overrides:
       "1":
-        model_type: "MLP"
+        model_type: "CNN_LSTM"
       "2":
         model_type: "CNN_LSTM"
       "3":

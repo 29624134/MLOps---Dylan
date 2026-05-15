@@ -26,6 +26,25 @@ Fallback : CSV file paths via train_files / val_files / test_files — kept
            for backward compatibility with external scripts (IEEE original
            code, standalone notebooks) that still run directly from disk.
 
+CNN-LSTM feature space
+──────────────────────
+The CNN-LSTM trains on the 19 RAW base features per burst:
+
+    18 time-domain features (h_max..v_form) + RUL_norm placeholder = 19
+
+It does NOT consume the rolling mean/std/slope features the MLP uses —
+the LSTM learns temporal patterns itself, so pre-computed rolling stats
+are redundant and (worse) lead to a scaler/feature-count mismatch at
+serve time, where ServingFeatureEngineer.get_window_matrix() returns the
+raw (window_size, 19) matrix.
+
+To enforce this, _load_data_cnn_lstm() projects the input DataFrames down
+to the 19 _CNN_LSTM_BASE_COLS columns in the exact same order used by
+ServingFeatureEngineer, then fits a fresh StandardScaler on those 19
+columns only. That scaler is the one persisted alongside the model
+checkpoint, so live inference and training operate in identical feature
+space.
+
 CNN-LSTM sequence preparation
 ──────────────────────────────
 For CNN_LSTM, load_data() returns per-bearing (X, y, rul_max, condition)
@@ -80,6 +99,21 @@ BEARING_CONDITION = {
     "Bearing2_4": 2, "Bearing2_5": 2, "Bearing2_6": 2, "Bearing2_7": 2,
     "Bearing3_1": 3, "Bearing3_2": 3, "Bearing3_3": 3,
 }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CNN-LSTM feature space
+# ─────────────────────────────────────────────────────────────────────────────
+# These MUST match serving_pipeline/feature_engineering.py::_ROLLING_COLS
+# exactly (same names, same order). ServingFeatureEngineer.get_window_matrix()
+# returns a (window_size, 19) matrix in this column order at live inference
+# time, so the scaler fitted here at training time must expect the same.
+_CNN_LSTM_BASE_COLS = [
+    "h_max", "h_min", "h_mean", "h_sd", "h_rms",
+    "h_skew", "h_kurt", "h_crest", "h_form",
+    "v_max", "v_min", "v_mean", "v_sd", "v_rms",
+    "v_skew", "v_kurt", "v_crest", "v_form",
+    "RUL_norm",
+]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -218,6 +252,32 @@ class RULTrainerPHM:
                 return part
         return Path(path).stem
 
+    # ── CNN-LSTM base-feature projection ──────────────────────────────────────
+
+    def _project_to_cnn_lstm_cols(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Return a copy of `df` containing only the 19 base columns the CNN-LSTM
+        expects, in the canonical order matching ServingFeatureEngineer.
+
+        Missing columns are filled with 0.0 — this lets the trainer accept
+        DataFrames that may or may not include 'RUL_norm' as an input feature
+        (it's a placeholder at serve time anyway).
+        """
+        out = pd.DataFrame(index=df.index)
+        for col in _CNN_LSTM_BASE_COLS:
+            if col in df.columns:
+                out[col] = df[col].astype(np.float32)
+            else:
+                # RUL_norm is the only column legitimately allowed to be missing
+                # in upstream data — fill with 0.0 to match live inference.
+                if col != "RUL_norm":
+                    self.logger.warning(
+                        f"  Column '{col}' missing — filling with 0.0. "
+                        f"Check upstream feature extraction."
+                    )
+                out[col] = 0.0
+        return out
+
     # ── CNN-LSTM sequence preparation ─────────────────────────────────────────
 
     def _prepare_sequence_data(
@@ -241,7 +301,9 @@ class RULTrainerPHM:
         Parameters
         ──────────
         bearing_datasets : list of (bearing_name, X_raw, y_raw_seconds)
-        scaler           : fitted StandardScaler
+                           X_raw must already be projected to the 19 base
+                           columns expected by the CNN-LSTM.
+        scaler           : fitted StandardScaler (fitted on 19-column space)
         horizon          : number of future steps to predict
         seq_len          : length of each input sequence window
 
@@ -285,17 +347,35 @@ class RULTrainerPHM:
 
         For MLP:
             Returns X_train, y_train_scaled, X_val, y_val, scaler
-            where X arrays are (n_rows, n_features) flat feature vectors.
+            where X arrays are (n_rows, n_features) flat feature vectors with
+            rolling mean/std/slope augmentation (76 features total).
 
         For CNN-LSTM:
             Returns bearing_datasets_train, bearing_datasets_val, scaler, feature_cols
-            where each bearing_dataset is a list of (bearing_name, X_raw, y_raw).
+            where each bearing_dataset is a list of (bearing_name, X_raw, y_raw)
+            and X_raw is the 19-column base feature matrix (no rolling stats).
             The trainer's train() method calls _prepare_sequence_data() next.
         """
-        # ── Load raw DataFrames ───────────────────────────────────────────────
+        # ── CNN-LSTM path branches early ──────────────────────────────────────
+        # It does NOT need rolling features; it needs only the 19 raw base
+        # columns matching the serving FE's get_window_matrix() output.
+        if self.model_type == "CNN_LSTM":
+            return self._load_data_cnn_lstm()
+
+        # ── MLP path: load + rolling FE + flat scaler ─────────────────────────
+        return self._load_data_mlp()
+
+    # ── MLP data loading ──────────────────────────────────────────────────────
+
+    def _load_data_mlp(self) -> tuple:
+        """
+        Load data for the MLP path. Returns:
+            X_train, y_train_scaled, X_val, y_val, scaler
+        """
+        # Load raw DataFrames
         if self.train_dataframes:
             self.logger.info(
-                f"Loading data from {len(self.train_dataframes)} train DataFrame(s) "
+                f"[MLP] Loading {len(self.train_dataframes)} train DataFrame(s) "
                 f"and {len(self.val_dataframes)} val DataFrame(s) [MongoDB path]."
             )
             train_dfs = []
@@ -310,8 +390,7 @@ class RULTrainerPHM:
                     val_dfs.append(result)
         else:
             self.logger.info(
-                f"Loading data from {len(self.train_files)} train CSV(s) "
-                f"[CSV fallback path]."
+                f"[MLP] Loading {len(self.train_files)} train CSV(s) [CSV fallback path]."
             )
             train_dfs = [
                 df for f in self.train_files
@@ -327,7 +406,6 @@ class RULTrainerPHM:
         if not val_dfs:
             raise RuntimeError("No validation data could be loaded.")
 
-        # ── Build scaler from all training features ───────────────────────────
         train_combined = pd.concat(train_dfs, axis=0).reset_index(drop=True)
         val_combined   = pd.concat(val_dfs,   axis=0).reset_index(drop=True)
 
@@ -338,11 +416,6 @@ class RULTrainerPHM:
         scaler      = StandardScaler()
         scaler.fit(X_all_train)
 
-        if self.model_type == "CNN_LSTM":
-            # Return per-bearing tuples for sequence preparation
-            return self._load_data_cnn_lstm(train_dfs, val_dfs, feature_cols, scaler)
-
-        # ── MLP path — return flat arrays ────────────────────────────────────
         X_train, y_train = self._get_xy(train_combined)
         X_val,   y_val   = self._get_xy(val_combined)
 
@@ -350,54 +423,119 @@ class RULTrainerPHM:
         X_train        = scaler.transform(pd.DataFrame(X_train, columns=feature_cols))
         X_val          = scaler.transform(pd.DataFrame(X_val,   columns=feature_cols))
 
-        self.logger.info(f"Training features ({len(feature_cols)}): {feature_cols}")
-        self.logger.info(f"Train: {X_train.shape} | Val: {X_val.shape}")
+        self.logger.info(f"[MLP] Training features ({len(feature_cols)}): {feature_cols}")
+        self.logger.info(f"[MLP] Train: {X_train.shape} | Val: {X_val.shape}")
         self.logger.info(
-            f"RUL_s train range (scaled): "
+            f"[MLP] RUL_s train range (scaled): "
             f"{y_train_scaled.min():.4f} -> {y_train_scaled.max():.4f}"
         )
         self.logger.info(
-            f"RUL_s val range: {y_val.min():.0f} s -> {y_val.max():.0f} s"
+            f"[MLP] RUL_s val range: {y_val.min():.0f} s -> {y_val.max():.0f} s"
         )
         return X_train, y_train_scaled, X_val, y_val, scaler
 
-    def _load_data_cnn_lstm(
-        self,
-        train_dfs: List[pd.DataFrame],
-        val_dfs:   List[pd.DataFrame],
-        feature_cols: List[str],
-        scaler: StandardScaler,
-    ) -> tuple:
+    # ── CNN-LSTM data loading ─────────────────────────────────────────────────
+
+    def _load_data_cnn_lstm(self) -> tuple:
         """
-        Build per-bearing (name, X_raw, y_raw) tuples for CNN-LSTM preparation.
-        The bearing name is used to look up the condition integer.
+        Load data for the CNN-LSTM path.
+
+        Returns:
+            train_datasets : list of (bearing_name, X_raw_19col, y_raw_seconds)
+            val_datasets   : list of (bearing_name, X_raw_19col, y_raw_seconds)
+            scaler         : StandardScaler fitted on the 19-column space
+            feature_cols   : list[str] — _CNN_LSTM_BASE_COLS
+
+        Notes
+        ─────
+        * No rolling features are added — the CNN-LSTM learns temporal
+          patterns itself via the LSTM.
+        * The scaler is fit ONLY on the 19 base columns so it matches the
+          (window_size, 19) matrix that ServingFeatureEngineer.get_window_matrix()
+          produces at live inference time.
+        * RUL_norm is filled with 0.0 if absent (placeholder, matching the
+          serving pipeline's behaviour).
         """
+        # Load raw DataFrames (no rolling FE — CNN-LSTM doesn't use it)
+        if self.train_dataframes:
+            self.logger.info(
+                f"[CNN-LSTM] Loading {len(self.train_dataframes)} train DataFrame(s) "
+                f"and {len(self.val_dataframes)} val DataFrame(s) [MongoDB path]."
+            )
+            train_raw_dfs = [df.copy() for df in self.train_dataframes]
+            val_raw_dfs   = [df.copy() for df in self.val_dataframes]
+        else:
+            self.logger.info(
+                f"[CNN-LSTM] Loading {len(self.train_files)} train CSV(s) "
+                f"[CSV fallback path]."
+            )
+            train_raw_dfs = [pd.read_csv(f) for f in self.train_files if os.path.exists(f)]
+            val_raw_dfs   = [pd.read_csv(f) for f in self.val_files   if os.path.exists(f)]
+
+        if not train_raw_dfs:
+            raise RuntimeError("No training data could be loaded.")
+        if not val_raw_dfs:
+            raise RuntimeError("No validation data could be loaded.")
+
+        feature_cols = list(_CNN_LSTM_BASE_COLS)   # 19 cols, canonical order
+
+        def _bname_of(df: pd.DataFrame) -> str:
+            if "dataset_id" in df.columns and len(df) > 0:
+                return str(df["dataset_id"].iloc[0])
+            if "file_id" in df.columns and len(df) > 0:
+                return str(df["file_id"].iloc[0])
+            return "unknown"
+
         def _extract_bearing_datasets(dfs):
+            """
+            Project each DataFrame to the 19 base columns, drop rows with NaN
+            in RUL_s, and return (bearing_name, X_19col, y_seconds) tuples.
+            """
             datasets = []
             for df in dfs:
-                drop = [c for c in DROP_COLS if c in df.columns]
-                X    = df[feature_cols].values.astype(np.float32)
-                y    = df[TARGET].values.astype(np.float32)
+                if df is None or len(df) == 0:
+                    continue
+                if TARGET not in df.columns:
+                    self.logger.warning(f"  No '{TARGET}' column — skipping DataFrame.")
+                    continue
 
-                # Try to recover bearing name from a 'dataset_id' column
-                # (present in MongoDB DataFrames) or default to "unknown"
-                if "dataset_id" in df.columns:
-                    bname = str(df["dataset_id"].iloc[0])
-                elif "file_id" in df.columns:
-                    bname = str(df["file_id"].iloc[0])
-                else:
-                    bname = "unknown"
+                bname  = _bname_of(df)
+                df_use = df.dropna(subset=[TARGET]).reset_index(drop=True)
+                if len(df_use) < (self.window_size + 1):
+                    self.logger.warning(
+                        f"  [{bname}] only {len(df_use)} rows < window_size+1 "
+                        f"({self.window_size + 1}) — skipping."
+                    )
+                    continue
 
-                datasets.append((bname, X, y))
+                X_19  = self._project_to_cnn_lstm_cols(df_use).values.astype(np.float32)
+                y_raw = df_use[TARGET].values.astype(np.float32)
+                datasets.append((bname, X_19, y_raw))
             return datasets
 
-        train_datasets = _extract_bearing_datasets(train_dfs)
-        val_datasets   = _extract_bearing_datasets(val_dfs)
+        train_datasets = _extract_bearing_datasets(train_raw_dfs)
+        val_datasets   = _extract_bearing_datasets(val_raw_dfs)
+
+        if not train_datasets:
+            raise RuntimeError("[CNN-LSTM] No training bearings survived projection.")
+        if not val_datasets:
+            raise RuntimeError("[CNN-LSTM] No validation bearings survived projection.")
+
+        # Fit scaler on the 19-column space only — concatenate all train rows.
+        X_all_train = np.concatenate([X for _, X, _ in train_datasets], axis=0)
+        scaler      = StandardScaler()
+        scaler.fit(X_all_train)
 
         self.logger.info(
-            f"[CNN-LSTM] Built {len(train_datasets)} train bearings, "
-            f"{len(val_datasets)} val bearings."
+            f"[CNN-LSTM] Scaler fit on 19 base columns. "
+            f"Train rows={X_all_train.shape[0]}  "
+            f"feature_cols={feature_cols}"
         )
+        self.logger.info(
+            f"[CNN-LSTM] Train bearings={[b for b, _, _ in train_datasets]}  "
+            f"Val bearings={[b for b, _, _ in val_datasets]}"
+        )
+
         return train_datasets, val_datasets, scaler, feature_cols
 
     def train(self, *args) -> Union[MLPModel, CNNLSTMModel]:
@@ -450,9 +588,6 @@ class RULTrainerPHM:
         )
 
         # y_val for CNNLSTMModel.train() should be raw seconds (for loss logging).
-        # We pass the normalised y_val and let the model handle it.
-        # Reconstruct raw-seconds val y for the evaluate() call later.
-        # The normalised val y is fine for val-loss monitoring inside the model.
         y_val_raw = np.array([
             y_raw[seq_len + i]
             for bname, X_raw, y_raw in bearing_datasets_val
@@ -495,8 +630,11 @@ class RULTrainerPHM:
             return self._evaluate_cnn_lstm(model, scaler)
         return self._evaluate_mlp(model, scaler)
 
-    def _resolve_eval_items(self) -> List[Tuple[str, Optional[pd.DataFrame]]]:
-        """Resolve the list of (bearing_name, df) pairs to evaluate on."""
+    def _resolve_eval_items_mlp(self) -> List[Tuple[str, Optional[pd.DataFrame]]]:
+        """
+        Resolve the list of (bearing_name, df) pairs to evaluate the MLP on.
+        DataFrames are augmented with rolling features.
+        """
         if self.test_dataframes:
             self.logger.info(
                 f"Evaluating on {len(self.test_dataframes)} test DataFrame(s) [MongoDB path]."
@@ -526,9 +664,49 @@ class RULTrainerPHM:
                 for f in self.val_files
             ]
 
+    # Backward-compat alias — old callers used this single method name.
+    # MLP eval keeps the old behaviour; CNN-LSTM eval uses its own resolver below.
+    def _resolve_eval_items(self) -> List[Tuple[str, Optional[pd.DataFrame]]]:
+        return self._resolve_eval_items_mlp()
+
+    def _resolve_eval_items_cnn_lstm(self) -> List[Tuple[str, Optional[pd.DataFrame]]]:
+        """
+        Resolve the list of (bearing_name, df) pairs to evaluate the CNN-LSTM on.
+        DataFrames are NOT augmented with rolling features — they're returned
+        as-is. _evaluate_cnn_lstm projects them to the 19 base columns before
+        scaling, mirroring _load_data_cnn_lstm().
+        """
+        if self.test_dataframes:
+            self.logger.info(
+                f"[CNN-LSTM eval] {len(self.test_dataframes)} test DataFrame(s) [MongoDB path]."
+            )
+            return [(name, df.copy()) for name, df in self.test_dataframes]
+        elif self.test_files:
+            self.logger.info(
+                f"[CNN-LSTM eval] {len(self.test_files)} test CSV(s) [CSV fallback path]."
+            )
+            out = []
+            for f in self.test_files:
+                if not os.path.exists(f):
+                    self.logger.warning(f"  File not found: {f}")
+                    continue
+                out.append((self._parse_bearing_name(f), pd.read_csv(f)))
+            return out
+        elif self.val_dataframes:
+            self.logger.info("[CNN-LSTM eval] No test data — falling back to val DataFrames.")
+            return [(f"val_{i}", df.copy()) for i, df in enumerate(self.val_dataframes)]
+        else:
+            self.logger.info("[CNN-LSTM eval] No test files — falling back to val bearings.")
+            out = []
+            for f in self.val_files:
+                if not os.path.exists(f):
+                    continue
+                out.append((self._parse_bearing_name(f), pd.read_csv(f)))
+            return out
+
     def _evaluate_mlp(self, model: MLPModel, scaler: StandardScaler) -> Dict[str, Any]:
         """Evaluate MLPModel on test bearings."""
-        eval_items = self._resolve_eval_items()
+        eval_items = self._resolve_eval_items_mlp()
 
         if not eval_items:
             return {"mae_s": None, "rmse_s": None, "mape": None, "mean_abs_pct": None, "summary_rows": []}
@@ -571,15 +749,20 @@ class RULTrainerPHM:
         return self._aggregate_metrics(summary_rows)
 
     def _evaluate_cnn_lstm(self, model: CNNLSTMModel, scaler: StandardScaler) -> Dict[str, Any]:
-        """Evaluate CNNLSTMModel on test bearings."""
-        eval_items = self._resolve_eval_items()
+        """
+        Evaluate CNNLSTMModel on test bearings.
+
+        Mirrors _load_data_cnn_lstm: projects each test DataFrame to the 19
+        base columns before scaling, so the scaler dimension matches.
+        """
+        eval_items = self._resolve_eval_items_cnn_lstm()
 
         if not eval_items:
             return {"mae_s": None, "rmse_s": None, "mape": None, "mean_abs_pct": None, "summary_rows": []}
 
-        p       = model._params()
-        horizon = p["horizon"]
-        seq_len = p["seq_len"]
+        p         = model._params()
+        horizon   = p["horizon"]
+        seq_len   = p["seq_len"]
         rul_scale = p["rul_scale"]
 
         summary_rows = []
@@ -587,12 +770,22 @@ class RULTrainerPHM:
             if df_test is None or len(df_test) == 0:
                 self.logger.warning(f"  [{bearing_name}] Could not load — skipping.")
                 continue
+            if TARGET not in df_test.columns:
+                self.logger.warning(f"  [{bearing_name}] No '{TARGET}' column — skipping.")
+                continue
 
-            drop     = [c for c in DROP_COLS if c in df_test.columns]
-            X_test   = df_test.drop(columns=drop).values.astype(np.float32)
-            y_test   = df_test[TARGET].values.astype(np.float32)
-            X_scaled = scaler.transform(X_test)
+            df_use   = df_test.dropna(subset=[TARGET]).reset_index(drop=True)
+            X_19     = self._project_to_cnn_lstm_cols(df_use).values.astype(np.float32)
+            y_test   = df_use[TARGET].values.astype(np.float32)
 
+            if len(X_19) < seq_len + horizon:
+                self.logger.warning(
+                    f"  [{bearing_name}] only {len(X_19)} rows < seq_len+horizon "
+                    f"({seq_len + horizon}) — skipping."
+                )
+                continue
+
+            X_scaled    = scaler.transform(X_19)
             cond        = self._condition_for_bearing(bearing_name)
             n_windows   = len(X_scaled) - seq_len - horizon + 1
             conditions  = np.full(n_windows, cond, dtype=np.int64)
@@ -602,10 +795,8 @@ class RULTrainerPHM:
                 self.logger.warning(f"  [{bearing_name}] Too few rows to predict — skipping.")
                 continue
 
-            # preds is (n_windows, horizon) — step-0 is already in raw seconds
+            # preds is (n_windows, horizon) — already in raw seconds
             # (CNNLSTMModel.predict() multiplies by rul_scale internally).
-            # However for per-bearing normalisation the scale differs.
-            # We use the model's built-in rul_scale as the common output scale.
             final_pred  = float(preds[-1, 0])
             gt_rul      = ACTUAL_RUL_S.get(bearing_name, float(y_test[-1]))
             error_s     = final_pred - gt_rul
@@ -740,6 +931,7 @@ class RULTrainerPHM:
     def run(self, run_id: str) -> Dict[str, Any]:
         """
         Execute the full training pipeline.
+
         Returns dict with model_id, model_path, results_csv, and all metrics.
         """
         self.logger.info(

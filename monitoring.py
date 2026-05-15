@@ -303,7 +303,7 @@ class LiveMonitor:
         if not models:
             print("  No models registered yet.")
         else:
-            print(f"  {'':2} {'Model ID':<14} {'Status':<12} {'Target':<8} {'MAE_s':>7}  {'RMSE_s':>7}  {'MAPE':>6}  {'Registered'}")
+            print(f"  {'':2} {'Model ID':<14} {'Status':<12} {'Target':<8} {'MAE_s':>10}  {'RMSE_s':>10}  {'CRA':>6}  {'Registered'}")
             _div(W)
             for m in sorted(models, key=lambda x: x.get("registered_at", "")):
                 mid    = (m.get("model_id") or "?")[:12]
@@ -312,13 +312,13 @@ class LiveMonitor:
                 mets   = m.get("metrics", {})
                 mae    = mets.get("mae_s")
                 rmse   = mets.get("rmse_s")
-                mape   = mets.get("mape")
-                mae_s  = f"{mae:>7.0f}" if mae   is not None else "      —"
-                rms_s  = f"{rmse:>7.0f}" if rmse  is not None else "      —"
-                map_s  = f"{mape:>5.1f}%" if mape  is not None else "     —"
+                cra    = mets.get("mean_cra")
+                mae_s  = f"{mae:>10.0f}" if mae  is not None else "         —"
+                rms_s  = f"{rmse:>10.0f}" if rmse is not None else "         —"
+                cra_s  = f"{cra:>6.3f}"   if cra  is not None else "     —"
                 reg_at = (m.get("registered_at") or "")[:16]
                 icon   = "🚀" if status == "deployed" else ("✅" if status == "approved" else "  ")
-                print(f"  {icon} {mid:<14} {status:<12} {target:<8} {mae_s}  {rms_s}  {map_s}  {reg_at}")
+                print(f"  {icon} {mid:<14} {status:<12} {target:<8} {mae_s}  {rms_s}  {cra_s}  {reg_at}")
 
         # ── 3. Serving runs ───────────────────────────────────────────────────
         _hdr("Serving Runs  (serving_history)", W)

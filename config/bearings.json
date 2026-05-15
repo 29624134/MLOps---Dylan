@@ -9,7 +9,7 @@
         "Bearing1_5",
         "Bearing1_7"
       ],
-      "current_live_index": 0,
+      "current_live_index": 4,
       "champion_file": "model_registry/champion_bearing1.json"
     },
     "2": {
@@ -20,7 +20,7 @@
         "Bearing2_6",
         "Bearing2_7"
       ],
-      "current_live_index": 0,
+      "current_live_index": 4,
       "champion_file": "model_registry/champion_bearing2.json"
     },
     "3": {
@@ -28,7 +28,7 @@
         "Bearing3_2",
         "Bearing3_3"
       ],
-      "current_live_index": 0,
+      "current_live_index": 1,
       "champion_file": "model_registry/champion_bearing3.json"
     }
   },
@@ -45,28 +45,28 @@
       "role": "live",
       "group": "1",
       "condition": 1,
-      "status": "available"
+      "status": "confirmed"
     },
     {
       "name": "Bearing1_3",
       "role": "live",
       "group": "1",
       "condition": 1,
-      "status": "available"
+      "status": "confirmed"
     },
     {
       "name": "Bearing1_4",
       "role": "live",
       "group": "1",
       "condition": 1,
-      "status": "available"
+      "status": "confirmed"
     },
     {
       "name": "Bearing1_5",
       "role": "live",
       "group": "1",
       "condition": 1,
-      "status": "available"
+      "status": "confirmed"
     },
     {
       "name": "Bearing1_6",
@@ -80,7 +80,7 @@
       "role": "live",
       "group": "1",
       "condition": 1,
-      "status": "available"
+      "status": "confirmed"
     },
     {
       "name": "Bearing2_1",
@@ -94,7 +94,7 @@
       "role": "live",
       "group": "2",
       "condition": 2,
-      "status": "available"
+      "status": "confirmed"
     },
     {
       "name": "Bearing2_3",
@@ -108,28 +108,28 @@
       "role": "live",
       "group": "2",
       "condition": 2,
-      "status": "available"
+      "status": "confirmed"
     },
     {
       "name": "Bearing2_5",
       "role": "live",
       "group": "2",
       "condition": 2,
-      "status": "available"
+      "status": "confirmed"
     },
     {
       "name": "Bearing2_6",
       "role": "live",
       "group": "2",
       "condition": 2,
-      "status": "available"
+      "status": "confirmed"
     },
     {
       "name": "Bearing2_7",
       "role": "live",
       "group": "2",
       "condition": 2,
-      "status": "available"
+      "status": "confirmed"
     },
     {
       "name": "Bearing3_1",
@@ -143,14 +143,14 @@
       "role": "live",
       "group": "3",
       "condition": 3,
-      "status": "available"
+      "status": "confirmed"
     },
     {
       "name": "Bearing3_3",
       "role": "live",
       "group": "3",
       "condition": 3,
-      "status": "available"
+      "status": "confirmed"
     }
   ]
 }

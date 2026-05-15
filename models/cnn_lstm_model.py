@@ -245,7 +245,7 @@ class CNNLSTMModel:
             "condition_emb_dim": 8,
             "dropout":           0.2,
             "rul_scale":         30000.0,
-            "epochs":            300,
+            "epochs":            600,
             "lr":                1e-3,
             "batch_size":        32,
             "patience":          60,

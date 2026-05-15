@@ -563,17 +563,22 @@ class ModelRegistry:
         old_score   = current.get("metrics", {}).get(metric) if current else None
         old_metrics = current.get("metrics", {}) if current else {}
 
-        # Log full metric comparison across all 4 metrics
+        # Log metric comparison
+        def _fmt(val, decimals=1):
+            if val is None:
+                return "N/A"
+            try:
+                return str(round(val, decimals))
+            except (TypeError, ValueError):
+                return str(val)
+
         logger.info(
             f"[Registry] ── Model Comparison ──────────────────────────────\n"
-            f"  Metric      │ New Model          │ Current Champion\n"
-            f"  ────────────┼────────────────────┼──────────────────\n"
-            f"  mae_s       │ {str(round(new_metrics.get('mae_s',  None), 1) if new_metrics.get('mae_s')  is not None else 'None'):<18} │ "
-            f"{str(round(old_metrics.get('mae_s',  None), 1) if old_metrics.get('mae_s')  is not None else 'None')}\n"
-            f"  rmse_s      │ {str(round(new_metrics.get('rmse_s', None), 1) if new_metrics.get('rmse_s') is not None else 'None'):<18} │ "
-            f"{str(round(old_metrics.get('rmse_s', None), 1) if old_metrics.get('rmse_s') is not None else 'None')}\n"
-            f"  mape        │ {str(round(new_metrics.get('mape',   None), 2) if new_metrics.get('mape')   is not None else 'None'):<18} │ "
-            f"{str(round(old_metrics.get('mape',   None), 2) if old_metrics.get('mape')   is not None else 'None')}\n"
+            f"  Metric        │ New Model          │ Current Champion\n"
+            f"  ──────────────┼────────────────────┼──────────────────\n"
+            f"  mae_s (s)     │ {_fmt(new_metrics.get('mae_s'),    1):<18} │ {_fmt(old_metrics.get('mae_s'),    1)}\n"
+            f"  rmse_s (s)    │ {_fmt(new_metrics.get('rmse_s'),   1):<18} │ {_fmt(old_metrics.get('rmse_s'),   1)}\n"
+            f"  cra (0–1)     │ {_fmt(new_metrics.get('mean_cra'), 4):<18} │ {_fmt(old_metrics.get('mean_cra'), 4)}\n"
         )
 
         # Decision logic
