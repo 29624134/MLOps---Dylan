@@ -28,6 +28,14 @@ Design notes
   directly and skips re-extraction from raw signals.
 - reload_model() is public — called by run_serving.py on hot-swap detection.
 
+Pipeline version tagging
+────────────────────────
+The pipeline carries a `pipeline_version` label (e.g. "V1") that is stamped
+onto every record written to RUL_predictions and serving_history. The version
+is supplied by the caller (run_serving.py resolves it from the WorkflowRegistry
+once at startup and passes it in config["pipeline_version"]). If not supplied,
+the ServingHistory default "V1" is used.
+
 CNN-LSTM support
 ────────────────
 Stage 2 (Inference) is given the ServingFeatureEngineer instance and the
@@ -44,12 +52,12 @@ Usage
     from serving_pipeline.serving_pipeline import ServingPipeline
 
     pipeline = ServingPipeline(config={
-        "mongo_uri":   "mongodb://localhost:27017",
-        "db_name":     "phm_mlops",
-        "window_size": 40,
+        "mongo_uri":        "mongodb://localhost:27017",
+        "db_name":          "phm_mlops",
+        "window_size":      40,
+        "pipeline_version": "V1",   # optional — defaults to "V1"
     })
 
-    # Standard usage (raw signals):
     for burst in ingestor.stream_bursts(source_folder):
         result = pipeline.run_burst(
             run_id       = "serve_20260407_abc123",
@@ -58,16 +66,6 @@ Usage
             h_signal     = burst["h_signal"],
             v_signal     = burst["v_signal"],
         )
-
-    # SCADA simulator usage (pre-extracted features from FS):
-    result = pipeline.run_burst(
-        run_id              = run_id,
-        bearing_name        = "Bearing1_5",
-        burst_idx           = burst_idx,
-        h_signal            = np.array([0.0]),   # ignored when precomputed
-        v_signal            = np.array([0.0]),   # ignored when precomputed
-        precomputed_features= features_dict,     # from feature_store FS
-    )
 """
 
 import logging
@@ -90,26 +88,29 @@ class ServingPipeline:
     Parameters
     ──────────
     config : dict
-        mongo_uri               : str  (required for Serving History)
-        db_name                 : str  (default "phm_mlops")
-        window_size             : int  (default 40)
-        model_registry_path     : str  (optional, uses ModelRegistry default)
-        target_feature          : str  (default "RUL_s")
-        critical_threshold_s    : int  (default 3600)
-        warning_threshold_s     : int  (default 14400)
-        baseline_path           : str  (default "model_registry/monitoring_baseline.json")
-        enable_serving_history  : bool (default True)
-        export_output_dir       : str  (default "export_output")
-        enable_export_json      : bool (default False)
-        enable_export_service   : bool (default True)
+        mongo_uri               : str   (required for Serving History)
+        db_name                 : str   (default "phm_mlops")
+        window_size             : int   (default 40)
+        model_registry_path     : str   (optional, uses ModelRegistry default)
+        target_feature          : str   (default "RUL_s")
+        critical_threshold_s    : int   (default 3600)
+        warning_threshold_s     : int   (default 14400)
+        baseline_path           : str   (default "model_registry/monitoring_baseline.json")
+        enable_serving_history  : bool  (default True)
+        export_output_dir       : str   (default "export_output")
+        enable_export_json      : bool  (default False)
+        enable_export_service   : bool  (default True)
+        pipeline_version        : str   (default "V1")
+            Workflow/pipeline version label stamped on every serving record.
     """
 
     def __init__(self, config: Optional[Dict[str, Any]] = None):
         cfg = config or {}
 
-        self._mongo_uri = cfg.get("mongo_uri", "mongodb://localhost:27017")
-        self._db_name   = cfg.get("db_name", "phm_mlops")
-        self._enable_sh = cfg.get("enable_serving_history", True)
+        self._mongo_uri        = cfg.get("mongo_uri", "mongodb://localhost:27017")
+        self._db_name          = cfg.get("db_name", "phm_mlops")
+        self._enable_sh        = cfg.get("enable_serving_history", True)
+        self._pipeline_version = cfg.get("pipeline_version", "V1")
 
         # ── Stage 1: Feature Engineering ─────────────────────────────────────
         self._fe = ServingFeatureEngineer(
@@ -138,8 +139,6 @@ class ServingPipeline:
         )
 
         # ── Serving History → RUL_predictions ────────────────────────────────
-        # ServingHistory.__init__ creates indexes automatically.
-        # Do NOT call ensure_indexes() — it no longer exists.
         self._sh = None
         if self._enable_sh:
             try:
@@ -187,7 +186,10 @@ class ServingPipeline:
                 "Audit export will be skipped."
             )
 
-        logger.info("[Pipeline] ServingPipeline initialised — all 4 stages ready.")
+        logger.info(
+            f"[Pipeline] ServingPipeline initialised — all 4 stages ready "
+            f"(pipeline_version={self._pipeline_version})."
+        )
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -196,24 +198,12 @@ class ServingPipeline:
             run_id: str,
             bearing_name: str,
             burst_idx: int,
-            h_signal: Optional[np.ndarray] = None,  # optional
-            v_signal: Optional[np.ndarray] = None,  # optional
+            h_signal: Optional[np.ndarray] = None,
+            v_signal: Optional[np.ndarray] = None,
             precomputed_features: Optional[Dict[str, float]] = None,
     ) -> Dict[str, Any]:
         """
         Run one burst through the full 4-stage pipeline.
-
-        Parameters
-        ──────────
-        run_id, bearing_name, burst_idx : identifiers
-        h_signal, v_signal              : raw vibration arrays (used when
-                                          precomputed_features is None)
-        precomputed_features            : dict of feature values already
-                                          extracted by scada_simulator.py.
-                                          When provided, the FE stage uses
-                                          these values directly and builds the
-                                          rolling window from them, skipping
-                                          re-extraction from raw signals.
 
         Returns a structured dict with outputs from all stages plus the
         RUL_predictions record_id. Always safe to use — check result["ok"].
@@ -233,7 +223,11 @@ class ServingPipeline:
             if self._sh:
                 try:
                     record_id = self._sh.save_error_record(
-                        run_id, bearing_name, burst_idx, error_str
+                        run_id           = run_id,
+                        bearing_name     = bearing_name,
+                        burst_idx        = burst_idx,
+                        error            = error_str,
+                        pipeline_version = self._pipeline_version,
                     )
                 except Exception:
                     pass
@@ -263,10 +257,7 @@ class ServingPipeline:
     ) -> List[Dict[str, Any]]:
         """
         Stream an entire bearing through the pipeline using raw CSV files.
-
         Convenience wrapper for the Workflow Orchestrator integration.
-        Resets the FE buffer and monitoring baseline between runs.
-        NOTE: run_serving.py is the preferred entry point for production use.
         """
         from scripts.data_ingestor import DataIngestorPHM
 
@@ -317,6 +308,14 @@ class ServingPipeline:
         self._inference.reload_model()
         logger.info("[Pipeline] Model reloaded from ModelRegistry.")
 
+    def set_pipeline_version(self, version: str) -> None:
+        """
+        Override the pipeline_version tag at runtime — used if the active
+        workflow version changes mid-session (e.g. CI activates a new version).
+        """
+        self._pipeline_version = version
+        logger.info(f"[Pipeline] pipeline_version set to '{version}'.")
+
     # ── Internals ─────────────────────────────────────────────────────────────
 
     def _run_stages(
@@ -350,9 +349,8 @@ class ServingPipeline:
             }
 
         # ── Stage 2: Inference ────────────────────────────────────────────────
-        # Pass fe_engineer + bearing_name so CNN-LSTM models can call
-        # fe.get_window_matrix() and derive the condition embedding.
-        # Both kwargs are ignored when the deployed model is an MLP.
+        # Pass fe_engineer + bearing_name so CNN-LSTM models can derive the
+        # condition embedding. Both kwargs are ignored when the model is an MLP.
         infer_out = self._inference.run(
             fe_out,
             fe_engineer  = self._fe,
@@ -365,7 +363,7 @@ class ServingPipeline:
         # ── Stage 4: Monitoring ───────────────────────────────────────────────
         mon_out = self._monitor.run(fe_out)
 
-        # ── Step 9: Write to RUL_predictions ─────────────────────────────────
+        # ── Step 9: Write to RUL_predictions (with pipeline_version) ─────────
         record_id = None
         sh_record = None
         if self._sh:
@@ -379,47 +377,49 @@ class ServingPipeline:
             features_dict["_quality"] = fe_out.get("quality_labels") or {}
 
             record_id = self._sh.save_pipeline_output(
-                run_id        = run_id,
-                bearing_name  = bearing_name,
-                burst_idx     = burst_idx,
-                model_version = infer_out.get("model_version", "unknown"),
-                features      = features_dict,
-                inference_out = {
+                run_id           = run_id,
+                bearing_name     = bearing_name,
+                burst_idx        = burst_idx,
+                model_version    = infer_out.get("model_version", "unknown"),
+                pipeline_version = self._pipeline_version,
+                features         = features_dict,
+                inference_out    = {
                     "rul_s":         infer_out.get("rul_s"),
                     "rul_min":       infer_out.get("rul_min"),
                     "horizon_preds": infer_out.get("horizon_preds", []),
                     "data_quality":  infer_out.get("data_quality", "clean"),
                 },
-                pm_out        = pm_out,
-                monitoring_out= mon_out,
-                pipeline_ok   = True,
+                pm_out           = pm_out,
+                monitoring_out   = mon_out,
+                pipeline_ok      = True,
             )
-            # Build minimal record for the Audit Service
             sh_record = {
-                "run_id":       run_id,
-                "bearing_name": bearing_name,
-                "burst_idx":    burst_idx,
-                "pipeline_ok":  True,
+                "run_id":           run_id,
+                "bearing_name":     bearing_name,
+                "burst_idx":        burst_idx,
+                "pipeline_ok":      True,
+                "pipeline_version": self._pipeline_version,
                 "inference": {
                     "rul_s":         infer_out.get("rul_s"),
                     "rul_min":       infer_out.get("rul_min"),
                     "data_quality":  infer_out.get("data_quality", "clean"),
                     "model_version": infer_out.get("model_version", "unknown"),
                 },
-                "pm":        pm_out,
+                "pm":         pm_out,
                 "monitoring": mon_out,
             }
 
         # ── Step 8: Export Service (ServPipeline → ExportSvc → External) ─────
         pipeline_result = {
-            "ok":        True,
-            "ready":     True,
-            "run_id":    run_id,
-            "bearing":   bearing_name,
-            "burst_idx": burst_idx,
-            "inference": infer_out,
-            "pm":        pm_out,
-            "monitoring": mon_out,
+            "ok":               True,
+            "ready":            True,
+            "run_id":           run_id,
+            "bearing":          bearing_name,
+            "burst_idx":        burst_idx,
+            "pipeline_version": self._pipeline_version,
+            "inference":        infer_out,
+            "pm":               pm_out,
+            "monitoring":       mon_out,
         }
         if self._exporter is not None:
             self._exporter.export_pipeline_output(pipeline_result)
@@ -429,11 +429,12 @@ class ServingPipeline:
             self._auditor.audit_record(sh_record)
 
         return {
-            "ok":        True,
-            "ready":     True,
-            "run_id":    run_id,
-            "bearing":   bearing_name,
-            "burst_idx": burst_idx,
+            "ok":               True,
+            "ready":            True,
+            "run_id":           run_id,
+            "bearing":          bearing_name,
+            "burst_idx":        burst_idx,
+            "pipeline_version": self._pipeline_version,
             "fe": {
                 "quality_labels": fe_out.get("quality_labels"),
                 "base_features":  fe_out.get("base_features"),
