@@ -24,13 +24,17 @@ If --champion is not specified, the group is inferred from the bearing name
 This script:
 1. Clears stale bursts/sentinels from previous sessions BEFORE predicting
 2. Polls the shared Feature Store for new bursts (filtered by bearing_name)
-3. Passes each burst through the 4-stage Serving Pipeline:
+3. Resolves the active pipeline_version from the Workflow Registry (e.g. "V1")
+   — every record written to RUL_predictions and serving_history carries this
+   tag so the audit trail can answer "which workflow produced this output".
+4. Passes each burst through the 4-stage Serving Pipeline:
        Feature Engineering → Inference → Predictive Maintenance → Monitoring
-4. Writes full prediction audit to RUL_predictions (one doc per burst)
-5. Writes operational telemetry to serving_history
-6. Writes monitoring metrics back to Feature Store
-7. Watches the group champion file for changes → hot-swaps model between bursts
-8. Detects session-end sentinel and idles until next SCADA session
+5. Writes full prediction audit to RUL_predictions (one doc per burst, tagged
+   with pipeline_version)
+6. Writes operational telemetry to serving_history (also tagged)
+7. Writes monitoring metrics back to Feature Store
+8. Watches the group champion file for changes → hot-swaps model between bursts
+9. Detects session-end sentinel and idles until next SCADA session
 
 Behaviour on CRITICAL status
 ─────────────────────────────
@@ -77,11 +81,12 @@ logging.basicConfig(
 logger = logging.getLogger("run_serving")
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-DEFAULT_MONGO_URI   = "mongodb://localhost:27017"
-DEFAULT_DB_NAME     = "phm_mlops"
-MODEL_REGISTRY_DIR  = "model_registry"
-DEFAULT_POLL_S      = 2.0
-DEFAULT_BEARING     = "Bearing1_1"
+DEFAULT_MONGO_URI       = "mongodb://localhost:27017"
+DEFAULT_DB_NAME         = "phm_mlops"
+MODEL_REGISTRY_DIR      = "model_registry"
+DEFAULT_POLL_S          = 2.0
+DEFAULT_BEARING         = "Bearing1_1"
+DEFAULT_PIPELINE_VERSION = "V1"
 
 from utils.db_collections import COL_FEATURE_STORE
 FS_LIVE_COLLECTION = COL_FEATURE_STORE
@@ -114,6 +119,42 @@ def _default_champion_path(bearing_name: str) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Pipeline version resolver
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _resolve_pipeline_version(
+    workflow_name: str = "rul_prediction",
+    fallback:      str = DEFAULT_PIPELINE_VERSION,
+) -> str:
+    """
+    Resolve the active pipeline (workflow) version label for serving records.
+
+    Looks up the currently-active workflow from WorkflowRegistry and returns
+    its version label normalised as "V<version>" (e.g. "V1", "V1.3.0").
+
+    Falls back to DEFAULT_PIPELINE_VERSION ("V1") if the registry is
+    unavailable or no active workflow is registered — the field must never
+    be missing from serving records.
+    """
+    try:
+        from utils.workflow_registry import WorkflowRegistry
+        reg    = WorkflowRegistry()
+        active = reg.get_active_workflow(workflow_name)
+        if active and active.get("version"):
+            v = str(active["version"]).strip()
+            # Normalise to "V1" / "V1.3.0" style
+            if not v.upper().startswith("V"):
+                v = "V" + v
+            return v
+    except Exception as exc:
+        logger.warning(
+            f"[PipelineVersion] Could not resolve active workflow version: {exc}. "
+            f"Falling back to '{fallback}'."
+        )
+    return fallback
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Feature derivation — system adds 8 stats to SCADA's 10
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -129,7 +170,7 @@ def _derive_features(scada_stats: dict) -> dict:
         form  = rms / mean  (form factor)
     Skew and kurt cannot be derived from simple stats — set to 0.0.
     """
-    features = dict(scada_stats)   # copy the 10 SCADA stats
+    features = dict(scada_stats)
     for prefix in ("h", "v"):
         mx   = features.get(f"{prefix}_max", 0.0)
         rms  = features.get(f"{prefix}_rms",  0.0)
@@ -138,7 +179,7 @@ def _derive_features(scada_stats: dict) -> dict:
         features[f"{prefix}_form"]  = rms / mean if mean != 0 else 0.0
         features[f"{prefix}_skew"]  = 0.0
         features[f"{prefix}_kurt"]  = 0.0
-    return features   # 18 values
+    return features
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -148,8 +189,6 @@ def _derive_features(scada_stats: dict) -> dict:
 class ChampionWatcher:
     """
     Watches the group-specific champion JSON file for changes.
-    When a new champion is promoted (mtime changes), returns the new record
-    so the serving loop can trigger a model reload.
 
     Baseline is set after the first burst arrives — not at startup — to
     avoid false positives from files written by a concurrent training thread.
@@ -210,9 +249,6 @@ class LiveFeatureStoreReader:
     Reads unconsumed bursts for this bearing from the shared feature_store
     collection. Marks each burst as consumed after the serving pipeline
     processes it.
-
-    Multiple run_serving.py instances share the same collection — each only
-    sees its own bearing's documents (filtered by bearing_name).
     """
 
     def __init__(self, mongo_uri: str, db_name: str):
@@ -229,13 +265,6 @@ class LiveFeatureStoreReader:
         logger.info(f"[FS Reader] Connected → {db_name}.{FS_LIVE_COLLECTION}")
 
     def clear_stale_data(self, bearing_name: str) -> int:
-        """
-        Delete ALL documents for this bearing from the feature_store collection —
-        including consumed bursts, unconsumed bursts, and session-end sentinels.
-
-        Called on startup before waiting for new SCADA data. Ensures no stale
-        bursts from a previous run are accidentally consumed.
-        """
         result = self._col.delete_many({"bearing_name": bearing_name})
         if result.deleted_count > 0:
             logger.info(
@@ -249,10 +278,6 @@ class LiveFeatureStoreReader:
         return result.deleted_count
 
     def next_burst(self, bearing_name: str) -> Optional[dict]:
-        """
-        Return the next unconsumed burst for this bearing (lowest burst_idx),
-        or None if nothing is available. Excludes session-end sentinels.
-        """
         from pymongo import ASCENDING
         doc = self._col.find_one(
             {
@@ -265,14 +290,12 @@ class LiveFeatureStoreReader:
         return doc
 
     def mark_consumed(self, doc_id, derived_features: dict = None):
-        """Mark a burst document as consumed. Optionally store derived features."""
         update = {"$set": {"consumed": True, "consumed_at": datetime.now(timezone.utc).isoformat()}}
         if derived_features:
             update["$set"]["derived_features"] = derived_features
         self._col.update_one({"_id": doc_id}, update)
 
     def check_session_end(self, bearing_name: str) -> bool:
-        """Return True if a session-end sentinel exists for this bearing."""
         return self._col.count_documents(
             {"bearing_name": bearing_name, "session_end": True}
         ) > 0
@@ -286,7 +309,6 @@ class LiveFeatureStoreReader:
         pm_out:         dict,
         inference_out:  dict,
     ):
-        """Write monitoring metrics back to the Feature Store for this burst."""
         metrics = {
             "run_id":         run_id,
             "recorded_at":    datetime.now(timezone.utc).isoformat(),
@@ -341,27 +363,22 @@ def run_serving(
 ):
     """
     Main serving loop for one bearing. Runs until session-end sentinel or Ctrl+C.
-
-    Parameters
-    ----------
-    bearing_name  : str   — bearing being served (e.g. "Bearing1_5")
-    champion_path : str   — path to this group's champion JSON file
-    mongo_uri     : str   — MongoDB connection string
-    db_name       : str   — database name
-    poll_interval : float — seconds between Feature Store polls when idle
-    window_size   : int   — FE rolling window size (must match training)
     """
     group = _group_from_bearing(bearing_name) or "?"
+
+    # ── Resolve pipeline version once at startup (e.g. "V1") ──────────────────
+    pipeline_version = _resolve_pipeline_version()
 
     logger.info("=" * 60)
     logger.info("  PHM MLOps — Serving Pipeline")
     logger.info("=" * 60)
-    logger.info(f"  Bearing       : {bearing_name}")
-    logger.info(f"  Group         : {group}")
-    logger.info(f"  Champion file : {champion_path}")
-    logger.info(f"  MongoDB       : {mongo_uri} / {db_name}")
-    logger.info(f"  Poll interval : {poll_interval}s")
-    logger.info(f"  Window size   : {window_size}")
+    logger.info(f"  Bearing          : {bearing_name}")
+    logger.info(f"  Group            : {group}")
+    logger.info(f"  Pipeline version : {pipeline_version}")
+    logger.info(f"  Champion file    : {champion_path}")
+    logger.info(f"  MongoDB          : {mongo_uri} / {db_name}")
+    logger.info(f"  Poll interval    : {poll_interval}s")
+    logger.info(f"  Window size      : {window_size}")
     logger.info("=" * 60)
 
     # ── Connect to Feature Store ──────────────────────────────────────────────
@@ -382,10 +399,11 @@ def run_serving(
         sys.exit(1)
 
     pipeline = ServingPipeline(config={
-        "mongo_uri":     mongo_uri,
-        "db_name":       db_name,
-        "window_size":   window_size,
-        "champion_path": champion_path,
+        "mongo_uri":        mongo_uri,
+        "db_name":          db_name,
+        "window_size":      window_size,
+        "champion_path":    champion_path,
+        "pipeline_version": pipeline_version,
     })
 
     # ── Telemetry writer ──────────────────────────────────────────────────────
@@ -393,8 +411,6 @@ def run_serving(
     telemetry = ServingTelemetry(mongo_uri=mongo_uri, db_name=db_name)
 
     # ── Champion watcher ──────────────────────────────────────────────────────
-    # Baseline is NOT set here — set after the first burst arrives.
-    # This prevents detecting the existing file from a previous session.
     champion_watcher = ChampionWatcher(champion_path)
     run_id           = f"serve_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{bearing_name}"
     first_burst_seen = False
@@ -421,7 +437,6 @@ def run_serving(
                     )
                     while True:
                         time.sleep(poll_interval * 5)
-                # sentinel exists but bursts remain — keep processing
 
             # ── Poll for next burst ───────────────────────────────────────────
             burst_doc = fs_reader.next_burst(bearing_name)
@@ -457,104 +472,124 @@ def run_serving(
                 )
                 pipeline.reload_model()
 
-            # ── Extract burst data ────────────────────────────────────────────
-            # SCADA writes the 10 stats flat on the document (not nested).
-            burst_idx   = burst_doc.get("burst_idx", 0)
+            #   ── ingestion timestamp from SCADA ────────────────────────────────────────
+            sent_at_dt = _parse_sent_at(burst_doc.get("sent_at"))
+            t_pickup_wall = datetime.now(timezone.utc)  # when run_serving has the doc
+            t_burst_start = time.perf_counter()  # local monotonic anchor
+
+            ingestion_lag_ms = None
+            if sent_at_dt is not None:
+                ingestion_lag_ms = (t_pickup_wall - sent_at_dt).total_seconds() * 1000.0
+
+            #   ── Extract burst data ────────────────────────────────────────────────────
+            #   SCADA writes the 10 stats flat on the document (not nested).
+            burst_idx = burst_doc.get("burst_idx", 0)
             _SCADA_KEYS = (
                 "h_max", "h_min", "h_mean", "h_sd", "h_rms",
                 "v_max", "v_min", "v_mean", "v_sd", "v_rms",
             )
             scada_stats = {k: burst_doc[k] for k in _SCADA_KEYS if k in burst_doc}
-            features    = _derive_features(scada_stats)
+            features = _derive_features(scada_stats)
 
-            # ── Run 4-stage serving pipeline ──────────────────────────────────
-            # h_signal/v_signal are required by the pipeline signature but ignored
-            # when precomputed_features is provided — SCADA already extracted them.
-            t_start    = time.perf_counter()
-            result     = pipeline.run_burst(
-                run_id               = run_id,
-                bearing_name         = bearing_name,
-                burst_idx            = burst_idx,
-                h_signal             = np.array([0.0], dtype=np.float32),
-                v_signal             = np.array([0.0], dtype=np.float32),
-                precomputed_features = features,
+            #   ── Run 4-stage serving pipeline ──────────────────────────────────────────
+            t_pipe_start = time.perf_counter()
+            result = pipeline.run_burst(
+                run_id=run_id,
+                bearing_name=bearing_name,
+                burst_idx=burst_idx,
+                h_signal=np.array([0.0], dtype=np.float32),
+                v_signal=np.array([0.0], dtype=np.float32),
+                precomputed_features=features,
             )
-            latency_ms = (time.perf_counter() - t_start) * 1000
+            pipeline_ms_external = (time.perf_counter() - t_pipe_start) * 1000.0
 
-            # ── Mark burst consumed — store the 18 base features ────────────
-            # The Feature Store holds raw sensor data only (18 base features).
-            # The trainer's _add_rolling_features() computes the rolling stats
-            # (mean/std/slope) to produce the full 76-dim vector at training
-            # time — exactly as it does for train/val bearings.
+            #   ── Prefer pipeline's own internal total (sub-ms accurate); fall back to
+            #       the external timer if the pipeline is an older version without it.
+            stage_timings_ms = result.get("stage_timings_ms") or {}
+            pipeline_ms = stage_timings_ms.get("pipeline_total_ms", pipeline_ms_external)
+
+            #   ── Mark burst consumed — store the 18 base features ─────────────────────
             fs_reader.mark_consumed(burst_doc["_id"], derived_features=features)
 
-            pm         = result.get("pm")         or {}
+            pm = result.get("pm") or {}
             monitoring = result.get("monitoring") or {}
-            inference  = result.get("inference")  or {}
-            ok         = result.get("ok",    False)
-            ready      = result.get("ready", False)
+            inference = result.get("inference") or {}
+            ok = result.get("ok", False)
+            ready = result.get("ready", False)
 
-            # ── Write monitoring metrics back to Feature Store ─────────────────
+            #   ── Write monitoring metrics back to Feature Store ────────────────────────
             if ok and ready:
                 fs_reader.write_monitoring_metrics(
-                    bearing_name   = bearing_name,
-                    burst_idx      = burst_idx,
-                    run_id         = run_id,
-                    monitoring_out = monitoring,
-                    pm_out         = pm,
-                    inference_out  = inference,
+                    bearing_name=bearing_name,
+                    burst_idx=burst_idx,
+                    run_id=run_id,
+                    monitoring_out=monitoring,
+                    pm_out=pm,
+                    inference_out=inference,
                 )
                 burst_count += 1
 
-            # ── Operational telemetry → serving_history ───────────────────────
+            #   ── Operational telemetry → serving_history ───────────────────────────────
             try:
                 import psutil
-                proc    = psutil.Process()
+                proc = psutil.Process()
                 cpu_pct = proc.cpu_percent(interval=None)
-                mem_mb  = proc.memory_info().rss / 1024 / 1024
+                mem_mb = proc.memory_info().rss / 1024 / 1024
             except Exception:
                 cpu_pct = None
-                mem_mb  = None
+                mem_mb = None
+
+            #   ── True end-to-end: sent_at → just-before-write to serving_history ──────
+            #   We compute e2e_ms BEFORE telemetry.record() so the figure does not
+            #   include the time taken to write itself (which is logged separately in
+            #   stage_timings_ms.serving_history_ms for the per-stage breakdown).
+            e2e_ms = None
+            if sent_at_dt is not None:
+                e2e_ms = (datetime.now(timezone.utc) - sent_at_dt).total_seconds() * 1000.0
 
             telemetry.record(
-                run_id              = run_id,
-                bearing_name        = bearing_name,
-                burst_idx           = burst_idx,
-                model_version       = champion_watcher.current_champion_id() or "unknown",
-                latency_ms          = latency_ms,
-                pipeline_ok         = ok,
-                pm_status           = pm.get("status", "unknown"),
-                rul_s               = pm.get("rul_s"),
-                rul_min             = pm.get("rul_min"),
-                drift_detected      = monitoring.get("drift_detected", False),
-                anomaly_flag        = monitoring.get("anomaly_flag", False),
-                bursts_this_session = burst_count,
-                cpu_percent         = cpu_pct,
-                memory_mb           = mem_mb,
+                run_id=run_id,
+                bearing_name=bearing_name,
+                burst_idx=burst_idx,
+                model_version=champion_watcher.current_champion_id() or "unknown",
+
+                # Legacy field — kept identical so existing dashboards don't break.
+                latency_ms=pipeline_ms,
+
+                pipeline_ok=ok,
+                pm_status=pm.get("status", "unknown"),
+                rul_s=pm.get("rul_s"),
+                rul_min=pm.get("rul_min"),
+                drift_detected=monitoring.get("drift_detected", False),
+                anomaly_flag=monitoring.get("anomaly_flag", False),
+                bursts_this_session=burst_count,
+                cpu_percent=cpu_pct,
+                memory_mb=mem_mb,
+
+                # New thesis-instrumentation fields:
+                pipeline_ms=pipeline_ms,
+                ingestion_lag_ms=ingestion_lag_ms,
+                e2e_ms=e2e_ms,
+                stage_timings_ms=stage_timings_ms,
             )
 
-            # ── Log result ────────────────────────────────────────────────────
+            #   ── Log result (extended with e2e + ingestion lag) ────────────────────────
             if ok and ready:
+                _lag_str = f"{ingestion_lag_ms:6.1f}ms" if ingestion_lag_ms is not None else "    —  "
+                _e2e_str = f"{e2e_ms:7.1f}ms" if e2e_ms is not None else "      — "
                 logger.info(
                     f"  [{bearing_name}] Burst {burst_idx:>4} | "
                     f"RUL={pm.get('rul_min', 0.0):>10.1f} min | "
                     f"status={pm.get('status', '—'):<8} | "
-                    f"latency={latency_ms:.1f}ms | "
+                    f"pipe={pipeline_ms:6.1f}ms ingest={_lag_str} e2e={_e2e_str} | "
                     f"drift={monitoring.get('drift_detected', False)} | "
                     f"alert={pm.get('alert', False)}"
                 )
 
                 if pm.get("status") == "critical":
                     # Log a prominent warning but DO NOT stop serving.
-                    # The maintenance decision is made by the human operator
-                    # via the Fault Review dashboard. Serving continues until
-                    # the SCADA session ends or the operator intervenes.
                     logger.warning(
-                        f"\n{'!'*60}\n"
-                        f"  CRITICAL RUL ALERT for {bearing_name}!\n"
-                        f"  RUL = {pm.get('rul_min', '?'):.3f} min\n"
-                        f"  Continuing predictions — awaiting operator action.\n"
-                        f"{'!'*60}"
+                        f"  [{bearing_name}] 🔴 CRITICAL — RUL={pm.get('rul_min', 0.0):.1f} min"
                     )
 
             elif not ready:
@@ -634,6 +669,21 @@ Examples:
     )
     return parser.parse_args()
 
+def _parse_sent_at(sent_at_str):
+    """
+    Parse the ISO-8601 'sent_at' string written by scada_simulator.py
+    into a UTC datetime. Returns None on any failure so the caller can
+    record ingestion_lag_ms / e2e_ms as None for that burst.
+    """
+    if not sent_at_str:
+        return None
+    try:
+        # scada_simulator writes:  datetime.now(timezone.utc).isoformat()
+        # Python 3.11+ handles the 'Z' suffix; earlier versions don't.
+        s = sent_at_str.replace("Z", "+00:00") if isinstance(sent_at_str, str) else sent_at_str
+        return datetime.fromisoformat(s) if isinstance(s, str) else s
+    except Exception:
+        return None
 
 if __name__ == "__main__":
     args = _parse_args()

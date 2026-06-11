@@ -4,40 +4,67 @@ monitor.py
 Live MLOps System Monitor — run this in a separate PyCharm terminal while
 scada_simulator.py and run_serving.py are running.
 
-Two modes
-─────────
+Three modes
+───────────
 Live mode (default):
     Polls MongoDB serving_history every N seconds and prints a refreshing
-    dashboard showing latency, CPU, memory, throughput, health, RUL trend.
+    dashboard showing latency (per-stage + e2e), CPU, memory, throughput,
+    health, RUL trend.
 
 Summary mode (--summary):
-    One-shot full system report — all collections, all bearings, all runs,
-    model registry state, database sizes. Useful after a run completes.
+    One-shot full system report. Includes:
+      • all collections, all bearings, all runs, model registry state
+      • per-stage latency table (mean / median / p95 / p99)
+      • end-to-end latency percentiles (sent_at → telemetry.record)
+      • ingestion-lag distribution (queue wait between SCADA and serving)
+
+Thesis-export mode (--export-csv PATH):
+    Writes one row per burst from serving_history to a CSV file, including
+    every latency field (pipeline, e2e, ingestion lag, all per-stage timings)
+    plus the operational columns. This is the file you import into pandas /
+    Excel / your thesis appendix.
 
 Usage
 ─────
-    python monitor.py                          # live dashboard, latest run
-    python monitor.py --interval 3             # refresh every 3s
-    python monitor.py --run_id serve_xyz       # filter to specific run
-    python monitor.py --bearing Bearing1_5     # filter to specific bearing
-    python monitor.py --summary                # full one-shot system report
+    python monitor.py
+    python monitor.py --interval 3
+    python monitor.py --run_id serve_xyz
+    python monitor.py --bearing Bearing1_5
+    python monitor.py --summary
+    python monitor.py --summary --run_id serve_xyz
+    python monitor.py --export-csv thesis_latency.csv
+    python monitor.py --export-csv thesis_latency.csv --run_id serve_xyz
 
 Stop live mode with Ctrl+C.
 ═══════════════════════════════════════════════════════════════════════════════
 """
 
 import argparse
+import csv
 import os
 import sys
 import time
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Sequence
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 DEFAULT_MONGO_URI  = "mongodb://localhost:27017"
 DEFAULT_DB_NAME    = "phm_mlops"
 DEFAULT_INTERVAL_S = 5.0
+
+# Stage keys we expect in stage_timings_ms. Kept here so we have a stable
+# order in tables and CSVs even if the pipeline adds/removes fields.
+_STAGE_KEYS = (
+    "fe_ms",
+    "inference_ms",
+    "pm_ms",
+    "monitoring_ms",
+    "serving_history_ms",
+    "export_ms",
+    "audit_ms",
+    "pipeline_total_ms",
+)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -46,6 +73,37 @@ DEFAULT_INTERVAL_S = 5.0
 
 def _clear():
     os.system("cls" if os.name == "nt" else "clear")
+
+
+def _percentile(sorted_vals: Sequence[float], frac: float) -> Optional[float]:
+    """
+    Safe percentile from an already-sorted list. Clamps the index so it
+    never exceeds len-1 (fixes the off-by-one in the original monitor).
+    Returns None when the list is empty.
+    """
+    if not sorted_vals:
+        return None
+    n   = len(sorted_vals)
+    idx = min(int(n * frac), n - 1)
+    return float(sorted_vals[idx])
+
+
+def _stats(values):
+    """Return (n, mean, min, p50, p95, p99, max) for a list of numbers."""
+    vals = [v for v in values if v is not None]
+    if not vals:
+        return None
+    s = sorted(vals)
+    n = len(s)
+    return {
+        "n":    n,
+        "mean": sum(s) / n,
+        "min":  s[0],
+        "p50":  _percentile(s, 0.50),
+        "p95":  _percentile(s, 0.95),
+        "p99":  _percentile(s, 0.99),
+        "max":  s[-1],
+    }
 
 
 def _bar(value: float, max_value: float, width: int = 30,
@@ -62,8 +120,8 @@ def _bar(value: float, max_value: float, width: int = 30,
 
 def _fmt_ms(val) -> str:
     if val is None:
-        return "   —   "
-    return f"{val:>7.1f} ms"
+        return "    —    "
+    return f"{val:>8.2f} ms"
 
 
 def _fmt_rul(val) -> str:
@@ -147,6 +205,8 @@ class LiveMonitor:
         print(f"✓  Connected to MongoDB → {db_name}")
         time.sleep(1)
 
+    # ── Internals ─────────────────────────────────────────────────────────────
+
     def _query(self, collection, extra_filter=None, limit=200):
         q = {}
         if self._run_id:
@@ -160,6 +220,13 @@ class LiveMonitor:
     def _latest_run_id(self) -> Optional[str]:
         doc = self._sh.find_one({}, sort=[("timestamp", -1)])
         return doc.get("run_id") if doc else None
+
+    def _pipeline_ms_of(self, doc) -> Optional[float]:
+        """Prefer the new pipeline_ms field; fall back to legacy latency_ms."""
+        val = doc.get("pipeline_ms")
+        if val is None:
+            val = doc.get("latency_ms")
+        return val
 
     # ── Live dashboard ────────────────────────────────────────────────────────
 
@@ -176,14 +243,19 @@ class LiveMonitor:
             return
 
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        W = 65
+        W = 72
 
-        latencies     = [d["latency_ms"]  for d in docs if d.get("latency_ms")  is not None]
-        cpu_vals      = [d["cpu_percent"] for d in docs if d.get("cpu_percent") is not None]
-        mem_vals      = [d["memory_mb"]   for d in docs if d.get("memory_mb")   is not None]
-        rul_mins      = [d["rul_min"]     for d in docs if d.get("rul_min")     is not None]
-        statuses      = [d.get("pm_status", "unknown") for d in docs]
-        models        = list({d["model_version"] for d in docs if d.get("model_version")})
+        # Pull values
+        pipe_lats   = [self._pipeline_ms_of(d) for d in docs]
+        pipe_lats   = [v for v in pipe_lats if v is not None]
+        e2e_lats    = [d["e2e_ms"]           for d in docs if d.get("e2e_ms")           is not None]
+        ingest_lags = [d["ingestion_lag_ms"] for d in docs if d.get("ingestion_lag_ms") is not None]
+        cpu_vals    = [d["cpu_percent"]      for d in docs if d.get("cpu_percent")      is not None]
+        mem_vals    = [d["memory_mb"]        for d in docs if d.get("memory_mb")        is not None]
+        rul_mins    = [d["rul_min"]          for d in docs if d.get("rul_min")          is not None]
+        statuses    = [d.get("pm_status", "unknown") for d in docs]
+        models      = list({d["model_version"] for d in docs if d.get("model_version")})
+
         drift_count   = sum(1 for d in docs if d.get("drift_detected"))
         anomaly_count = sum(1 for d in docs if d.get("anomaly_flag"))
         ok_count      = sum(1 for d in docs if d.get("pipeline_ok"))
@@ -195,25 +267,28 @@ class LiveMonitor:
         latest_bear   = latest.get("bearing_name", "?")
         latest_status = latest.get("pm_status", "unknown")
         latest_rul    = latest.get("rul_min")
-        latest_lat    = latest.get("latency_ms")
+        latest_pipe   = self._pipeline_ms_of(latest)
+        latest_e2e    = latest.get("e2e_ms")
+        latest_ingest = latest.get("ingestion_lag_ms")
         latest_cpu    = latest.get("cpu_percent")
         latest_mem    = latest.get("memory_mb")
+        latest_stage  = latest.get("stage_timings_ms") or {}
 
-        avg_lat = sum(latencies) / len(latencies) if latencies else None
-        max_lat = max(latencies)                  if latencies else None
-        min_lat = min(latencies)                  if latencies else None
-        p95_lat = sorted(latencies)[int(len(latencies) * 0.95)] if len(latencies) >= 20 else None
-        avg_cpu = sum(cpu_vals) / len(cpu_vals)   if cpu_vals  else None
-        max_cpu = max(cpu_vals)                   if cpu_vals  else None
-        avg_mem = sum(mem_vals) / len(mem_vals)   if mem_vals  else None
+        pipe_stats = _stats(pipe_lats)
+        e2e_stats  = _stats(e2e_lats)
+        ing_stats  = _stats(ingest_lags)
 
-        cutoff   = time.time() - 60
-        recent   = [d for d in docs if d.get("timestamp") and
-                    d["timestamp"].timestamp() > cutoff]
+        avg_cpu = sum(cpu_vals) / len(cpu_vals) if cpu_vals else None
+        max_cpu = max(cpu_vals)                 if cpu_vals else None
+        avg_mem = sum(mem_vals) / len(mem_vals) if mem_vals else None
+
+        cutoff = time.time() - 60
+        recent = [d for d in docs if d.get("timestamp") and
+                  d["timestamp"].timestamp() > cutoff]
         tput_60s = len(recent)
 
         print("=" * W)
-        print(f"  PHM MLOps — Live Monitor         {now_str}")
+        print(f"  PHM MLOps — Live Monitor              {now_str}")
         print("=" * W)
         print(f"  Run ID   : {run_id}")
         print(f"  Bearing  : {latest_bear}   Burst #{latest_burst}")
@@ -221,35 +296,67 @@ class LiveMonitor:
         _div(W)
 
         _hdr("Latest Burst", W)
-        print(f"  Status   : {_status_icon(latest_status)}  {latest_status.upper()}")
-        print(f"  RUL      : {_fmt_rul(latest_rul)}")
-        print(f"  Latency  : {_fmt_ms(latest_lat)}")
+        print(f"  Status      : {_status_icon(latest_status)}  {latest_status.upper()}")
+        print(f"  RUL         : {_fmt_rul(latest_rul)}")
+        print(f"  Pipeline    : {_fmt_ms(latest_pipe)}")
+        print(f"  Ingestion   : {_fmt_ms(latest_ingest)}   (SCADA → run_serving pickup)")
+        print(f"  End-to-end  : {_fmt_ms(latest_e2e)}   (sent_at → telemetry written)")
         if latest_cpu is not None:
-            print(f"  CPU      : {_bar(latest_cpu, 100, width=25)}")
+            print(f"  CPU         : {_bar(latest_cpu, 100, width=25)}")
         if latest_mem is not None:
-            print(f"  Memory   : {latest_mem:.1f} MB")
+            print(f"  Memory      : {latest_mem:.1f} MB")
 
-        _hdr(f"Latency  (last {len(latencies)} bursts)", W)
-        print(f"  Avg      : {_fmt_ms(avg_lat)}")
-        print(f"  Min      : {_fmt_ms(min_lat)}")
-        print(f"  Max      : {_fmt_ms(max_lat)}")
-        if p95_lat is not None:
-            print(f"  p95      : {_fmt_ms(p95_lat)}")
-        if avg_lat is not None:
-            print(f"  Budget   : {_bar(avg_lat, 10000, width=25, warn=0.02, crit=0.1)}  (10s period)")
+        # Per-stage breakdown for the latest burst
+        if latest_stage:
+            _hdr("Latest Burst — Stage Breakdown", W)
+            for k in _STAGE_KEYS:
+                v = latest_stage.get(k)
+                if v is None:
+                    continue
+                print(f"  {k:<22}: {_fmt_ms(v)}")
 
-        _hdr("Resource Usage", W)
-        if avg_cpu is not None:
-            print(f"  CPU avg  : {_bar(avg_cpu, 100, width=25)}")
-            print(f"  CPU max  : {_bar(max_cpu, 100, width=25)}")
+        _hdr(f"Pipeline Latency  (last {len(pipe_lats)} bursts)", W)
+        if pipe_stats:
+            print(f"  mean   : {_fmt_ms(pipe_stats['mean'])}")
+            print(f"  min    : {_fmt_ms(pipe_stats['min'])}")
+            print(f"  p50    : {_fmt_ms(pipe_stats['p50'])}")
+            print(f"  p95    : {_fmt_ms(pipe_stats['p95'])}")
+            print(f"  p99    : {_fmt_ms(pipe_stats['p99'])}")
+            print(f"  max    : {_fmt_ms(pipe_stats['max'])}")
+            print(f"  budget : {_bar(pipe_stats['mean'], 10000, width=25, warn=0.02, crit=0.1)}  (10s burst period)")
         else:
-            print("  CPU      : — (psutil not installed or no data yet)")
+            print("  No pipeline-latency data yet.")
+
+        _hdr(f"End-to-End Latency  (last {len(e2e_lats)} bursts)", W)
+        if e2e_stats:
+            print(f"  mean   : {_fmt_ms(e2e_stats['mean'])}")
+            print(f"  p50    : {_fmt_ms(e2e_stats['p50'])}")
+            print(f"  p95    : {_fmt_ms(e2e_stats['p95'])}")
+            print(f"  p99    : {_fmt_ms(e2e_stats['p99'])}")
+            print(f"  max    : {_fmt_ms(e2e_stats['max'])}")
+        else:
+            print("  No end-to-end data yet (SCADA simulator may not be writing sent_at).")
+
+        _hdr(f"Ingestion Lag  (last {len(ingest_lags)} bursts)", W)
+        if ing_stats:
+            print(f"  mean   : {_fmt_ms(ing_stats['mean'])}   (sent_at → run_serving pickup)")
+            print(f"  p95    : {_fmt_ms(ing_stats['p95'])}")
+            print(f"  max    : {_fmt_ms(ing_stats['max'])}")
+        else:
+            print("  No ingestion-lag data yet.")
+
+        _hdr("Resource Usage  (run_serving.py process only)", W)
+        if avg_cpu is not None:
+            print(f"  CPU avg : {_bar(avg_cpu, 100, width=25)}")
+            print(f"  CPU max : {_bar(max_cpu, 100, width=25)}")
+        else:
+            print("  CPU     : — (psutil not installed or no data yet)")
         if avg_mem is not None:
-            print(f"  Mem avg  : {avg_mem:.1f} MB")
+            print(f"  Mem avg : {avg_mem:.1f} MB")
 
         _hdr("Throughput", W)
         print(f"  Total bursts   : {total_bursts:,}")
-        print(f"  Last 60s       : {tput_60s} bursts")
+        print(f"  Last 60s       : {tput_60s} bursts  (note: capped at last 200 docs)")
         print(f"  Pipeline OK    : {ok_count}   Errors: {err_count}")
 
         _hdr(f"Health  (last {len(docs)} bursts)", W)
@@ -259,28 +366,44 @@ class LiveMonitor:
         print(f"  🔀 Drift    : {drift_count}   🔺 Anomaly: {anomaly_count}")
 
         if len(rul_mins) >= 3:
-            trend_vals = list(reversed(rul_mins[:10]))
+            window     = rul_mins[:10]
+            max_rul    = max(window) if max(window) > 0 else 1.0
+            trend_vals = list(reversed(window))
             trend_str  = "  " + "".join(
-                "▁▂▃▄▅▆▇█"[min(int((v / max(rul_mins[:10])) * 8), 7)]
-                if max(rul_mins[:10]) > 0 else "▁"
-                for v in trend_vals
+                "▁▂▃▄▅▆▇█"[min(int((v / max_rul) * 8), 7)] for v in trend_vals
             )
             _hdr(f"RUL Trend  (oldest→latest, last {len(trend_vals)} bursts)", W)
             print(f"  {trend_str}   latest: {_fmt_rul(rul_mins[0])}")
 
         print("\n" + "=" * W)
-        print(f"  Refreshing every {self._interval}s  |  --summary for full report  |  Ctrl+C to stop")
+        print(f"  Refresh: {self._interval}s | --summary for full report | "
+              f"--export-csv to dump | Ctrl+C to stop")
 
     # ── Summary report ────────────────────────────────────────────────────────
 
+    def _stage_table(self, docs):
+        """Build per-stage latency stats across the supplied docs."""
+        cols = {k: [] for k in _STAGE_KEYS}
+        for d in docs:
+            st = d.get("stage_timings_ms") or {}
+            for k in _STAGE_KEYS:
+                v = st.get(k)
+                if v is not None:
+                    cols[k].append(v)
+        return {k: _stats(vs) for k, vs in cols.items()}
+
     def summary(self):
-        W   = 70
+        W   = 78
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         print("\n" + "=" * W)
         print(f"  PHM MLOps — SYSTEM SUMMARY REPORT")
         print(f"  Generated : {now}")
         print(f"  Database  : {self._db_name}")
+        if self._run_id:
+            print(f"  Run filter: {self._run_id}")
+        if self._bearing:
+            print(f"  Bearing   : {self._bearing}")
         print("=" * W)
 
         # ── 1. MongoDB collections ────────────────────────────────────────────
@@ -303,7 +426,8 @@ class LiveMonitor:
         if not models:
             print("  No models registered yet.")
         else:
-            print(f"  {'':2} {'Model ID':<14} {'Status':<12} {'Target':<8} {'MAE_s':>10}  {'RMSE_s':>10}  {'CRA':>6}  {'Registered'}")
+            print(f"  {'':2} {'Model ID':<14} {'Status':<12} {'Target':<8} "
+                  f"{'MAE_s':>10}  {'RMSE_s':>10}  {'CRA':>6}  {'Registered'}")
             _div(W)
             for m in sorted(models, key=lambda x: x.get("registered_at", "")):
                 mid    = (m.get("model_id") or "?")[:12]
@@ -318,99 +442,98 @@ class LiveMonitor:
                 cra_s  = f"{cra:>6.3f}"   if cra  is not None else "     —"
                 reg_at = (m.get("registered_at") or "")[:16]
                 icon   = "🚀" if status == "deployed" else ("✅" if status == "approved" else "  ")
-                print(f"  {icon} {mid:<14} {status:<12} {target:<8} {mae_s}  {rms_s}  {cra_s}  {reg_at}")
+                print(f"  {icon} {mid:<14} {status:<12} {target:<8} "
+                      f"{mae_s}  {rms_s}  {cra_s}  {reg_at}")
 
         # ── 3. Serving runs ───────────────────────────────────────────────────
         _hdr("Serving Runs  (serving_history)", W)
-        run_ids = self._sh.distinct("run_id")
+        run_query = {"run_id": self._run_id} if self._run_id else {}
+        run_ids   = self._sh.distinct("run_id", run_query)
         if not run_ids:
             print("  No serving runs recorded yet.")
         else:
-            print(f"  {'Run ID':<30} {'Bursts':>7} {'OK':>5} {'Err':>5} {'Avg lat':>10}  {'Bearing(s)'}")
+            print(f"  {'Run ID':<30} {'Bursts':>7} {'OK':>5} {'Err':>5} "
+                  f"{'Avg pipe':>10}  {'Avg e2e':>10}  {'Bearing(s)'}")
             _div(W)
             for rid in sorted(run_ids, reverse=True):
                 rdocs    = list(self._sh.find({"run_id": rid}, {"_id": 0}))
                 n        = len(rdocs)
                 ok       = sum(1 for d in rdocs if d.get("pipeline_ok"))
                 err      = n - ok
-                lats     = [d["latency_ms"] for d in rdocs if d.get("latency_ms") is not None]
-                avg_l    = f"{sum(lats)/len(lats):>8.1f} ms" if lats else "         —"
+                pipe     = [self._pipeline_ms_of(d) for d in rdocs]
+                pipe     = [v for v in pipe if v is not None]
+                e2es     = [d["e2e_ms"] for d in rdocs if d.get("e2e_ms") is not None]
+                avg_p    = f"{sum(pipe)/len(pipe):>8.1f}ms" if pipe else "         —"
+                avg_e    = f"{sum(e2es)/len(e2es):>8.1f}ms" if e2es else "         —"
                 bearings = sorted({d.get("bearing_name", "?") for d in rdocs})
                 bear_str = ", ".join(bearings)[:22]
-                print(f"  {rid:<30} {n:>7,} {ok:>5} {err:>5} {avg_l}  {bear_str}")
+                print(f"  {rid:<30} {n:>7,} {ok:>5} {err:>5} {avg_p}  {avg_e}  {bear_str}")
 
-        # ── 4. Per-bearing RUL summary ────────────────────────────────────────
-        _hdr("Per-Bearing RUL Summary  (RUL_predictions)", W)
-        bearing_ids = self._rul.distinct("bearing_name")
-        if not bearing_ids:
-            print("  No RUL predictions recorded yet.")
-        else:
-            print(f"  {'Bearing':<16} {'Bursts':>7} {'Last RUL':>9} {'Status':<10} {'Drift':>6} {'Anomaly':>8}")
-            _div(W)
-            for b in sorted(bearing_ids):
-                bdocs  = list(self._rul.find({"bearing_name": b}, {"_id": 0})
-                              .sort("timestamp", -1).limit(200))
-                n      = self._rul.count_documents({"bearing_name": b})
-                latest = bdocs[0] if bdocs else {}
-                inf    = latest.get("inference", {}) or {}
-                rul    = inf.get("rul_min") or latest.get("rul_min")
-                status = latest.get("pm_status", "?")
-                drift  = sum(1 for d in bdocs
-                             if (d.get("monitoring") or {}).get("drift_detected"))
-                anom   = sum(1 for d in bdocs
-                             if (d.get("monitoring") or {}).get("anomaly_flag"))
-                rul_s  = _fmt_rul(rul)
-                icon   = _status_icon(status)
-                print(f"  {b:<16} {n:>7,} {rul_s:>9} {icon} {status:<8} {drift:>6} {anom:>8}")
+        # ── 4. Latency breakdown (the thesis numbers) ────────────────────────
+        _hdr("Latency Breakdown — All-Run Combined  (or filtered)", W)
+        match = {}
+        if self._run_id:
+            match["run_id"] = self._run_id
+        if self._bearing:
+            match["bearing_name"] = self._bearing
+        all_docs = list(self._sh.find(match, {"_id": 0}))
 
-        # ── 5. Feature stores ─────────────────────────────────────────────────
-        _hdr("Feature Stores", W)
-        ff_bearings  = self._ff.distinct("dataset_id")
-        fs_bearings  = self._fs.distinct("bearing_name")
-        fsm_bearings = self._fsm.distinct("dataset_id")
-
-        ff_list  = ", ".join(sorted(ff_bearings)[:5])  + ("..." if len(ff_bearings)  > 5 else "")
-        fsm_list = ", ".join(sorted(fsm_bearings)[:5]) + ("..." if len(fsm_bearings) > 5 else "")
-
-        print(f"  factory_features       : {self._ff.count_documents({}):>8,} docs  "
-              f"{len(ff_bearings)} bearings")
-        if ff_list:
-            print(f"    Bearings : {ff_list}")
-        print(f"  feature_store (live)   : {self._fs.count_documents({}):>8,} docs  "
-              f"{len(fs_bearings)} bearing(s) active")
-        print(f"  feature_store_mirrored : {self._fsm.count_documents({}):>8,} docs  "
-              f"{len(fsm_bearings)} confirmed fault bearing(s)")
-        if fsm_list:
-            print(f"    Bearings : {fsm_list}")
-
-        # ── 6. Latency breakdown across all runs ──────────────────────────────
-        _hdr("Latency Breakdown  (all runs combined)", W)
-        all_lats = [d["latency_ms"] for d in
-                    self._sh.find({}, {"latency_ms": 1, "_id": 0})
-                    if d.get("latency_ms") is not None]
-        if all_lats:
-            s     = sorted(all_lats)
-            n     = len(s)
-            mean  = sum(s) / n
-            under_50  = sum(1 for l in s if l <  50)
-            under_100 = sum(1 for l in s if l < 100)
-            under_500 = sum(1 for l in s if l < 500)
-            print(f"  Samples  : {n:,}")
-            print(f"  Mean     : {_fmt_ms(mean)}")
-            print(f"  Median   : {_fmt_ms(s[n//2])}")
-            print(f"  p95      : {_fmt_ms(s[int(n*0.95)])}")
-            print(f"  p99      : {_fmt_ms(s[int(n*0.99)])}")
-            print(f"  Max      : {_fmt_ms(max(s))}")
-            print(f"  < 50ms   : {under_50:,} / {n:,}  ({under_50/n*100:.1f}%)  ← Excellent")
-            print(f"  < 100ms  : {under_100:,} / {n:,}  ({under_100/n*100:.1f}%)  ← Good")
-            print(f"  < 500ms  : {under_500:,} / {n:,}  ({under_500/n*100:.1f}%)  ← Acceptable")
-            over_1s = sum(1 for l in s if l >= 1000)
-            if over_1s:
-                print(f"  > 1000ms : {over_1s:,} / {n:,}  ({over_1s/n*100:.1f}%)  ← ⚠️  Investigate")
-        else:
+        if not all_docs:
             print("  No latency data recorded yet.")
+        else:
+            pipe = [self._pipeline_ms_of(d) for d in all_docs]
+            pipe = [v for v in pipe if v is not None]
+            e2e  = [d["e2e_ms"]           for d in all_docs if d.get("e2e_ms")           is not None]
+            ing  = [d["ingestion_lag_ms"] for d in all_docs if d.get("ingestion_lag_ms") is not None]
 
-        # ── 7. Health summary across all runs ─────────────────────────────────
+            print(f"  {'Metric':<22}{'n':>7}{'mean':>11}{'p50':>11}"
+                  f"{'p95':>11}{'p99':>11}{'max':>11}")
+            _div(W)
+            for label, vals in (
+                ("pipeline_ms",       pipe),
+                ("e2e_ms",            e2e),
+                ("ingestion_lag_ms",  ing),
+            ):
+                st = _stats(vals)
+                if st:
+                    print(f"  {label:<22}{st['n']:>7}{st['mean']:>10.2f}ms"
+                          f"{st['p50']:>10.2f}ms{st['p95']:>10.2f}ms"
+                          f"{st['p99']:>10.2f}ms{st['max']:>10.2f}ms")
+                else:
+                    print(f"  {label:<22}{'—':>7}{'—':>11}{'—':>11}"
+                          f"{'—':>11}{'—':>11}{'—':>11}")
+
+            # Per-stage
+            _hdr("Per-Stage Pipeline Breakdown", W)
+            stage_stats = self._stage_table(all_docs)
+            print(f"  {'Stage':<22}{'n':>7}{'mean':>11}{'p50':>11}"
+                  f"{'p95':>11}{'p99':>11}{'max':>11}")
+            _div(W)
+            for k in _STAGE_KEYS:
+                st = stage_stats.get(k)
+                if st is None:
+                    print(f"  {k:<22}{'—':>7}{'—':>11}{'—':>11}"
+                          f"{'—':>11}{'—':>11}{'—':>11}")
+                else:
+                    print(f"  {k:<22}{st['n']:>7}{st['mean']:>10.2f}ms"
+                          f"{st['p50']:>10.2f}ms{st['p95']:>10.2f}ms"
+                          f"{st['p99']:>10.2f}ms{st['max']:>10.2f}ms")
+
+            # Compliance buckets vs the 10 s burst period
+            n     = len(pipe)
+            if n:
+                under_50  = sum(1 for v in pipe if v <  50)
+                under_100 = sum(1 for v in pipe if v < 100)
+                under_500 = sum(1 for v in pipe if v < 500)
+                over_1s   = sum(1 for v in pipe if v >= 1000)
+                _hdr("Pipeline Latency Buckets (vs 10s burst period)", W)
+                print(f"  < 50 ms  : {under_50:>6,} / {n:,}  ({under_50/n*100:5.1f}%)")
+                print(f"  < 100 ms : {under_100:>6,} / {n:,}  ({under_100/n*100:5.1f}%)")
+                print(f"  < 500 ms : {under_500:>6,} / {n:,}  ({under_500/n*100:5.1f}%)")
+                if over_1s:
+                    print(f"  > 1000ms : {over_1s:>6,} / {n:,}  ({over_1s/n*100:5.1f}%)  ⚠️")
+
+        # ── 5. Health summary across all runs ─────────────────────────────────
         _hdr("Overall Health  (all RUL_predictions)", W)
         total_rul = self._rul.count_documents({})
         if total_rul:
@@ -428,7 +551,7 @@ class LiveMonitor:
         else:
             print("  No prediction data yet.")
 
-        # ── 8. Workflow & preprod ─────────────────────────────────────────────
+        # ── 6. Workflow & preprod ─────────────────────────────────────────────
         _hdr("Workflow Registry", W)
         wf_docs = list(self._wr.find({}, {"_id": 0}))
         if not wf_docs:
@@ -453,6 +576,46 @@ class LiveMonitor:
         print("  End of report.")
         print("=" * W + "\n")
 
+    # ── Thesis CSV export ─────────────────────────────────────────────────────
+
+    def export_csv(self, path: str):
+        match = {}
+        if self._run_id:
+            match["run_id"] = self._run_id
+        if self._bearing:
+            match["bearing_name"] = self._bearing
+
+        cursor = self._sh.find(match, {"_id": 0}).sort("timestamp", 1)
+
+        fieldnames = [
+            "timestamp", "run_id", "bearing_name", "burst_idx", "model_version",
+            "pipeline_ok", "pm_status", "rul_s", "rul_min",
+            "drift_detected", "anomaly_flag",
+            "pipeline_ms", "latency_ms", "ingestion_lag_ms", "e2e_ms",
+            "cpu_percent", "memory_mb", "bursts_this_session",
+        ] + list(_STAGE_KEYS)
+
+        n_written = 0
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=fieldnames)
+            w.writeheader()
+            for d in cursor:
+                stage = d.get("stage_timings_ms") or {}
+                row   = {k: d.get(k) for k in fieldnames if k not in _STAGE_KEYS}
+                # ensure timestamp is iso8601
+                ts = d.get("timestamp")
+                if hasattr(ts, "isoformat"):
+                    row["timestamp"] = ts.isoformat()
+                for sk in _STAGE_KEYS:
+                    row[sk] = stage.get(sk)
+                w.writerow(row)
+                n_written += 1
+
+        print(f"\n  ✓  Wrote {n_written:,} rows → {os.path.abspath(path)}")
+        if n_written == 0:
+            print("    (No documents matched the filter — check --run_id / --bearing.)")
+        print()
+
     # ── Run loop ──────────────────────────────────────────────────────────────
 
     def run(self):
@@ -472,27 +635,36 @@ class LiveMonitor:
 
 def _parse_args():
     parser = argparse.ArgumentParser(
-        description="Live MLOps monitor — polls serving_history for real-time stats.",
+        description="Live MLOps monitor — polls serving_history for real-time "
+                    "stats and supports thesis-ready latency export.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python monitor.py                        # live dashboard, auto-latest run
-  python monitor.py --interval 3           # refresh every 3s
-  python monitor.py --bearing Bearing1_5   # filter to one bearing
-  python monitor.py --run_id serve_xyz     # filter to specific run
-  python monitor.py --summary              # full one-shot system report
+  python monitor.py
+  python monitor.py --interval 3
+  python monitor.py --bearing Bearing1_5
+  python monitor.py --run_id serve_xyz
+  python monitor.py --summary
+  python monitor.py --summary --run_id serve_xyz
+  python monitor.py --export-csv latency.csv
+  python monitor.py --export-csv latency.csv --run_id serve_xyz
         """,
     )
-    parser.add_argument("--mongo_uri", type=str,   default=DEFAULT_MONGO_URI)
-    parser.add_argument("--db_name",   type=str,   default=DEFAULT_DB_NAME)
-    parser.add_argument("--interval",  type=float, default=DEFAULT_INTERVAL_S,
-                        help=f"Live refresh interval in seconds (default: {DEFAULT_INTERVAL_S})")
-    parser.add_argument("--run_id",    type=str,   default=None,
+    parser.add_argument("--mongo_uri",  type=str,   default=DEFAULT_MONGO_URI)
+    parser.add_argument("--db_name",    type=str,   default=DEFAULT_DB_NAME)
+    parser.add_argument("--interval",   type=float, default=DEFAULT_INTERVAL_S,
+                        help=f"Live refresh interval in seconds "
+                             f"(default: {DEFAULT_INTERVAL_S})")
+    parser.add_argument("--run_id",     type=str,   default=None,
                         help="Filter to a specific run_id (default: latest)")
-    parser.add_argument("--bearing",   type=str,   default=None,
+    parser.add_argument("--bearing",    type=str,   default=None,
                         help="Filter to a specific bearing name")
-    parser.add_argument("--summary",   action="store_true", default=False,
+    parser.add_argument("--summary",    action="store_true", default=False,
                         help="Print a full one-shot system summary report and exit")
+    parser.add_argument("--export-csv", type=str,   default=None,
+                        dest="export_csv",
+                        help="Export filtered serving_history to CSV and exit "
+                             "(for thesis analysis)")
     return parser.parse_args()
 
 
@@ -505,7 +677,10 @@ if __name__ == "__main__":
         run_id       = args.run_id,
         bearing_name = args.bearing,
     )
-    if args.summary:
+
+    if args.export_csv:
+        monitor.export_csv(args.export_csv)
+    elif args.summary:
         monitor.summary()
     else:
         try:

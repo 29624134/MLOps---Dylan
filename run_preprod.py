@@ -11,24 +11,24 @@ Flow
 ────
 1. Validate confirmed fault data exists in FS Mirrored for this group
 2. Retrain the group-specific model via WorkflowExecutor.run_training_only(group)
-3. Compare new model vs the group's current champion
-4. If better → write group champion file atomically
-   → run_serving.py for that group detects the change and hot-swaps the model
-5. If not better → leave as PENDING for manual review
+3. Compare new model vs the group's current champion (lower MAE_s = better)
+4. If better → approve + deploy in registry (auto-archives old champion)
+              → write group champion file atomically
+              → run_serving.py for that group detects the change and hot-swaps
+5. If not better → REJECT new model in the registry (explicit, audit-traceable)
+                 → current champion retained, no champion file rewrite
+
+Status outcomes in the Model Registry
+─────────────────────────────────────
+After a preprod run the new model is always in one of:
+    deployed  — the new champion (and old champion is archived)
+    rejected  — explicitly rejected because not better than current champion
+    pending   — only if metric was missing (data error → manual review needed)
 
 Champion files (one per group):
     model_registry/champion_bearing1.json  ← Group 1
     model_registry/champion_bearing2.json  ← Group 2
     model_registry/champion_bearing3.json  ← Group 3
-
-Architecture:
-    [Dashboard: confirm fault on Bearing1_5]
-             → group = "1"
-             → [run_preprod.py --group 1]
-             → [retrain Group 1 model only]
-             → [champion_bearing1.json updated]
-             → [run_serving.py for Bearing1_x detects change → hot-swap]
-    Group 2 and Group 3 serving: completely uninterrupted ✓
 
 Usage
 ─────
@@ -38,7 +38,7 @@ Usage
     # Manual trigger:
     python run_preprod.py --group 2
 
-    # Dry run (compare only, do not promote):
+    # Dry run (compare only, do not promote or reject):
     python run_preprod.py --group 1 --dry_run
 ═══════════════════════════════════════════════════════════════════════════════
 """
@@ -48,7 +48,6 @@ import json
 import logging
 import os
 import sys
-import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -164,7 +163,7 @@ def run_preprod(
     run_id    : str  — unique identifier (auto-generated if None)
     mongo_uri : str  — MongoDB connection string
     db_name   : str  — database name
-    dry_run   : bool — compare only, do not write champion file
+    dry_run   : bool — compare only, do not write champion file or reject
     """
     run_id = run_id or f"preprod_g{group}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
@@ -188,7 +187,6 @@ def run_preprod(
         db     = client[db_name]
         col    = db[COL_FEATURE_STORE_MIRRORED]
 
-        # Load bearing registry to find confirmed bearings in this group
         from orchestrator import BearingRegistry
         reg = BearingRegistry("config/bearings.json")
 
@@ -260,23 +258,29 @@ def run_preprod(
         logger.error(f"Model registry error: {e}", exc_info=True)
         return False
 
-    # ── Step 4: Compare and promote ───────────────────────────────────────────
+    # ── Step 4: Compare and promote OR reject ─────────────────────────────────
     current_champion = read_champion(group)
     champion_metrics = current_champion.get("metrics", {}) if current_champion else {}
 
     if is_new_model_better(new_metrics, champion_metrics, COMPARISON_METRIC):
+        new_mae      = new_metrics.get(COMPARISON_METRIC)
+        champ_mae    = champion_metrics.get(COMPARISON_METRIC, "N/A")
+        new_mae_str  = f"{new_mae:.2f}"   if isinstance(new_mae,   (int, float)) else "N/A"
+        champ_mae_str = f"{champ_mae:.2f}" if isinstance(champ_mae, (int, float)) else "N/A"
+
         logger.info(
             f"\n  ✅ New model is BETTER — promoting to Group {group} champion.\n"
             f"  Model ID : {new_model_id}\n"
-            f"  {COMPARISON_METRIC}: {new_metrics.get(COMPARISON_METRIC):.2f} "
-            f"(was: {champion_metrics.get(COMPARISON_METRIC, 'N/A')})"
+            f"  {COMPARISON_METRIC}: {new_mae_str} (was: {champ_mae_str})"
         )
 
         if not dry_run:
+            # approve_model + deploy_model — deploy_model auto-archives the
+            # previous champion (sets its status to 'archived').
             registry.approve_model(new_model_id, approved_by="preprod_auto")
             registry.deploy_model(new_model_id)
 
-            # Write group-specific champion file
+            # Write group-specific champion file (the file run_serving.py watches)
             write_champion(
                 group=group,
                 model_id=new_model_id,
@@ -288,15 +292,42 @@ def run_preprod(
                 f"run_serving.py (Group {group}) will hot-swap on next burst ✓"
             )
         else:
-            logger.info(f"  [DRY RUN] Promotion skipped — champion_bearing{group}.json NOT written.")
+            logger.info(
+                f"  [DRY RUN] Promotion skipped — "
+                f"champion_bearing{group}.json NOT written, registry NOT updated."
+            )
 
     else:
-        logger.info(
-            f"\n  ℹ️  New model is NOT better — keeping current Group {group} champion.\n"
-            f"  New {COMPARISON_METRIC}      : {new_metrics.get(COMPARISON_METRIC)}\n"
-            f"  Champion {COMPARISON_METRIC} : {champion_metrics.get(COMPARISON_METRIC)}"
+        # New model is NOT better → mark it REJECTED in the registry.
+        # This makes the registry status explicit and traceable instead of
+        # leaving the model floating in PENDING forever.
+        new_mae   = new_metrics.get(COMPARISON_METRIC)
+        champ_mae = champion_metrics.get(COMPARISON_METRIC)
+        reason = (
+            f"New model {COMPARISON_METRIC}={new_mae} is not better than "
+            f"current Group {group} champion {COMPARISON_METRIC}={champ_mae}."
         )
-        logger.info(f"  New model {new_model_id} left as PENDING for manual review.")
+
+        logger.info(
+            f"\n  ℹ️  New model is NOT better — rejecting and retaining current Group {group} champion.\n"
+            f"  New {COMPARISON_METRIC}      : {new_mae}\n"
+            f"  Champion {COMPARISON_METRIC} : {champ_mae}"
+        )
+
+        if not dry_run:
+            registry.reject_model(
+                new_model_id,
+                rejected_by="preprod_auto",
+                reason=reason,
+            )
+            logger.info(
+                f"  Model {new_model_id} marked as REJECTED in the registry."
+            )
+        else:
+            logger.info(
+                f"  [DRY RUN] Rejection skipped — model {new_model_id} "
+                f"left as PENDING."
+            )
 
     logger.info(f"\n[Pre-Production complete — Group {group}]")
     logger.info(
@@ -317,36 +348,56 @@ def _parse_args():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Retrain Group 1 model after fault confirmed on Bearing1_5:
-  python run_preprod.py --group 1 --run_id preprod_xyz
+  # Automatic trigger (from API after fault confirmation):
+  python run_preprod.py --run_id <run_id> --group 1
 
-  # Retrain Group 2 model:
+  # Manual trigger:
   python run_preprod.py --group 2
 
-  # Dry run — compare only, do not write champion file:
-  python run_preprod.py --group 3 --dry_run
+  # Dry run (no champion file written, no model rejected/promoted):
+  python run_preprod.py --group 1 --dry_run
         """,
     )
     parser.add_argument(
-        "--group", type=str, required=True, choices=["1", "2", "3"],
-        help="Bearing group to retrain (1, 2, or 3)"
+        "--group",
+        type=str,
+        required=True,
+        help='Bearing group to retrain: "1", "2", or "3".',
     )
-    parser.add_argument("--run_id",    type=str, default=None,
-                        help="Run ID (auto-generated if not provided)")
-    parser.add_argument("--mongo_uri", type=str, default=DEFAULT_MONGO_URI)
-    parser.add_argument("--db_name",   type=str, default=DEFAULT_DB_NAME)
-    parser.add_argument("--dry_run",   action="store_true", default=False,
-                        help="Compare models but do NOT write champion file")
+    parser.add_argument(
+        "--run_id",
+        type=str,
+        default=None,
+        help="Optional run identifier (auto-generated if omitted).",
+    )
+    parser.add_argument(
+        "--mongo_uri",
+        type=str,
+        default=DEFAULT_MONGO_URI,
+        help=f"MongoDB URI (default: {DEFAULT_MONGO_URI}).",
+    )
+    parser.add_argument(
+        "--db_name",
+        type=str,
+        default=DEFAULT_DB_NAME,
+        help=f"Database name (default: {DEFAULT_DB_NAME}).",
+    )
+    parser.add_argument(
+        "--dry_run",
+        action="store_true",
+        help="Compare only — do not promote or reject.",
+    )
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = _parse_args()
-    success = run_preprod(
-        group=args.group,
-        run_id=args.run_id,
-        mongo_uri=args.mongo_uri,
-        db_name=args.db_name,
-        dry_run=args.dry_run,
+
+    ok = run_preprod(
+        group     = args.group,
+        run_id    = args.run_id,
+        mongo_uri = args.mongo_uri,
+        db_name   = args.db_name,
+        dry_run   = args.dry_run,
     )
-    sys.exit(0 if success else 1)
+    sys.exit(0 if ok else 1)
