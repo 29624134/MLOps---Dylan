@@ -448,15 +448,18 @@ class RULTrainerPHM:
                 rul_max = 1.0
             for i in range(len(X_scaled) - seq_len - horizon + 1):
                 Xs.append(X_scaled[i:i + seq_len])
-                # Normalised target across the horizon
-                target = y_raw[i + seq_len: i + seq_len + horizon] / rul_max
+                # Scalar target — RUL at the burst immediately after the window.
+                # CNNLSTMModel replicates this across the horizon internally so all
+                # output heads are supervised by the same value (matches the
+                # original CNN-LSTM design from Lei et al.).
+                target = y_raw[i + seq_len] / rul_max
                 ys.append(target)
                 conds.append(cond)
         if not Xs:
             return (
                 np.zeros((0, seq_len, 19), dtype=np.float32),
-                np.zeros((0, horizon),     dtype=np.float32),
-                np.zeros((0,),             dtype=np.int64),
+                np.zeros((0, horizon), dtype=np.float32),
+                np.zeros((0,), dtype=np.int64),
             )
         return (
             np.array(Xs,    dtype=np.float32),

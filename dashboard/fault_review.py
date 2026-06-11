@@ -22,8 +22,72 @@ import streamlit as st
 
 st.set_page_config(
     page_title="Fault Review",
-    page_icon="✅",
     layout="centered",
+)
+
+st.markdown(
+    """
+    <style>
+    .stApp {
+        background-color: #ffffff;
+    }
+    [data-testid="stHeader"] {
+        background-color: #ffffff;
+    }
+    .stApp, .stMarkdown, p, label, h1, h2, h3, h4, h5, h6 {
+        color: #000000;
+    }
+    /* Border around the whole page content */
+    [data-testid="stMainBlockContainer"] {
+        border: 2px solid #000000 !important;
+        border-radius: 8px !important;
+        padding: 2rem !important;
+        margin-top: 1rem !important;
+    }
+    /* All headings and body text uniform size */
+    .stMarkdown h1,
+    .stMarkdown h2,
+    .stMarkdown h3,
+    .stMarkdown h4,
+    .stMarkdown h5,
+    .stMarkdown h6,
+    .stMarkdown p,
+    .stMarkdown li,
+    label {
+        font-size: 20px !important;
+        font-weight: 600 !important;
+        font-family: "Source Sans Pro", sans-serif !important;
+    }
+    .stMarkdown p {
+        font-weight: 600 !important;
+    }
+    /* Black border on all buttons + font sizing */
+    .stButton > button {
+        border: 2px solid #000000 !important;
+        font-size: 20px !important;
+        font-weight: 600 !important;
+        font-family: "Source Sans Pro", sans-serif !important;
+        color: #ffffff !important;
+    }
+    /* Confirm Fault (primary button) → green */
+    .stButton > button[kind="primary"] {
+        background-color: #2e7d32 !important;
+    }
+    .stButton > button[kind="primary"]:hover {
+        background-color: #1b5e20 !important;
+        border-color: #000000 !important;
+    }
+    /* Deny Fault (secondary button) → red */
+    .stButton > button[kind="secondary"] {
+        background-color: #c62828 !important;
+    }
+    .stButton > button[kind="secondary"]:hover {
+        background-color: #8e0000 !important;
+        border-color: #000000 !important;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
 )
 
 API_BASE = "http://localhost:8000"
@@ -42,10 +106,10 @@ def _get(path: str) -> dict:
         r.raise_for_status()
         return r.json()
     except requests.exceptions.ConnectionError:
-        st.error(f"❌ Cannot reach backend at `{API_BASE}`. Is the API running?")
+        st.error(f"Cannot reach backend at `{API_BASE}`. Is the API running?")
         return {}
     except Exception as e:
-        st.error(f"❌ API error: {e}")
+        st.error(f"API error: {e}")
         return {}
 
 
@@ -55,10 +119,10 @@ def _post(path: str, payload: dict = None, timeout: int = 15) -> dict:
         r.raise_for_status()
         return r.json()
     except requests.exceptions.ConnectionError:
-        st.error(f"❌ Cannot reach backend at `{API_BASE}`.")
+        st.error(f"Cannot reach backend at `{API_BASE}`.")
         return {"error": "connection failed"}
     except Exception as e:
-        st.error(f"❌ API error: {e}")
+        st.error(f"API error: {e}")
         return {"error": str(e)}
 
 
@@ -156,7 +220,7 @@ def _parse_current_bearings(info: dict) -> dict:
 
 
 # ── Header ────────────────────────────────────────────────────────────────────
-st.markdown("# ✅ Fault Review")
+st.markdown("Fault Review")
 st.markdown("Maintenance technician fault confirmation interface.")
 st.markdown("---")
 
@@ -171,7 +235,7 @@ if not current_info:
     st.stop()
 
 if current_info.get("queue_exhausted"):
-    st.success("🏁 All bearings in the queue have been processed.")
+    st.success("All bearings in the queue have been processed.")
     st.stop()
 
 active_bearings = _parse_current_bearings(current_info)
@@ -240,7 +304,7 @@ if not decision:
 
     with col1:
         if st.button(
-            "✅ Confirm Fault",
+            "Confirm Fault",
             use_container_width=True,
             type="primary",
             disabled=not name_ok,
@@ -255,7 +319,7 @@ if not decision:
 
     with col2:
         if st.button(
-            "❌ Deny Fault",
+            "Deny Fault",
             use_container_width=True,
             disabled=not name_ok,
         ):
@@ -269,7 +333,7 @@ if not decision:
 
 # ── Step 3: Continue ──────────────────────────────────────────────────────────
 if decision:
-    label_str = "confirmed ✅" if decision == "confirmed" else "denied ❌"
+    label_str = "confirmed" if decision == "confirmed" else "denied"
     st.markdown("---")
     st.success(
         f"**{current_name}** has been **{label_str}**."

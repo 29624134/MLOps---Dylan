@@ -312,10 +312,10 @@ class ServingTelemetry:
     """
 
     def __init__(self, mongo_uri: str, db_name: str = "phm_mlops"):
-        self._uri     = mongo_uri
+        self._uri = mongo_uri
         self._db_name = db_name
-        self._client  = MongoClient(mongo_uri, serverSelectionTimeoutMS=5000)
-        self._col     = self._client[db_name][COL_SERVING_HISTORY]
+        self._client = MongoClient(mongo_uri, serverSelectionTimeoutMS=5000)
+        self._col = self._client[db_name][COL_SERVING_HISTORY]
         self._ensure_indexes()
         logger.info(
             f"ServingTelemetry connected → {db_name}.{COL_SERVING_HISTORY}"
@@ -323,59 +323,77 @@ class ServingTelemetry:
 
     def _ensure_indexes(self):
         try:
-            self._col.create_index("run_id",           name="idx_run_id")
-            self._col.create_index("bearing_name",     name="idx_bearing_name")
-            self._col.create_index("model_version",    name="idx_model_version")
-            self._col.create_index("pipeline_version", name="idx_pipeline_version")
+            self._col.create_index("run_id", name="idx_run_id")
+            self._col.create_index("bearing_name", name="idx_bearing_name")
             self._col.create_index(
                 [("timestamp", DESCENDING)], name="idx_timestamp_desc"
             )
+            self._col.create_index("model_version", name="idx_model_version")
         except Exception as e:
             logger.warning(f"[ServingTelemetry] Index creation warning: {e}")
 
     def record(
-        self,
-        run_id:               str,
-        bearing_name:         str,
-        burst_idx:            int,
-        model_version:        str,
-        latency_ms:           float,
-        pipeline_ok:          bool,
-        pm_status:            str,
-        rul_s:                Optional[float],
-        rul_min:              Optional[float],
-        drift_detected:       bool,
-        anomaly_flag:         bool,
-        bursts_this_session:  int,
-        correction:           Optional[Dict[str, Any]] = None,
-        cpu_percent:          Optional[float] = None,
-        memory_mb:            Optional[float] = None,
-        pipeline_version:     str = DEFAULT_PIPELINE_VERSION,
+            self,
+            run_id: str,
+            bearing_name: str,
+            burst_idx: int,
+            model_version: str,
+            latency_ms: float,
+            pipeline_ok: bool,
+            pm_status: str,
+            rul_s: Optional[float],
+            rul_min: Optional[float],
+            drift_detected: bool,
+            anomaly_flag: bool,
+            bursts_this_session: int,
+            correction: Optional[Dict[str, Any]] = None,
+            cpu_percent: Optional[float] = None,
+            memory_mb: Optional[float] = None,
+            # ── NEW thesis-instrumentation fields (all optional / back-compat) ──
+            pipeline_ms: Optional[float] = None,
+            ingestion_lag_ms: Optional[float] = None,
+            e2e_ms: Optional[float] = None,
+            stage_timings_ms: Optional[Dict[str, float]] = None,
     ) -> None:
         """
         Write one telemetry record to serving_history.
 
-        Call this after every successfully processed burst in run_serving.py.
+        Call this after every processed burst in run_serving.py.
         Failures are also recorded (pipeline_ok=False) so nothing is invisible.
+
+        Backwards-compat: if pipeline_ms is not provided, it defaults to
+        latency_ms (preserving old callers).
         """
+        if pipeline_ms is None:
+            pipeline_ms = latency_ms
+
         doc = {
-            "run_id":               run_id,
-            "bearing_name":         bearing_name,
-            "burst_idx":            burst_idx,
-            "timestamp":            datetime.now(timezone.utc),
-            "model_version":        model_version,
-            "pipeline_version":     pipeline_version or DEFAULT_PIPELINE_VERSION,
-            "latency_ms":           round(latency_ms, 3),
-            "pipeline_ok":          pipeline_ok,
-            "pm_status":            pm_status,
-            "rul_s":                rul_s,
-            "rul_min":              rul_min,
-            "drift_detected":       drift_detected,
-            "anomaly_flag":         anomaly_flag,
-            "bursts_this_session":  bursts_this_session,
-            "correction":           correction or {},
-            "cpu_percent":          cpu_percent,
-            "memory_mb":            memory_mb,
+            "run_id": run_id,
+            "bearing_name": bearing_name,
+            "burst_idx": burst_idx,
+            "timestamp": datetime.now(timezone.utc),
+            "model_version": model_version,
+
+            # Latency: legacy + new
+            "latency_ms": round(float(latency_ms), 3),  # back-compat alias
+            "pipeline_ms": round(float(pipeline_ms), 3),
+            "ingestion_lag_ms": (round(float(ingestion_lag_ms), 3)
+                                 if ingestion_lag_ms is not None else None),
+            "e2e_ms": (round(float(e2e_ms), 3)
+                       if e2e_ms is not None else None),
+            "stage_timings_ms": {k: round(float(v), 3)
+                                 for k, v in (stage_timings_ms or {}).items()},
+
+            "pipeline_ok": pipeline_ok,
+            "pm_status": pm_status,
+            "rul_s": rul_s,
+            "rul_min": rul_min,
+            "drift_detected": drift_detected,
+            "anomaly_flag": anomaly_flag,
+            "bursts_this_session": bursts_this_session,
+            "correction": correction or {},
+            "cpu_percent": cpu_percent,
+            "memory_mb": memory_mb,
         }
         try:
             self._col.insert_one(doc)
@@ -387,19 +405,40 @@ class ServingTelemetry:
         docs = list(self._col.find({"run_id": run_id}, {"_id": 0}))
         if not docs:
             return {}
-        latencies = [d["latency_ms"] for d in docs if d.get("latency_ms") is not None]
+
+        pipeline_lats = [d.get("pipeline_ms") or d.get("latency_ms")
+                         for d in docs
+                         if (d.get("pipeline_ms") or d.get("latency_ms")) is not None]
+        e2e_lats = [d["e2e_ms"] for d in docs if d.get("e2e_ms") is not None]
+        ingest_lags = [d["ingestion_lag_ms"] for d in docs if d.get("ingestion_lag_ms") is not None]
+
+        def _avg(xs):  return round(sum(xs) / len(xs), 3) if xs else None
+
+        def _maxn(xs): return round(max(xs), 3) if xs else None
+
+        def _minn(xs): return round(min(xs), 3) if xs else None
+
         return {
-            "run_id":            run_id,
-            "total_bursts":      len(docs),
-            "avg_latency_ms":    round(sum(latencies) / len(latencies), 2) if latencies else None,
-            "max_latency_ms":    round(max(latencies), 2) if latencies else None,
-            "min_latency_ms":    round(min(latencies), 2) if latencies else None,
-            "ok_count":          sum(1 for d in docs if d.get("pipeline_ok")),
-            "error_count":       sum(1 for d in docs if not d.get("pipeline_ok")),
-            "critical_count":    sum(1 for d in docs if d.get("pm_status") == "critical"),
-            "warning_count":     sum(1 for d in docs if d.get("pm_status") == "warning"),
-            "drift_count":       sum(1 for d in docs if d.get("drift_detected")),
-            "anomaly_count":     sum(1 for d in docs if d.get("anomaly_flag")),
-            "model_versions":    list({d["model_version"]    for d in docs if d.get("model_version")}),
-            "pipeline_versions": list({d["pipeline_version"] for d in docs if d.get("pipeline_version")}),
+            "run_id": run_id,
+            "total_bursts": len(docs),
+
+            # Pipeline (old API name kept for back-compat)
+            "avg_latency_ms": _avg(pipeline_lats),
+            "max_latency_ms": _maxn(pipeline_lats),
+            "min_latency_ms": _minn(pipeline_lats),
+
+            # New thesis breakdown
+            "avg_pipeline_ms": _avg(pipeline_lats),
+            "avg_e2e_ms": _avg(e2e_lats),
+            "max_e2e_ms": _maxn(e2e_lats),
+            "avg_ingestion_lag_ms": _avg(ingest_lags),
+            "max_ingestion_lag_ms": _maxn(ingest_lags),
+
+            "ok_count": sum(1 for d in docs if d.get("pipeline_ok")),
+            "error_count": sum(1 for d in docs if not d.get("pipeline_ok")),
+            "critical_count": sum(1 for d in docs if d.get("pm_status") == "critical"),
+            "warning_count": sum(1 for d in docs if d.get("pm_status") == "warning"),
+            "drift_count": sum(1 for d in docs if d.get("drift_detected")),
+            "anomaly_count": sum(1 for d in docs if d.get("anomaly_flag")),
+            "model_versions": list({d["model_version"] for d in docs if d.get("model_version")}),
         }

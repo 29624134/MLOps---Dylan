@@ -472,94 +472,124 @@ def run_serving(
                 )
                 pipeline.reload_model()
 
-            # ── Extract burst data ────────────────────────────────────────────
-            burst_idx   = burst_doc.get("burst_idx", 0)
+            #   ── ingestion timestamp from SCADA ────────────────────────────────────────
+            sent_at_dt = _parse_sent_at(burst_doc.get("sent_at"))
+            t_pickup_wall = datetime.now(timezone.utc)  # when run_serving has the doc
+            t_burst_start = time.perf_counter()  # local monotonic anchor
+
+            ingestion_lag_ms = None
+            if sent_at_dt is not None:
+                ingestion_lag_ms = (t_pickup_wall - sent_at_dt).total_seconds() * 1000.0
+
+            #   ── Extract burst data ────────────────────────────────────────────────────
+            #   SCADA writes the 10 stats flat on the document (not nested).
+            burst_idx = burst_doc.get("burst_idx", 0)
             _SCADA_KEYS = (
                 "h_max", "h_min", "h_mean", "h_sd", "h_rms",
                 "v_max", "v_min", "v_mean", "v_sd", "v_rms",
             )
             scada_stats = {k: burst_doc[k] for k in _SCADA_KEYS if k in burst_doc}
-            features    = _derive_features(scada_stats)
+            features = _derive_features(scada_stats)
 
-            # ── Run 4-stage serving pipeline ──────────────────────────────────
-            t_start    = time.perf_counter()
-            result     = pipeline.run_burst(
-                run_id               = run_id,
-                bearing_name         = bearing_name,
-                burst_idx            = burst_idx,
-                h_signal             = np.array([0.0], dtype=np.float32),
-                v_signal             = np.array([0.0], dtype=np.float32),
-                precomputed_features = features,
+            #   ── Run 4-stage serving pipeline ──────────────────────────────────────────
+            t_pipe_start = time.perf_counter()
+            result = pipeline.run_burst(
+                run_id=run_id,
+                bearing_name=bearing_name,
+                burst_idx=burst_idx,
+                h_signal=np.array([0.0], dtype=np.float32),
+                v_signal=np.array([0.0], dtype=np.float32),
+                precomputed_features=features,
             )
-            latency_ms = (time.perf_counter() - t_start) * 1000
+            pipeline_ms_external = (time.perf_counter() - t_pipe_start) * 1000.0
 
-            # ── Mark burst consumed — store the 18 base features ──────────────
+            #   ── Prefer pipeline's own internal total (sub-ms accurate); fall back to
+            #       the external timer if the pipeline is an older version without it.
+            stage_timings_ms = result.get("stage_timings_ms") or {}
+            pipeline_ms = stage_timings_ms.get("pipeline_total_ms", pipeline_ms_external)
+
+            #   ── Mark burst consumed — store the 18 base features ─────────────────────
             fs_reader.mark_consumed(burst_doc["_id"], derived_features=features)
 
-            pm         = result.get("pm")         or {}
+            pm = result.get("pm") or {}
             monitoring = result.get("monitoring") or {}
-            inference  = result.get("inference")  or {}
-            ok         = result.get("ok",    False)
-            ready      = result.get("ready", False)
+            inference = result.get("inference") or {}
+            ok = result.get("ok", False)
+            ready = result.get("ready", False)
 
-            # ── Write monitoring metrics back to Feature Store ────────────────
+            #   ── Write monitoring metrics back to Feature Store ────────────────────────
             if ok and ready:
                 fs_reader.write_monitoring_metrics(
-                    bearing_name   = bearing_name,
-                    burst_idx      = burst_idx,
-                    run_id         = run_id,
-                    monitoring_out = monitoring,
-                    pm_out         = pm,
-                    inference_out  = inference,
+                    bearing_name=bearing_name,
+                    burst_idx=burst_idx,
+                    run_id=run_id,
+                    monitoring_out=monitoring,
+                    pm_out=pm,
+                    inference_out=inference,
                 )
                 burst_count += 1
 
-            # ── Operational telemetry → serving_history (with pipeline_version)
+            #   ── Operational telemetry → serving_history ───────────────────────────────
             try:
                 import psutil
-                proc    = psutil.Process()
+                proc = psutil.Process()
                 cpu_pct = proc.cpu_percent(interval=None)
-                mem_mb  = proc.memory_info().rss / 1024 / 1024
+                mem_mb = proc.memory_info().rss / 1024 / 1024
             except Exception:
                 cpu_pct = None
-                mem_mb  = None
+                mem_mb = None
+
+            #   ── True end-to-end: sent_at → just-before-write to serving_history ──────
+            #   We compute e2e_ms BEFORE telemetry.record() so the figure does not
+            #   include the time taken to write itself (which is logged separately in
+            #   stage_timings_ms.serving_history_ms for the per-stage breakdown).
+            e2e_ms = None
+            if sent_at_dt is not None:
+                e2e_ms = (datetime.now(timezone.utc) - sent_at_dt).total_seconds() * 1000.0
 
             telemetry.record(
-                run_id              = run_id,
-                bearing_name        = bearing_name,
-                burst_idx           = burst_idx,
-                model_version       = champion_watcher.current_champion_id() or "unknown",
-                pipeline_version    = pipeline_version,
-                latency_ms          = latency_ms,
-                pipeline_ok         = ok,
-                pm_status           = pm.get("status", "unknown"),
-                rul_s               = pm.get("rul_s"),
-                rul_min             = pm.get("rul_min"),
-                drift_detected      = monitoring.get("drift_detected", False),
-                anomaly_flag        = monitoring.get("anomaly_flag", False),
-                bursts_this_session = burst_count,
-                cpu_percent         = cpu_pct,
-                memory_mb           = mem_mb,
+                run_id=run_id,
+                bearing_name=bearing_name,
+                burst_idx=burst_idx,
+                model_version=champion_watcher.current_champion_id() or "unknown",
+
+                # Legacy field — kept identical so existing dashboards don't break.
+                latency_ms=pipeline_ms,
+
+                pipeline_ok=ok,
+                pm_status=pm.get("status", "unknown"),
+                rul_s=pm.get("rul_s"),
+                rul_min=pm.get("rul_min"),
+                drift_detected=monitoring.get("drift_detected", False),
+                anomaly_flag=monitoring.get("anomaly_flag", False),
+                bursts_this_session=burst_count,
+                cpu_percent=cpu_pct,
+                memory_mb=mem_mb,
+
+                # New thesis-instrumentation fields:
+                pipeline_ms=pipeline_ms,
+                ingestion_lag_ms=ingestion_lag_ms,
+                e2e_ms=e2e_ms,
+                stage_timings_ms=stage_timings_ms,
             )
 
-            # ── Log result ────────────────────────────────────────────────────
+            #   ── Log result (extended with e2e + ingestion lag) ────────────────────────
             if ok and ready:
+                _lag_str = f"{ingestion_lag_ms:6.1f}ms" if ingestion_lag_ms is not None else "    —  "
+                _e2e_str = f"{e2e_ms:7.1f}ms" if e2e_ms is not None else "      — "
                 logger.info(
                     f"  [{bearing_name}] Burst {burst_idx:>4} | "
                     f"RUL={pm.get('rul_min', 0.0):>10.1f} min | "
                     f"status={pm.get('status', '—'):<8} | "
-                    f"latency={latency_ms:.1f}ms | "
+                    f"pipe={pipeline_ms:6.1f}ms ingest={_lag_str} e2e={_e2e_str} | "
                     f"drift={monitoring.get('drift_detected', False)} | "
                     f"alert={pm.get('alert', False)}"
                 )
 
                 if pm.get("status") == "critical":
+                    # Log a prominent warning but DO NOT stop serving.
                     logger.warning(
-                        f"\n{'!'*60}\n"
-                        f"  CRITICAL RUL ALERT for {bearing_name}!\n"
-                        f"  RUL = {pm.get('rul_min', '?'):.3f} min\n"
-                        f"  Continuing predictions — awaiting operator action.\n"
-                        f"{'!'*60}"
+                        f"  [{bearing_name}] 🔴 CRITICAL — RUL={pm.get('rul_min', 0.0):.1f} min"
                     )
 
             elif not ready:
@@ -639,6 +669,21 @@ Examples:
     )
     return parser.parse_args()
 
+def _parse_sent_at(sent_at_str):
+    """
+    Parse the ISO-8601 'sent_at' string written by scada_simulator.py
+    into a UTC datetime. Returns None on any failure so the caller can
+    record ingestion_lag_ms / e2e_ms as None for that burst.
+    """
+    if not sent_at_str:
+        return None
+    try:
+        # scada_simulator writes:  datetime.now(timezone.utc).isoformat()
+        # Python 3.11+ handles the 'Z' suffix; earlier versions don't.
+        s = sent_at_str.replace("Z", "+00:00") if isinstance(sent_at_str, str) else sent_at_str
+        return datetime.fromisoformat(s) if isinstance(s, str) else s
+    except Exception:
+        return None
 
 if __name__ == "__main__":
     args = _parse_args()
