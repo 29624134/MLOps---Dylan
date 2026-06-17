@@ -50,8 +50,8 @@ logger = logging.getLogger(__name__)
 # ─────────────────────────────────────────────────────────────────────────────
 # Default threshold values (seconds)
 # ─────────────────────────────────────────────────────────────────────────────
-_DEFAULT_CRITICAL_S = 3_600    # 1 hour
-_DEFAULT_WARNING_S  = 14_400   # 4 hours
+_DEFAULT_CRITICAL_S = 1_440   # 1 hour
+_DEFAULT_WARNING_S  = 1_800   # 4 hours
 
 # Recommended actions by status
 _RECOMMENDED_ACTIONS = {

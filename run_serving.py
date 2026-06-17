@@ -290,9 +290,11 @@ class LiveFeatureStoreReader:
         return doc
 
     def mark_consumed(self, doc_id, derived_features: dict = None):
-        update = {"$set": {"consumed": True, "consumed_at": datetime.now(timezone.utc).isoformat()}}
+        update = {"$set": {"consumed": True,
+                           "consumed_at": datetime.now(timezone.utc).isoformat()}}
         if derived_features:
             update["$set"]["derived_features"] = derived_features
+            update["$unset"] = {"h_signal": "", "v_signal": ""}  # raw no longer needed
         self._col.update_one({"_id": doc_id}, update)
 
     def check_session_end(self, bearing_name: str) -> bool:
@@ -481,26 +483,32 @@ def run_serving(
             if sent_at_dt is not None:
                 ingestion_lag_ms = (t_pickup_wall - sent_at_dt).total_seconds() * 1000.0
 
-            #   ── Extract burst data ────────────────────────────────────────────────────
-            #   SCADA writes the 10 stats flat on the document (not nested).
-            burst_idx = burst_doc.get("burst_idx", 0)
-            _SCADA_KEYS = (
-                "h_max", "h_min", "h_mean", "h_sd", "h_rms",
-                "v_max", "v_min", "v_mean", "v_sd", "v_rms",
-            )
-            scada_stats = {k: burst_doc[k] for k in _SCADA_KEYS if k in burst_doc}
-            features = _derive_features(scada_stats)
 
-            #   ── Run 4-stage serving pipeline ──────────────────────────────────────────
+            # ── Extract burst data ────────────────────────────────────────────────
+            # SCADA now writes RAW h/v signals. The FE stage computes all 18 features.
+            burst_idx = burst_doc.get("burst_idx", 0)
+            h_signal = np.asarray(burst_doc.get("h_signal", []), dtype=np.float32)
+            v_signal = np.asarray(burst_doc.get("v_signal", []), dtype=np.float32)
+
+            if h_signal.size == 0 or v_signal.size == 0:
+                logger.warning(f"[{bearing_name}] Burst {burst_idx} has empty signal — skipping.")
+                fs_reader.mark_consumed(burst_doc["_id"])
+                continue
+
+            # ── Run 4-stage serving pipeline ────────────────────────────────────────
+            # No precomputed_features → FE stage runs process_burst() and extracts all
+            # 18 base features (incl. real skewness/kurtosis) from the raw arrays.
             t_pipe_start = time.perf_counter()
             result = pipeline.run_burst(
                 run_id=run_id,
                 bearing_name=bearing_name,
                 burst_idx=burst_idx,
-                h_signal=np.array([0.0], dtype=np.float32),
-                v_signal=np.array([0.0], dtype=np.float32),
-                precomputed_features=features,
+                h_signal=h_signal,
+                v_signal=v_signal,
             )
+
+
+
             pipeline_ms_external = (time.perf_counter() - t_pipe_start) * 1000.0
 
             #   ── Prefer pipeline's own internal total (sub-ms accurate); fall back to
@@ -508,14 +516,17 @@ def run_serving(
             stage_timings_ms = result.get("stage_timings_ms") or {}
             pipeline_ms = stage_timings_ms.get("pipeline_total_ms", pipeline_ms_external)
 
-            #   ── Mark burst consumed — store the 18 base features ─────────────────────
-            fs_reader.mark_consumed(burst_doc["_id"], derived_features=features)
 
             pm = result.get("pm") or {}
             monitoring = result.get("monitoring") or {}
             inference = result.get("inference") or {}
             ok = result.get("ok", False)
             ready = result.get("ready", False)
+
+            # ── Mark burst consumed — every burst, warmup included ────────────
+            # Persist the FE-computed 18 base features for the trainer.
+            base_features = (result.get("fe") or {}).get("base_features") or {}
+            fs_reader.mark_consumed(burst_doc["_id"], derived_features=base_features)
 
             #   ── Write monitoring metrics back to Feature Store ────────────────────────
             if ok and ready:
@@ -577,10 +588,13 @@ def run_serving(
             if ok and ready:
                 _lag_str = f"{ingestion_lag_ms:6.1f}ms" if ingestion_lag_ms is not None else "    —  "
                 _e2e_str = f"{e2e_ms:7.1f}ms" if e2e_ms is not None else "      — "
+                rul_min = pm.get("rul_min")
+                rul_str = f"{rul_min:>10.1f}" if rul_min is not None else f"{'n/a':>10}"
+
                 logger.info(
                     f"  [{bearing_name}] Burst {burst_idx:>4} | "
-                    f"RUL={pm.get('rul_min', 0.0):>10.1f} min | "
-                    f"status={pm.get('status', '—'):<8} | "
+                    f"RUL={rul_str} min | "
+                    f"status={(pm.get('status') or 'unknown'):<8} | "
                     f"pipe={pipeline_ms:6.1f}ms ingest={_lag_str} e2e={_e2e_str} | "
                     f"drift={monitoring.get('drift_detected', False)} | "
                     f"alert={pm.get('alert', False)}"
@@ -589,7 +603,7 @@ def run_serving(
                 if pm.get("status") == "critical":
                     # Log a prominent warning but DO NOT stop serving.
                     logger.warning(
-                        f"  [{bearing_name}] 🔴 CRITICAL — RUL={pm.get('rul_min', 0.0):.1f} min"
+                        f"  [{bearing_name}] 🔴 CRITICAL — RUL={rul_str.strip()} min"
                     )
 
             elif not ready:

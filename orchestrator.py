@@ -649,6 +649,7 @@ class WorkflowExecutor:
                 _EXCLUDE = {
                     "_id", "bearing_name", "sent_at", "consumed", "consumed_at",
                     "session_end", "derived_features",
+                    "h_signal", "v_signal",  # raw arrays — not training columns
                     # Monitoring/inference fields written by write_monitoring_metrics
                     "run_id", "recorded_at", "type", "drift_detected",
                     "drift_features", "anomaly_flag", "baseline_ready", "stats",
