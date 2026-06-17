@@ -118,7 +118,7 @@ workflows:
           rul_scale: 30000.0
           # Default model type — overridden per group by group_model_overrides
           model_type: "MLP"
-          # MLP params (Groups 1 and 3)
+          # MLP params (Groups 3)
           model_params:
             horizon: 10
             hidden_units: [128, 64]
@@ -128,7 +128,7 @@ workflows:
             batch_size: 32
             patience: 30
             seed: 42
-          # CNN-LSTM params (Group 2)
+          # CNN-LSTM params (Group 1,2)
           # These are merged in by the orchestrator when model_type = "CNN_LSTM"
           cnn_lstm_params:
             horizon: 10

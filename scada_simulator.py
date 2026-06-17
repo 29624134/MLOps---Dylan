@@ -204,27 +204,28 @@ class LiveFeatureStoreWriter:
         )
 
     def write_burst(
-        self,
-        bearing_name: str,
-        burst_idx:    int,
-        time_s:       float,
-        scada_stats:  dict,
+            self,
+            bearing_name: str,
+            burst_idx: int,
+            time_s: float,
+            h_signal: np.ndarray,
+            v_signal: np.ndarray,
     ) -> bool:
         """
-        Insert one burst's SCADA stats (10 values) flat on the document.
-        run_serving.py will add the remaining 8 derived features in-place
-        when it consumes the burst, giving a flat 18-feature document.
+        Insert one burst's RAW vibration signals. The MLOps system
+        (run_serving.py → ServingFeatureEngineer) computes all 18 features
+        from these arrays — SCADA performs no feature extraction.
         Returns True on success. Silently skips duplicate burst_idx.
         """
         doc = {
             "bearing_name": bearing_name,
-            "burst_idx":    burst_idx,
-            "time_s":       time_s,
-            "sent_at":      datetime.now(timezone.utc).isoformat(),
-            "consumed":     False,
+            "burst_idx": burst_idx,
+            "time_s": time_s,
+            "sent_at": datetime.now(timezone.utc).isoformat(),
+            "consumed": False,
+            "h_signal": np.asarray(h_signal, dtype=np.float32).tolist(),
+            "v_signal": np.asarray(v_signal, dtype=np.float32).tolist(),
         }
-        # Write the 10 SCADA stats flat on the document
-        doc.update(scada_stats)
         try:
             self._col.insert_one(doc)
             return True
@@ -432,19 +433,19 @@ def run_multi_simulator(
                     bearing_name=bearing_name,
                     burst_idx=burst_idx,
                     time_s=burst["time_s"],
-                    scada_stats=scada_stats,
+                    h_signal=burst["h_signal"],
+                    v_signal=burst["v_signal"],
                 )
 
                 if ok:
                     counters[bearing_name]["sent"] += 1
                     states[bearing_name].update(burst_idx, bearing_name)
                     tick_sent = True
+                    n = len(burst["h_signal"])
                     logger.info(
                         f"  [{bearing_name}] Burst {burst_idx:>4} | "
                         f"time={burst['time_s']:>8.1f}s | "
-                        f"h_rms={scada_stats.get('h_rms', 0):.4f} | "
-                        f"v_rms={scada_stats.get('v_rms', 0):.4f} | "
-                        f"→ {FS_LIVE_COLLECTION} ✓  [10 SCADA stats]"
+                        f"{n} samples/axis → {FS_LIVE_COLLECTION} ✓  [raw signal]"
                     )
 
             # Sleep once per tick (after all bearings for this burst index)
